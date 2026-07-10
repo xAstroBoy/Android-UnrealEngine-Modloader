@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cstring>
 #include <setjmp.h>
+#include <exception>
 
 // ═══════════════════════════════════════════════════════════════════════
 // SAFE-CALL CRASH RECOVERY
@@ -189,9 +190,22 @@ extern "C" uint64_t dispatch_full(int slot,
     ctx.ret_x0 = 0;
     ctx.ret_d0 = 0.0;
 
-    // Pre callback — may modify ctx.x[], ctx.d[], or set ctx.blocked
+    // Pre callback — may modify ctx.x[], ctx.d[], or set ctx.blocked.
+    // Guarded: a Lua error inside the callback throws sol::error (a C++
+    // exception). If it escaped here it would unwind through the C
+    // trampoline and std::terminate the whole game. Swallow + log instead.
     if (rec->pre) {
-        rec->pre(ctx);
+        try {
+            rec->pre(ctx);
+        } catch (const std::exception& e) {
+            logger::log_error("NHOOK",
+                "Hook '%s' pre-callback threw: %s — ignored, game continues.",
+                rec->name.c_str(), e.what());
+        } catch (...) {
+            logger::log_error("NHOOK",
+                "Hook '%s' pre-callback threw a non-std exception — ignored.",
+                rec->name.c_str());
+        }
     }
 
     // Call original (unless blocked or return overridden)
@@ -263,9 +277,20 @@ extern "C" uint64_t dispatch_full(int slot,
         }
     }
 
-    // Post callback — may modify ctx.ret_x0 / ctx.ret_d0
+    // Post callback — may modify ctx.ret_x0 / ctx.ret_d0. Guarded the same
+    // way as the pre callback so a Lua error can never terminate the game.
     if (rec->post) {
-        rec->post(ctx);
+        try {
+            rec->post(ctx);
+        } catch (const std::exception& e) {
+            logger::log_error("NHOOK",
+                "Hook '%s' post-callback threw: %s — ignored, game continues.",
+                rec->name.c_str(), e.what());
+        } catch (...) {
+            logger::log_error("NHOOK",
+                "Hook '%s' post-callback threw a non-std exception — ignored.",
+                rec->name.c_str());
+        }
     }
 
     // Write D0 return value back to save area — asm thunk will restore D0 from here

@@ -17,6 +17,7 @@
 #include <android/log.h>
 #include <atomic>
 #include <cstring>
+#include <sys/stat.h> // umask
 
 #define LOG_TAG "UEModLoader"
 
@@ -124,6 +125,12 @@ static void *early_pak_thread(void * /*arg*/)
 static void *boot_thread(void *arg)
 {
     (void)arg;
+
+    // Clear the umask so every directory/file the modloader creates under its
+    // data dir is world-accessible (0777/0666). Otherwise the app's default
+    // umask (027) makes them 0750/0640 — unreadable to an SFTP server / file
+    // manager running under a different UID, even through the /sdcard mirror.
+    umask(0);
 
     // 5-second delay — give the Activity time to fully initialize
     // We need ActivityThread.currentApplication() to return non-null

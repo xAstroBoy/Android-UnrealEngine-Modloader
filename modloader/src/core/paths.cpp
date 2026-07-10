@@ -354,6 +354,7 @@ namespace paths
         ensure_dir(sdk_enums_dir());
         ensure_dir(cxx_header_dir());
         ensure_dir(lua_types_dir());
+        ensure_dir(ida_dir());
     }
 
     const std::string &data_dir() { return s_data_dir; }
@@ -370,5 +371,6 @@ namespace paths
     std::string cxx_header_dir() { return s_data_dir + "/CXXHeaderDump/"; }
     std::string lua_types_dir() { return s_data_dir + "/Lua/"; }
     std::string usmap_path() { return s_data_dir + "/Mappings.usmap"; }
+    std::string ida_dir() { return s_data_dir + "/IDAMapping/"; }
 
 } // namespace paths

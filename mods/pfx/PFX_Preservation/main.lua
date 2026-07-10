@@ -1,20 +1,27 @@
 -- ============================================================================
 -- PFX_Preservation v1 — Table Ownership Bypass + Force Download All DLC
 -- ============================================================================
--- PRESERVATION PROJECT: Forces the game to think ALL tables are owned,
--- bypasses entitlement checks, enables auto-download of missing chunks,
--- and provides tools to trigger downloads of all available table paks.
+-- PRESERVATION PROJECT: Forces the game to think ALL tables are owned and
+-- bypasses entitlement checks — WITHOUT triggering any downloads. Every table's
+-- PAK is already present in the game OBB, so we must NOT enable chunk acquisition
+-- (that makes the game re-"download" content it already has).
 --
 -- This mod works by:
 -- 1. Setting bDebugUnlockAllTables = true on PFXStoreManager
 -- 2. Hooking IsTableOwned/IsBundleOwned to always return true
 -- 3. Hooking IsPlayDisabled to always return false
--- 4. Enabling bShouldAcquireMissingChunksOnLoad on AssetManager
--- 5. Hooking MetaEntitlementCallbackProxy:VerifyEntitlement success path
--- 6. Providing bridge commands to enumerate & download all table paks
+-- 4. FORCING bShouldAcquireMissingChunksOnLoad = FALSE (no downloads — OBB has all)
+-- 5. Marking all tables IncludedInBaseGame so they load straight from the OBB
+--
+-- NOTE: auto-download was intentionally removed. The `pres_download_all` /
+-- `pres_chunks_on` commands remain for manual use only and are NOT auto-run.
 -- ============================================================================
 local TAG = "PFX_Preservation"
 Log(TAG .. ": Loading v1 — Table Preservation & Ownership Bypass...")
+
+-- Reload generation: older LoopAsync callbacks self-terminate on hot-reload.
+_G._PRES_GEN = (_G._PRES_GEN or 0) + 1
+local MY_GEN = _G._PRES_GEN
 
 -- ============================================================================
 -- HELPERS
@@ -349,22 +356,92 @@ end
 -- ============================================================================
 -- 9. FULL ACTIVATION — ONE COMMAND
 -- ============================================================================
+
+-- ============================================================================
+-- DOWNLOAD FIX (native) — the table/package manager marks tables Remote(2)
+-- ("needs download") even though the PAKs are already mounted from the OBB, so
+-- selecting/switching to one softlocks on a fetch (no network). We flip any
+-- Remote/Downloading/Downloaded/Mounting package to Mounted(6); the game then
+-- attaches it (6->7 Attached) and it STAYS attached — loading straight from the
+-- OBB, no download. Because they don't revert, this is essentially one-shot; a
+-- slow 2s pin just catches any NEW Remote descriptors (cheap, no lag).
+--
+-- Offsets from IDA of libUnreal.so (RVAs relative to YUP.GetLibBase()):
+--   0x76AE910 = table/package manager global (holds the manager pointer)
+--   mgr+96  = descriptor array (16-byte {descriptor, package} pairs)
+--   mgr+104 = descriptor count
+--   desc+73 = EPFXPackageState byte  (Remote=2 .. Mounted=6 .. Attached=7)
+-- Verified live: flipping Remote->Mounted fixed the softlock; states persist.
+-- ============================================================================
+local MGR_RVA    = 0x76AE910
+local DESC_ARR   = 96
+local DESC_CNT   = 104
+local STATE_OFF  = 73
+local dlpin_on   = false
+_G._DLPIN_TOTAL  = 0
+
+local function pin_download_states()
+    local base = YUP.GetLibBase(); if not base or base == 0 then return 0 end
+    local mgr = MemReadU64(base + MGR_RVA)
+    if not (mgr and mgr > 0x1000 and mgr < 0x8000000000) then return 0 end
+    local n = MemReadU64(mgr + DESC_CNT) & 0xFFFFFFFF
+    local a = MemReadU64(mgr + DESC_ARR)
+    -- validate: bogus count/ptr (wrong build/offset) -> safe no-op, never corrupt
+    if not (a and a > 0x1000 and a < 0x8000000000 and n > 0 and n < 256) then return 0 end
+    local flipped = 0
+    for i = 0, n - 1 do
+        local desc = MemReadU64(a + i * 16)
+        if desc and desc > 0x1000 and desc < 0x8000000000 then
+            local w  = MemReadU64(desc + STATE_OFF)
+            local st = w & 0xFF
+            if st >= 2 and st <= 5 then                       -- Remote..Mounting
+                MemWriteU64(desc + STATE_OFF, (w & ~0xFF) | 6) -- -> Mounted (keep other 7 bytes)
+                flipped = flipped + 1
+            end
+        end
+    end
+    _G._DLPIN_TOTAL = _G._DLPIN_TOTAL + flipped
+    return flipped
+end
+
+local function install_download_pin()
+    if dlpin_on then return end
+    dlpin_on = true
+    pcall(pin_download_states)                    -- immediate first pass
+    LoopAsync(2000, function()                    -- slow + cheap: states don't revert
+        if _G._PRES_GEN ~= MY_GEN then return true end
+        pcall(pin_download_states)
+        return false
+    end)
+    Log(TAG .. ": download fix active (native Remote->Mounted, load from OBB)")
+end
+
+pcall(function() RegisterCommand("pres_dl_status", function()
+    local base = YUP.GetLibBase(); local mgr = base and MemReadU64(base + MGR_RVA) or 0
+    local n = (mgr and mgr > 0x1000) and (MemReadU64(mgr + DESC_CNT) & 0xFFFFFFFF) or 0
+    return TAG .. ": download-fix total flipped=" .. tostring(_G._DLPIN_TOTAL) .. " descriptors=" .. tostring(n)
+end) end)
+
 local function activate_preservation()
-    Log(TAG .. ": === ACTIVATING FULL PRESERVATION MODE ===")
+    Log(TAG .. ": === ACTIVATING PRESERVATION MODE (unlock, NO download) ===")
 
     -- Step 1: Debug unlock flag
     set_debug_unlock(true)
 
-    -- Step 2: Auto-acquire chunks
-    set_auto_acquire_chunks(true)
+    -- Step 2: DISABLE chunk auto-acquire — the OBB already has every PAK, so the
+    -- game must NOT try to "download" missing chunks. This is the download fix.
+    set_auto_acquire_chunks(false)
 
     -- Step 3: Install ownership hooks
     install_ownership_hooks()
 
+    -- Step 3b: native download fix (Remote->Mounted, load from OBB)
+    install_download_pin()
+
     -- Step 4: Enumerate tables
     enumerate_tables()
 
-    -- Step 5: Force all tables as base game
+    -- Step 5: Force all tables as base game (load straight from the OBB)
     force_all_tables_included()
 
     -- Step 6: Enumerate chunks
@@ -374,7 +451,7 @@ local function activate_preservation()
     Log(TAG .. ":   " .. #tables_found .. " tables found")
     Log(TAG .. ":   " .. #chunks_found .. " chunk mappings found")
     Log(TAG .. ":   bDebugUnlockAllTables = true")
-    Log(TAG .. ":   bShouldAcquireMissingChunksOnLoad = true")
+    Log(TAG .. ":   bShouldAcquireMissingChunksOnLoad = FALSE (no downloads)")
     Log(TAG .. ":   All tables marked IncludedInBaseGame")
     Log(TAG .. ":   Ownership hooks active")
 

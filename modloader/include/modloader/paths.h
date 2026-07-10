@@ -35,4 +35,7 @@ namespace paths
     // Usmap mappings file
     std::string usmap_path(); // data_dir + "/Mappings.usmap"
 
+    // IDA/Ghidra mapping output directory
+    std::string ida_dir(); // data_dir + "/IDAMapping/"
+
 } // namespace paths

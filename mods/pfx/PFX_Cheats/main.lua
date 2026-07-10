@@ -844,18 +844,66 @@ local function probe_scale_targets()
     return table.concat(lines, " || ")
 end
 
+-- PHYSICS ball size lives in the YUP ball_struct (radius float @ +0xB0), NOT the
+-- ball_C actor — that's only the skin, which the game re-syncs every frame, so
+-- SetActorScale3D "reverts instantly". We reach the ball_structs through FingerMode's
+-- captured physics container (_G._FM_S): S+0x5C0 = holder array, holder+0xA8 =
+-- ball_struct. Writing the radius there STICKS (the game reads it as authoritative).
+local BALL_ARR_OFF, BALL_CNT_OFF, HOLDER_BS = 0x5C0, 0x5C8, 0xA8
+local BALL_RADIUS_OFF, BASE_BALL_RADIUS = 0xB0, 0.0135
+local function bs_heap(p) return p and p > 0x7000000000 and p < 0x8000000000 end
+-- Only the first *(S+0x5C8) slots are real balls; the rest hold garbage pointers that
+-- still pass a heap range check — writing to them corrupts memory and crashes the
+-- native physics. Bound to the count AND validate each ball_struct (finite position)
+-- before touching its radius.
+local function apply_ball_radius(scale)
+    local S = _G._FM_S or 0            -- FingerMode captures this via its GetBall hook
+    if not bs_heap(S) then return 0 end
+    local arr = MemReadU64(S + BALL_ARR_OFF)
+    if not bs_heap(arr) then return 0 end
+    local count = MemReadU64(S + BALL_CNT_OFF) & 0xFFFFFFFF
+    if count == 0 or count > 8 then return 0 end
+    local n = 0
+    for i = 0, count - 1 do
+        local h = MemReadU64(arr + i * 8)
+        if bs_heap(h) then
+            local bs = MemReadU64(h + HOLDER_BS)
+            if bs_heap(bs) then
+                local x = MemReadFloat(bs)                     -- ball_struct pos.x
+                if x == x and x > -100 and x < 100 then        -- finite & sane => real ball
+                    pcall(function() MemWriteFloat(bs + BALL_RADIUS_OFF, BASE_BALL_RADIUS * scale) end)
+                    n = n + 1
+                end
+            end
+        end
+    end
+    return n
+end
+
+-- Keep enforcing the radius (new balls spawn at the default size, and we want the
+-- toggle to survive multiball/respawns). Cheap memory writes; runs only while big.
+local big_ball_loop_on = false
+local function start_big_ball_loop()
+    if big_ball_loop_on then return end
+    big_ball_loop_on = true
+    LoopAsync(400, function()
+        if cheats.big_ball then pcall(function() apply_ball_radius(BIG_BALL_SCALE) end) end
+        return false
+    end)
+end
+
 local function apply_big_ball()
     local target_scale = cheats.big_ball and BIG_BALL_SCALE or 1.0
+
+    -- 1) PHYSICS: the part that actually changes ball size and persists.
+    local radius_n = apply_ball_radius(target_scale)
+
+    -- 2) VISUAL: best-effort skin scale so it also looks bigger (may be re-synced).
     local balls = collect_live_balls()
     if not balls or #balls == 0 then
         local one = find_active_ball()
         if one then balls = { one } else balls = {} end
     end
-
-    if #balls == 0 then
-        return false, "no active ball"
-    end
-
     local ok_count = 0
     for _, ball in ipairs(balls) do
         if apply_actor_scale_with_collision(ball, target_scale) then
@@ -864,11 +912,14 @@ local function apply_big_ball()
         end
     end
 
-    stats.big_ball_applies = stats.big_ball_applies + ok_count
-    if ok_count > 0 then
-        return true, "ball scale=" .. string.format("%.2f", target_scale) .. " (actors=" .. tostring(ok_count) .. ")"
+    stats.big_ball_applies = stats.big_ball_applies + radius_n
+    if radius_n > 0 then
+        return true, string.format("radius x%.2f on %d balls (skin actors=%d)", target_scale, radius_n, ok_count)
     end
-    return false, "failed to scale ball"
+    if ok_count > 0 then
+        return true, "skin scale=" .. string.format("%.2f", target_scale) .. " (no physics: S not captured yet)"
+    end
+    return false, "no active ball / S not captured (roll a ball first)"
 end
 
 local function apply_large_flippers()
@@ -969,6 +1020,7 @@ end
 
 local function cheats_set_big_ball(enable)
     cheats.big_ball = not not enable
+    if cheats.big_ball then start_big_ball_loop() end
     local ok, msg = apply_big_ball()
     return cheats.big_ball, (ok and msg) or ("pending: " .. tostring(msg))
 end

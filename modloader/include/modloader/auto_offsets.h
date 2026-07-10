@@ -60,6 +60,8 @@ namespace auto_offsets
         uintptr_t static_load_class;
         uintptr_t static_construct_object;
         uintptr_t fname_init;       // FName::Init
+        uintptr_t append_string;    // FName::ToString / FName::AppendString (Dumper-7 core)
+        uintptr_t gnatives;         // GNatives bytecode function table (Dumper-7 core)
         uintptr_t ftext_tostring;   // FText::ToString
         uintptr_t ftext_fromstring; // FText::FromString
         uintptr_t pak_mount;        // FPakPlatformFile::Mount
@@ -126,6 +128,17 @@ namespace auto_offsets
 
     // Find StaticConstructObject_Internal via string xrefs
     uintptr_t find_static_construct_object();
+
+    // Find StaticLoadObject via string xrefs
+    uintptr_t find_static_load_object();
+
+    // Find FName::ToString / FName::AppendString — the function that materializes
+    // a name string from an FNameEntry. Located via FNamePool cross-references and
+    // the ARM64 FNameEntry-header-decode shape (LDRH + shift-by-6 length).
+    uintptr_t find_append_string();
+
+    // Find GNatives — the UFunction bytecode opcode → handler table.
+    uintptr_t find_gnatives();
 
     // Probe FUObjectItem size by validating object chains
     // Returns 0x14 (UE4) or 0x18 (UE5) or 0 if unknown
