@@ -139,3 +139,9 @@ quest_root*
 UE4SS_LUA_API_COMPLETE_REFERENCE.md
 /tools
 .github/copilot-instructions.md
+
+# ── lsposed-module build output ──────────────────────────────────────
+lsposed-module/app/build/
+lsposed-module/build/
+lsposed-module/.gradle/
+lsposed-module/local.properties

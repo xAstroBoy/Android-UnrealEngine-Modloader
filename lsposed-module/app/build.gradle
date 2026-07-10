@@ -1,0 +1,43 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.xastroboy.uemodloader.lsposed'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.xastroboy.uemodloader.lsposed'
+        minSdk 29          // Quest 2 = Android 10 (API 29); Quest 3 newer
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+        // arm64 only — Quest is ARM64, and the payload is libmodloader.so (arm64-v8a)
+        ndk { abiFilters 'arm64-v8a' }
+    }
+
+    // Force the payload .so to be extracted to the module's nativeLibraryDir on
+    // disk (/data/app/<module>/lib/arm64/), where the game process can System.load
+    // it with the correct SELinux label. Do NOT compress/pack it into the APK only.
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    // Xposed API — provided by the LSPosed framework at runtime, not bundled.
+    compileOnly 'de.robv.android.xposed:api:82'
+}

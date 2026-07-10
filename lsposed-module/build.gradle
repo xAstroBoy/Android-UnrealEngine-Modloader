@@ -1,0 +1,4 @@
+// Root build file — Quest UE4 ModLoader LSPosed module.
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+}
