@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:label="UE4 ModLoader (LSPosed)"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:extractNativeLibs="true">
+
+        <!-- ═══ Xposed / LSPosed module descriptors ═══ -->
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="Injects libmodloader.so (Quest UE4 ModLoader) into UE4 games via root — no APK patching." />
+        <!-- API 82 = classic Xposed API, fully supported by LSPosed. -->
+        <meta-data
+            android:name="xposedminversion"
+            android:value="82" />
+        <!-- Recommended scope: pre-selected in LSPosed Manager. Add your game here. -->
+        <meta-data
+            android:name="xposedscope"
+            android:resource="@array/xposed_scope" />
+    </application>
+
+</manifest>

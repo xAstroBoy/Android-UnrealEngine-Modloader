@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Recommended LSPosed scope — the games the module targets by default.
+         Add any other UE4 Quest game's package name here (or configure at
+         runtime via /sdcard/UnrealModloader/lsposed_targets.txt). -->
+    <string-array name="xposed_scope">
+        <item>com.Armature.VR4</item>          <!-- Resident Evil 4 VR -->
+        <item>com.zenstudios.PFXVRQuest</item>  <!-- Pinball FX VR -->
+        <item>com.Capricia.HandBoi</item>       <!-- Hand Boi -->
+    </string-array>
+</resources>
