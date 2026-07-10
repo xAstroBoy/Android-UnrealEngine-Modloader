@@ -40,6 +40,11 @@ local TAG = "PFX_MaxAll"
 local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
+-- Reload generation: older LoopAsync callbacks compare this and self-terminate, so
+-- a hot-reload cleanly supersedes the previous loops instead of stacking them.
+_G._MAXALL_GEN = (_G._MAXALL_GEN or 0) + 1
+local MY_GEN = _G._MAXALL_GEN
+
 Log(TAG .. ": Loading v27...")
 
 -- ============================================================================
@@ -505,6 +510,7 @@ local function start_trophy_sweep()
     Log(TAG .. ": Starting background trophy sweep (data-only, every 8s, hub-only)")
 
     LoopAsync(8000, function()
+        if _G._MAXALL_GEN ~= MY_GEN then return true end
         if in_table_gameplay() then
             return false
         end
@@ -558,6 +564,11 @@ end
 -- Fixes cases where grabbed trophies come back holo/hidden/invisible.
 -- Keeps slots visible, restores physical entries, and re-enables collision.
 -- ============================================================================
+-- Cap the EXPENSIVE actor respawns per tick so a full-wall respawn storm can't
+-- stall the main thread (was up to ~700ms). Leftover broken slots heal on the next
+-- ticks — a few seconds to clear a backlog, then it settles to cheap checks.
+local MAX_RESPAWN_PER_TICK = 2
+
 local function heal_trophy_visibility_once()
     if not trophyMapReady then return 0, 0 end
 
@@ -595,7 +606,8 @@ local function heal_trophy_visibility_once()
                 local sa = nil
                 pcall(function() sa = csr:Get("SpawnedActor") end)
                 if not sa or not is_live(sa) then
-                    if entry and is_live(entry) then
+                    -- expensive: rate-limited so a full-wall storm can't stall a tick
+                    if entry and is_live(entry) and respawn < MAX_RESPAWN_PER_TICK then
                         pcall(function() csr:Call("SetupWithCollectibleEntry", entry) end)
                         respawn = respawn + 1
                     end
@@ -606,9 +618,11 @@ local function heal_trophy_visibility_once()
                 local cls = ""
                 pcall(function() cls = sa:GetClass():GetName() end)
                 if cls ~= "" and cls:match("Holo") and entry and is_live(entry) then
-                    pcall(function() csr:Call("DestroyPreviousCollectible") end)
-                    pcall(function() csr:Call("SetupWithCollectibleEntry", entry) end)
-                    respawn = respawn + 1
+                    if respawn < MAX_RESPAWN_PER_TICK then   -- expensive: rate-limited
+                        pcall(function() csr:Call("DestroyPreviousCollectible") end)
+                        pcall(function() csr:Call("SetupWithCollectibleEntry", entry) end)
+                        respawn = respawn + 1
+                    end
                     return
                 end
 
@@ -630,30 +644,39 @@ local function heal_trophy_visibility_once()
     return healed, respawn
 end
 
-local function start_trophy_watchdog()
-    if trophyWatchdogStarted then return end
-    trophyWatchdogStarted = true
-    Log(TAG .. ": Starting trophy watchdog (visibility/collision self-heal, 3s, hub-only)")
-
-    LoopAsync(3000, function()
-        if in_table_gameplay() then
-            return false
-        end
-
+-- ADAPTIVE watchdog: when there's a respawn backlog (e.g. just entered the hub and
+-- the game spawned holo actors), tick FAST with a small per-tick budget so the wall
+-- heals to physical in a few seconds WITHOUT the old ~700ms full-storm freeze. Once
+-- healed (no respawns needed), drop to a slow maintenance tick so it costs ~nothing
+-- and never causes a walking-in-the-hub spike. Self-reschedules via ExecuteWithDelay
+-- so the interval can change between ticks (LoopAsync can't).
+local WD_FAST_MS = 350     -- interval while healing a backlog (small hitch, quick)
+local WD_SLOW_MS = 3000    -- maintenance interval once everything is physical
+local function watchdog_tick()
+    if _G._MAXALL_GEN ~= MY_GEN then return end   -- superseded by reload -> stop
+    local nextMs = WD_SLOW_MS
+    if not in_table_gameplay() then
         local t0 = os.clock()
         local healed, respawn = heal_trophy_visibility_once()
         local dt = (os.clock() - t0) * 1000.0
-
         perf.watchdog_runs = perf.watchdog_runs + 1
         perf.watchdog_ms_total = perf.watchdog_ms_total + dt
         if dt > perf.watchdog_ms_max then perf.watchdog_ms_max = dt end
-
-        if respawn > 0 then
-            Log(TAG .. ": Trophy watchdog respawned=" .. respawn .. " healed=" .. healed
-                .. " dt_ms=" .. string.format("%.2f", dt))
+        -- backlog remaining? MAX_RESPAWN_PER_TICK caps each tick, so a hit budget
+        -- means more to do -> keep ticking fast until it drains.
+        if respawn >= MAX_RESPAWN_PER_TICK then
+            nextMs = WD_FAST_MS
+            Log(TAG .. ": Trophy heal burst respawned=" .. respawn .. " dt_ms=" .. string.format("%.2f", dt))
         end
-        return false
-    end)
+    end
+    ExecuteWithDelay(nextMs, watchdog_tick)
+end
+
+local function start_trophy_watchdog()
+    if trophyWatchdogStarted then return end
+    trophyWatchdogStarted = true
+    Log(TAG .. ": Starting trophy watchdog (adaptive: fast-heal backlog, slow maintenance)")
+    ExecuteWithDelay(WD_SLOW_MS, watchdog_tick)
 end
 
 -- ============================================================================
@@ -1338,6 +1361,7 @@ local pollCount = 0
 local main_poll_handle = nil
 
 main_poll_handle = LoopAsync(5000, function()
+    if _G._MAXALL_GEN ~= MY_GEN then return true end
     if pollCount < 10 or (pollCount % 6 == 0) then
         Log(TAG .. ": DIAG: LoopAsync tick #" .. pollCount .. " — initDone=" .. tostring(initDone) .. " allDone=" .. tostring(allDone))
     end

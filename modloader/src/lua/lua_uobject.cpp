@@ -3960,6 +3960,49 @@ namespace lua_uobject
 
             return write_property_value(self.ptr, *rp, value); },
 
+                                     // ── Reflection enumeration ──
+                                     // GetProperties() → { {name=, type=, offset=, size=}, ... } (own + inherited)
+                                     "GetProperties", [](sol::this_state ts, LuaUObject &self) -> sol::object
+                                     {
+            sol::state_view lua(ts);
+            if (!self.ptr) return sol::nil;
+            ue::UClass* cls = ue::uobj_get_class(self.ptr);
+            if (!cls) return sol::nil;
+            std::string class_name = reflection::get_short_name(reinterpret_cast<const ue::UObject*>(cls));
+            auto* rc = rebuilder::rebuild(class_name);
+            if (!rc) return sol::nil;
+            sol::table t = lua.create_table();
+            int i = 1;
+            for (auto& p : rc->all_properties) {
+                sol::table e = lua.create_table();
+                e["name"] = p.name;
+                e["type"] = p.type_name;
+                e["offset"] = p.offset;
+                e["size"] = p.element_size;
+                t[i++] = e;
+            }
+            return t; },
+
+                                     // GetFunctions() → { {name=, num_parms=}, ... } (own + inherited)
+                                     "GetFunctions", [](sol::this_state ts, LuaUObject &self) -> sol::object
+                                     {
+            sol::state_view lua(ts);
+            if (!self.ptr) return sol::nil;
+            ue::UClass* cls = ue::uobj_get_class(self.ptr);
+            if (!cls) return sol::nil;
+            std::string class_name = reflection::get_short_name(reinterpret_cast<const ue::UObject*>(cls));
+            auto* rc = rebuilder::rebuild(class_name);
+            if (!rc) return sol::nil;
+            sol::table t = lua.create_table();
+            int i = 1;
+            for (auto& fn : rc->all_functions) {
+                sol::table e = lua.create_table();
+                e["name"] = fn.name;
+                e["num_parms"] = fn.num_parms;
+                t[i++] = e;
+            }
+            return t; },
+
                                      // ── Function calls via ProcessEvent ──
                                      "Call", [](sol::this_state ts, LuaUObject &self, const std::string &func_name, sol::variadic_args va) -> sol::object
                                      {

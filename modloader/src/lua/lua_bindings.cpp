@@ -22,14 +22,26 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
+#include <cmath>
 #include <thread>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fstream>
 #include <sstream>
 #include <functional>
+#include <vector>
+#include <array>
+#include <algorithm>
+#include <utility>
 #include <nlohmann/json.hpp>
+
+// Native storage for HeapSnapVec / HeapFilterMovedVec (motion-based struct find)
+static std::vector<uintptr_t> g_snap_addr;
+static std::vector<std::array<float, 3>> g_snap_val;
 
 namespace lua_bindings
 {
@@ -2127,6 +2139,233 @@ namespace lua_bindings
 
         lua.set_function("IntToPtr", [](int64_t val) -> sol::lightuserdata_value
                          { return sol::lightuserdata_value(reinterpret_cast<void *>(static_cast<uintptr_t>(val))); });
+
+        // ── /proc/self/mem access ───────────────────────────────────────────
+        // Direct dereference SIGSEGVs on the game's RELRO / physics-arena pages
+        // (anti-tamper / PROT_NONE hiding). /proc/self/mem reads via the kernel
+        // (FOLL_FORCE) and bypasses that — works on ALL mapped pages, read+write.
+        // These are the reliable primitives for reading the YUP physics world.
+        static int s_mem_fd = -1;
+        auto get_mem_fd = []() -> int {
+            if (s_mem_fd < 0) s_mem_fd = open("/proc/self/mem", O_RDWR);
+            return s_mem_fd;
+        };
+        lua.set_function("MemReadU64", [get_mem_fd](int64_t addr) -> int64_t {
+            int fd = get_mem_fd(); if (fd < 0) return 0;
+            uint64_t v = 0;
+            if (pread64(fd, &v, 8, (off64_t)(uintptr_t)addr) != 8) return 0;
+            return (int64_t)v; });
+        lua.set_function("MemReadFloat", [get_mem_fd](int64_t addr) -> double {
+            int fd = get_mem_fd(); if (fd < 0) return 0.0;
+            float v = 0.0f;
+            if (pread64(fd, &v, 4, (off64_t)(uintptr_t)addr) != 4) return 0.0;
+            return (double)v; });
+        lua.set_function("MemWriteFloat", [get_mem_fd](int64_t addr, double val) -> bool {
+            int fd = get_mem_fd(); if (fd < 0) return false;
+            float v = (float)val;
+            return pwrite64(fd, &v, 4, (off64_t)(uintptr_t)addr) == 4; });
+        lua.set_function("MemWriteU64", [get_mem_fd](int64_t addr, int64_t val) -> bool {
+            int fd = get_mem_fd(); if (fd < 0) return false;
+            uint64_t v = (uint64_t)val;
+            return pwrite64(fd, &v, 8, (off64_t)(uintptr_t)addr) == 8; });
+
+        // ── Heap scanning ───────────────────────────────────────────────────
+        // HeapScanPtr(targetInt, maxHits=64) → { addr1, addr2, ... }
+        // Scans all rw anon/heap regions for 8-byte-aligned qwords equal to target.
+        // Used to find native structs by a back-pointer (e.g. YUP ball_struct that
+        // holds a pointer to the UE render component).
+        lua.set_function("HeapScanPtr", [](sol::this_state ts, int64_t target, sol::optional<int> max_hits) -> sol::object
+                         {
+            sol::state_view lua(ts);
+            sol::table results = lua.create_table();
+            const uintptr_t tval = static_cast<uintptr_t>(target);
+            const int cap = max_hits.value_or(64);
+            int found = 0;
+            std::ifstream maps("/proc/self/maps");
+            if (!maps.is_open()) return results;
+            std::string line;
+            while (std::getline(maps, line) && found < cap) {
+                uintptr_t start = 0, end = 0; char perms[8] = {0}; char path[256] = {0};
+                int n = sscanf(line.c_str(), "%lx-%lx %7s %*s %*s %*s %255[^\n]", &start, &end, perms, path);
+                if (n < 3) continue;
+                if (perms[0] != 'r' || perms[1] != 'w') continue;
+                bool anon = (n < 4) || path[0] == '\0';
+                bool heapish = anon || strncmp(path, "[anon", 5) == 0 || strncmp(path, "[heap", 5) == 0;
+                if (!heapish) continue;
+                size_t sz = (end > start) ? (end - start) : 0;
+                if (sz == 0 || sz > (size_t)1024 * 1024 * 1024) continue;
+                safe_call::execute([&]() {
+                    for (uintptr_t a = start; a + 8 <= end && found < cap; a += 8) {
+                        if (*reinterpret_cast<volatile uintptr_t *>(a) == tval) {
+                            results[++found] = static_cast<int64_t>(a);
+                        }
+                    }
+                }, "HeapScanPtr");
+            }
+            return results; });
+
+        // ── Motion-based struct finding (frame-independent) ──────────────────
+        // HeapSnapVec(boxHalf=20, maxEntries=4000000) → count
+        //   Snapshots every 4-aligned float triple whose 3 comps are finite,
+        //   |comp| <= boxHalf, and not all ~0. Stored natively for HeapFilterMovedVec.
+        // HeapFilterMovedVec(dx, dy, dz, tol) → { addr, ... }
+        //   Keeps snapshotted triples whose value changed by ~ (dx,dy,dz).
+        // Usage: snap while ball at P0; let game run; filter with (P1-P0)*scale.
+        lua.set_function("HeapSnapVec", [](double box_half, sol::optional<int> max_entries) -> int
+                         {
+            g_snap_addr.clear(); g_snap_val.clear();
+            const float box = (float)box_half;
+            const size_t cap = (size_t)max_entries.value_or(4000000);
+            g_snap_addr.reserve(std::min(cap, (size_t)1000000));
+            std::ifstream maps("/proc/self/maps");
+            if (!maps.is_open()) return 0;
+            std::string line;
+            while (std::getline(maps, line) && g_snap_addr.size() < cap) {
+                uintptr_t start = 0, end = 0; char perms[8] = {0}; char path[256] = {0};
+                int n = sscanf(line.c_str(), "%lx-%lx %7s %*s %*s %*s %255[^\n]", &start, &end, perms, path);
+                if (n < 3) continue;
+                if (perms[0] != 'r' || perms[1] != 'w') continue;
+                bool anon = (n < 4) || path[0] == '\0';
+                bool heapish = anon || strncmp(path, "[anon", 5) == 0 || strncmp(path, "[heap", 5) == 0;
+                if (!heapish) continue;
+                size_t sz = (end > start) ? (end - start) : 0;
+                if (sz == 0 || sz > (size_t)1024 * 1024 * 1024) continue;
+                safe_call::execute([&]() {
+                    for (uintptr_t a = start; a + 12 <= end && g_snap_addr.size() < cap; a += 4) {
+                        const float *p = reinterpret_cast<const float *>(a);
+                        float x = p[0], y = p[1], z = p[2];
+                        if (!(x == x) || !(y == y) || !(z == z)) continue;
+                        if (fabsf(x) > box || fabsf(y) > box || fabsf(z) > box) continue;
+                        if (fabsf(x) < 1e-6f && fabsf(y) < 1e-6f && fabsf(z) < 1e-6f) continue;
+                        g_snap_addr.push_back(a);
+                        g_snap_val.push_back({x, y, z});
+                    }
+                }, "HeapSnapVec");
+            }
+            return (int)g_snap_addr.size(); });
+
+        lua.set_function("HeapFilterMovedVec", [](sol::this_state ts, double dx, double dy, double dz, double tol) -> sol::object
+                         {
+            sol::state_view lua(ts);
+            sol::table results = lua.create_table();
+            const float fdx = (float)dx, fdy = (float)dy, fdz = (float)dz, ftol = (float)tol;
+            int found = 0;
+            safe_call::execute([&]() {
+                for (size_t i = 0; i < g_snap_addr.size(); ++i) {
+                    const float *p = reinterpret_cast<const float *>(g_snap_addr[i]);
+                    float cx = p[0], cy = p[1], cz = p[2];
+                    if (!(cx == cx) || !(cy == cy) || !(cz == cz)) continue;
+                    if (fabsf((cx - g_snap_val[i][0]) - fdx) <= ftol &&
+                        fabsf((cy - g_snap_val[i][1]) - fdy) <= ftol &&
+                        fabsf((cz - g_snap_val[i][2]) - fdz) <= ftol) {
+                        results[++found] = static_cast<int64_t>(g_snap_addr[i]);
+                    }
+                }
+            }, "HeapFilterMovedVec");
+            return results; });
+
+        // HeapFindBallWorld(maxHits=16) → { S1, ... }
+        // Finds the YUP physics container S by structural fingerprint (all offsets from IDA):
+        //   arr = *(S+0x5C0) is a heap ptr; for some idx in [0,7]:
+        //   holder = *(arr+idx*8) heap ptr; bs = *(holder+0xA8) heap ptr; *(bs+4) is a finite float.
+        // Race-free / ball-independent: S is stable per loaded table (works paused, between balls).
+        lua.set_function("HeapFindBallWorld", [](sol::this_state ts, sol::optional<int> max_hits) -> sol::object
+                         {
+            sol::state_view lua(ts);
+            sol::table results = lua.create_table();
+            const int cap = max_hits.value_or(16);
+            int found = 0;
+            // Build sorted list of mapped [start,end) ranges (r--) so deref-chains never fault.
+            std::vector<std::pair<uintptr_t,uintptr_t>> ranges;
+            {
+                std::ifstream m("/proc/self/maps"); std::string ln;
+                while (std::getline(m, ln)) {
+                    uintptr_t s=0,e=0; char pr[8]={0};
+                    if (sscanf(ln.c_str(),"%lx-%lx %7s",&s,&e,pr)<3) continue;
+                    if (pr[0]!='r') continue;
+                    ranges.push_back({s,e});
+                }
+                std::sort(ranges.begin(), ranges.end());
+            }
+            auto mapped=[&](uintptr_t p, size_t need)->bool{
+                if (p < 0x7000000000ULL || p >= 0x8000000000ULL || (p&7)) return false;
+                size_t lo=0, hi=ranges.size();
+                while (lo<hi){ size_t mid=(lo+hi)/2; if (ranges[mid].first<=p) lo=mid+1; else hi=mid; }
+                if (lo==0) return false;
+                auto &r=ranges[lo-1];
+                return p>=r.first && p+need<=r.second;
+            };
+            auto rq=[&](uintptr_t p)->uintptr_t{ return *reinterpret_cast<uintptr_t*>(p); };
+            std::ifstream maps("/proc/self/maps");
+            if (!maps.is_open()) return results;
+            std::string line;
+            while (std::getline(maps, line) && found < cap) {
+                uintptr_t start=0,end=0; char perms[8]={0}; char path[256]={0};
+                int n = sscanf(line.c_str(), "%lx-%lx %7s %*s %*s %*s %255[^\n]", &start,&end,perms,path);
+                if (n<3) continue;
+                if (perms[0]!='r'||perms[1]!='w') continue;
+                bool anon=(n<4)||path[0]=='\0';
+                bool heapish=anon||strncmp(path,"[anon",5)==0||strncmp(path,"[heap",5)==0;
+                if (!heapish) continue;
+                size_t sz=(end>start)?(end-start):0; if (sz==0||sz>(size_t)1024*1024*1024) continue;
+                // Per-region fault guard: a concurrent unmap/remap can invalidate our snapshot
+                // of mapped ranges mid-scan; safe_call catches the SIGSEGV and skips the region.
+                safe_call::execute([&]() {
+                    for (uintptr_t a=start; a+0x5C8<=end && found<cap; a+=8) {
+                        uintptr_t arr = rq(a+0x5C0);
+                        if (!mapped(arr, 16*8)) continue;
+                        int good=0;
+                        for (int idx=0; idx<16; ++idx) {
+                            uintptr_t holder = rq(arr+idx*8);
+                            if (!mapped(holder, 0xB0)) continue;
+                            uintptr_t bs = rq(holder+0xA8);
+                            if (!mapped(bs, 0x0C)) continue;
+                            float x=*reinterpret_cast<float*>(bs+0);
+                            float y=*reinterpret_cast<float*>(bs+4);
+                            float z=*reinterpret_cast<float*>(bs+8);
+                            if (x==x && y==y && z==z && fabsf(x)<100.f && fabsf(y)<100.f && fabsf(z)<100.f)
+                                ++good;
+                        }
+                        if (good>=3) results[++found]=static_cast<int64_t>(a);
+                    }
+                }, "HeapFindBallWorld");
+            }
+            return results; });
+
+        // HeapScanFloatVec(x, y, z, tol=0.5, maxHits=64) → { addrOfX1, ... }
+        // Scans rw anon/heap regions (4-byte step) for 3 consecutive floats near (x,y,z).
+        lua.set_function("HeapScanFloatVec", [](sol::this_state ts, double x, double y, double z,
+                                                sol::optional<double> tol_opt, sol::optional<int> max_hits) -> sol::object
+                         {
+            sol::state_view lua(ts);
+            sol::table results = lua.create_table();
+            const float fx = (float)x, fy = (float)y, fz = (float)z;
+            const float tol = (float)tol_opt.value_or(0.5);
+            const int cap = max_hits.value_or(64);
+            int found = 0;
+            std::ifstream maps("/proc/self/maps");
+            if (!maps.is_open()) return results;
+            std::string line;
+            while (std::getline(maps, line) && found < cap) {
+                uintptr_t start = 0, end = 0; char perms[8] = {0}; char path[256] = {0};
+                int n = sscanf(line.c_str(), "%lx-%lx %7s %*s %*s %*s %255[^\n]", &start, &end, perms, path);
+                if (n < 3) continue;
+                if (perms[0] != 'r' || perms[1] != 'w') continue;
+                bool anon = (n < 4) || path[0] == '\0';
+                bool heapish = anon || strncmp(path, "[anon", 5) == 0 || strncmp(path, "[heap", 5) == 0;
+                if (!heapish) continue;
+                size_t sz = (end > start) ? (end - start) : 0;
+                if (sz == 0 || sz > (size_t)1024 * 1024 * 1024) continue;
+                safe_call::execute([&]() {
+                    for (uintptr_t a = start; a + 12 <= end && found < cap; a += 4) {
+                        const float *p = reinterpret_cast<const float *>(a);
+                        if (fabsf(p[0] - fx) <= tol && fabsf(p[1] - fy) <= tol && fabsf(p[2] - fz) <= tol) {
+                            results[++found] = static_cast<int64_t>(a);
+                        }
+                    }
+                }, "HeapScanFloatVec");
+            }
+            return results; });
 
         // ── PAK mounting ────────────────────────────────────────────────────
         lua.set_function("MountPak", [](const std::string &pak_name) -> bool

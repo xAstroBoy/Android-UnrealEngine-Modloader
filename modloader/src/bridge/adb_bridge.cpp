@@ -7,6 +7,7 @@
 #include "modloader/mod_loader.h"
 #include "modloader/pak_mounter.h"
 #include "modloader/lua_dump_generator.h"
+#include "modloader/ida_mapping_generator.h"
 #include "modloader/reflection_walker.h"
 #include "modloader/process_event_hook.h"
 #include "modloader/pe_trace.h"
@@ -224,6 +225,22 @@ namespace adb_bridge
         result["lua_types_path"] = paths::lua_types_dir();
         result["legacy_sdk_path"] = paths::sdk_dir();
         result["note"] = "Re-walked GUObjectArray and regenerated SDK (CXXHeaderDump + Lua + Legacy)";
+        return ok_response(result);
+    }
+
+    static std::string handle_dump_ida()
+    {
+        // Re-walk GUObjectArray so newly loaded classes are covered, then emit
+        // the IDA/Ghidra function-rename mappings (Dumper-7 style).
+        reflection::walk_all();
+        int files = ida_map::generate();
+        json result;
+        result["functions"] = ida_map::function_count();
+        result["globals"] = ida_map::global_count();
+        result["files_written"] = files;
+        result["ida_path"] = paths::ida_dir();
+        result["note"] = "Renamed native UFunction exec pointers → IDAMapping/UnrealFunctions.py "
+                         "(+ UnrealGlobals.py, UnrealSymbols.map, UnrealMappings.json)";
         return ok_response(result);
     }
 
@@ -450,6 +467,8 @@ namespace adb_bridge
             return handle_dump_sdk();
         if (command == "redump")
             return handle_dump_sdk();
+        if (command == "dump_ida")
+            return handle_dump_ida();
         if (command == "mount_pak")
             return handle_mount_pak(cmd);
         if (command == "list_paks")
@@ -652,7 +671,7 @@ namespace adb_bridge
             // list built-ins hardcoded as in dispatch table
             std::vector<std::string> built = {
                 "list_mods", "reload_mod", "load_mod", "exec_lua", "list_hooks",
-                "dump_sdk", "mount_pak", "list_paks", "log_tail", "get_stats",
+                "dump_sdk", "dump_ida", "mount_pak", "list_paks", "log_tail", "get_stats",
                 "find_object", "find_class", "object_count", "dump_symbols",
                 "exec_console", "dump_console_commands",
                 "aes_scan", "aes_latest", "aes_keys",

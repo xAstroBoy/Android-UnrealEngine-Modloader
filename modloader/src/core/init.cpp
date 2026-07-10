@@ -339,10 +339,25 @@ namespace init
         logger::log_info("DEFER", "Reflection complete: %zu classes, %zu structs, %zu enums",
                          classes.size(), structs.size(), enums.size());
 
-        // Generate SDK
-        if (reflection_ok && config::auto_dump_on_boot() && (!classes.empty() || !structs.empty() || !enums.empty()))
+        // Auto-dump ONCE: generate the full SDK/IDA dump on the first launch, then
+        // write a marker so subsequent launches skip the heavy boot-time dump.
+        // Regenerate any time on demand via the ADB bridge (dump_sdk / dump_ida).
+        std::string dump_marker = paths::data_dir() + "/.sdk_dumped";
+        bool already_dumped = false;
         {
-            logger::log_info("DEFER", "Generating SDK...");
+            FILE *mf = fopen(dump_marker.c_str(), "r");
+            if (mf)
+            {
+                already_dumped = true;
+                fclose(mf);
+            }
+        }
+
+        // Generate SDK (once)
+        if (reflection_ok && config::auto_dump_on_boot() && !already_dumped &&
+            (!classes.empty() || !structs.empty() || !enums.empty()))
+        {
+            logger::log_info("DEFER", "Generating SDK (one-time boot dump)...");
             sdk_gen::generate();
             logger::log_info("DEFER", "SDK written to %s", paths::sdk_dir().c_str());
 
@@ -424,10 +439,29 @@ namespace init
                     logger::log_error("DEFER", "GObjects dump: cannot open %s", gobjects_path.c_str());
                 }
             }
+
+            // Mark the one-time boot dump as done — skip it on future launches.
+            {
+                FILE *mf = fopen(dump_marker.c_str(), "w");
+                if (mf)
+                {
+                    fputs("1\n", mf);
+                    fclose(mf);
+                }
+                logger::log_info("DEFER", "One-time boot dump complete — marker written (%s). "
+                                          "Future launches skip auto-dump; use bridge dump_sdk/dump_ida to refresh.",
+                                 dump_marker.c_str());
+            }
         }
         else if (!reflection_ok)
         {
             logger::log_warn("DEFER", "Skipping SDK generation — reflection walk unavailable on this session");
+        }
+        else if (already_dumped)
+        {
+            logger::log_info("DEFER", "SDK already dumped once (marker present) — skipping boot dump. "
+                                      "Delete %s or use bridge dump_sdk/dump_ida to regenerate.",
+                             dump_marker.c_str());
         }
         else if (!config::auto_dump_on_boot())
         {

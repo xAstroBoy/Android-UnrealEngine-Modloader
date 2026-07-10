@@ -32,6 +32,7 @@ set(MOD_SOURCES
     src/hook/native_hooks.cpp
     src/reflection/reflection_walker.cpp
     src/reflection/lua_dump_generator.cpp
+    src/reflection/ida_mapping_generator.cpp
     src/reflection/class_rebuilder.cpp
     src/lua/lua_engine.cpp
     src/lua/lua_bindings.cpp

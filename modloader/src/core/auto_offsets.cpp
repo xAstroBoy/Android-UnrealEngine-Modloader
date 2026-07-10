@@ -1252,6 +1252,162 @@ namespace auto_offsets
         return result;
     }
 
+    // ═══ FIND STATICLOADOBJECT ══════════════════════════════════════════════
+
+    uintptr_t find_static_load_object()
+    {
+        std::vector<std::string> log;
+        uintptr_t result = 0;
+
+        result = find_func_near_exact_string("StaticLoadObject", "StaticLoadObject(literal)", log);
+        if (result)
+            goto done;
+
+        // StaticLoadObjectInternal asserts/logs with these strings.
+        result = find_func_near_string("Illegal call to StaticLoadObject", "StaticLoadObject(Illegal)", log);
+        if (result)
+            goto done;
+
+        result = find_func_near_string("Failed to find object", "StaticLoadObject(FailFind)", log);
+        if (result)
+            goto done;
+
+    done:
+        for (const auto &msg : log)
+            logger::log_info("AUTOOFF", "  %s", msg.c_str());
+        return result;
+    }
+
+    // ═══ FIND APPENDSTRING (FName::ToString) ════════════════════════════════
+    // The name→string function reads an FNameEntry from the FNamePool: it loads
+    // the 2-byte entry header (LDRH), extracts the length (shift right by 6), then
+    // copies the characters out (STRB/STRH loop). We find every function that
+    // references the FNamePool global and score them by that shape; the ToString /
+    // AppendString routine scores highest. This is far more robust across ARM64
+    // games than a fixed byte signature.
+    uintptr_t find_append_string()
+    {
+        std::vector<std::string> log;
+        uintptr_t result = 0;
+
+        uintptr_t pool = find_gnames();
+        if (pool == 0)
+        {
+            log.push_back("AppendString: FNamePool unknown — cannot locate via xrefs");
+            goto done;
+        }
+
+        {
+            auto refs = find_adrp_refs_to(pool);
+            char msg[256];
+            snprintf(msg, sizeof(msg), "AppendString: %zu xref(s) to FNamePool 0x%lX",
+                     refs.size(), static_cast<unsigned long>(pool));
+            log.push_back(msg);
+
+            std::unordered_map<uintptr_t, int> func_scores;
+            for (uintptr_t ref : refs)
+            {
+                uintptr_t fstart = find_function_start(ref);
+                if (fstart == 0)
+                    continue;
+
+                int score = 0;
+                bool has_ldrh = false;
+                bool has_shift6 = false;
+                bool has_store = false;
+                for (uintptr_t pc = fstart; pc < fstart + 0x400; pc += 4)
+                {
+                    if (!safe_call::probe_read(reinterpret_cast<void *>(pc), 4))
+                        break;
+                    uint32_t instr = *reinterpret_cast<uint32_t *>(pc);
+
+                    // LDRH (unsigned offset) — read the 16-bit FNameEntry header.
+                    if ((instr & 0xFFC00000) == 0x79400000)
+                        has_ldrh = true;
+                    // UBFX/LSR by #6 (immr=6): 32-bit UBFM has immr field at bits 16..21.
+                    if ((instr & 0xFFC00000) == 0x53000000 && ((instr >> 16) & 0x3F) == 6)
+                        has_shift6 = true;
+                    // STRB (char copy-out loop).
+                    if ((instr & 0xFFC00000) == 0x39000000)
+                        has_store = true;
+
+                    if (instr == 0xD65F03C0) // RET — end of function
+                        break;
+                }
+
+                if (has_ldrh)
+                    score += 5;
+                if (has_shift6)
+                    score += 6;
+                if (has_store)
+                    score += 3;
+
+                if (score > func_scores[fstart])
+                    func_scores[fstart] = score;
+            }
+
+            int best_score = 0;
+            for (const auto &kv : func_scores)
+            {
+                if (kv.second > best_score)
+                {
+                    best_score = kv.second;
+                    result = kv.first;
+                }
+            }
+
+            if (result && best_score >= 8)
+            {
+                snprintf(msg, sizeof(msg), "AppendString: selected 0x%lX (shape score %d)",
+                         static_cast<unsigned long>(result), best_score);
+                log.push_back(msg);
+            }
+            else
+            {
+                snprintf(msg, sizeof(msg), "AppendString: no strong candidate (best score %d) — leaving unresolved",
+                         best_score);
+                log.push_back(msg);
+                result = 0;
+            }
+        }
+
+    done:
+        for (const auto &msg : log)
+            logger::log_info("AUTOOFF", "  %s", msg.c_str());
+        if (result)
+            logger::log_info("AUTOOFF", "AppendString discovered at 0x%lX", static_cast<unsigned long>(result));
+        return result;
+    }
+
+    // ═══ FIND GNATIVES ══════════════════════════════════════════════════════
+    // GNatives is the bytecode-opcode → handler function-pointer table used by the
+    // UFunction interpreter. It lives in .data and is referenced by the VM loop.
+    uintptr_t find_gnatives()
+    {
+        std::vector<std::string> log;
+        uintptr_t result = 0;
+
+        result = find_global_near_string("GNatives", "GNatives(literal)", log);
+        if (result)
+            goto done;
+
+        // The interpreter error path references these when it hits a bad opcode.
+        result = find_global_near_string("Unknown code token", "GNatives(UnknownToken)", log);
+        if (result)
+            goto done;
+
+        result = find_global_near_string("Bad bytecode", "GNatives(BadBytecode)", log);
+        if (result)
+            goto done;
+
+    done:
+        for (const auto &msg : log)
+            logger::log_info("AUTOOFF", "  %s", msg.c_str());
+        if (result)
+            logger::log_info("AUTOOFF", "GNatives discovered at 0x%lX", static_cast<unsigned long>(result));
+        return result;
+    }
+
     // ═══ PROBE FUOBJECTITEM SIZE ════════════════════════════════════════════
 
     uint32_t probe_fuobjectitem_size(uintptr_t guobjectarray)
@@ -1470,6 +1626,30 @@ namespace auto_offsets
         else
             result.failed_discoveries++;
 
+        // 9b. StaticLoadObject
+        log("--- Finding StaticLoadObject ---");
+        result.static_load_object = find_static_load_object();
+        if (result.static_load_object)
+            result.total_discoveries++;
+        else
+            result.failed_discoveries++;
+
+        // 9c. AppendString (FName::ToString) — Dumper-7 core scanner
+        log("--- Finding AppendString (FName::ToString) ---");
+        result.append_string = find_append_string();
+        if (result.append_string)
+            result.total_discoveries++;
+        else
+            result.failed_discoveries++;
+
+        // 9d. GNatives — Dumper-7 core scanner
+        log("--- Finding GNatives ---");
+        result.gnatives = find_gnatives();
+        if (result.gnatives)
+            result.total_discoveries++;
+        else
+            result.failed_discoveries++;
+
         // 10. FField owner size
         log("--- Probing FField owner size ---");
         result.ffield_owner_size = probe_ffield_owner_size();
@@ -1589,6 +1769,15 @@ namespace auto_offsets
             register_offset("StaticFindObject", result.static_find_object);
         if (result.static_construct_object)
             register_offset("StaticConstructObject", result.static_construct_object);
+        if (result.static_load_object)
+            register_offset("StaticLoadObject", result.static_load_object);
+        if (result.append_string)
+        {
+            register_offset("AppendString", result.append_string);
+            register_offset("FName::ToString", result.append_string);
+        }
+        if (result.gnatives)
+            register_offset("GNatives", result.gnatives);
 
         // Apply structural offsets
         if (result.fuobjectitem_size != 0)

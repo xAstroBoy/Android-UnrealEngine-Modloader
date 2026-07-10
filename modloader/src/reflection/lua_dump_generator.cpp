@@ -12,6 +12,7 @@
 // 3. SDK/ — Legacy per-class/struct/enum Lua files (kept for backward compat)
 
 #include "modloader/lua_dump_generator.h"
+#include "modloader/ida_mapping_generator.h"
 #include "modloader/reflection_walker.h"
 #include "modloader/paths.h"
 #include "modloader/logger.h"
@@ -1716,6 +1717,9 @@ namespace sdk_gen
 
         // 4. Usmap binary mappings (FModel/UE4SS compatible)
         total_files += generate_usmap();
+
+        // 5. IDA / Ghidra function-rename mappings (Dumper-7 style)
+        total_files += ida_map::generate();
 
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start);

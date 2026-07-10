@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <memory>
 #include <cstring>
+#include <exception>
 #include <sys/prctl.h>
 
 namespace pe_hook
@@ -391,12 +392,22 @@ namespace pe_hook
             }
             else
             {
-                // Pre-hooks
+                // Pre-hooks. Guarded: a Lua error inside a callback throws
+                // sol::error; unguarded it would unwind through the engine's
+                // ProcessEvent and std::terminate the game. Swallow + log.
                 for (auto &cb : snap_pre)
                 {
                     if (!cb)
                         continue; // defense-in-depth: skip null callbacks
-                    if (cb(self, func, parms))
+                    bool block = false;
+                    try {
+                        block = cb(self, func, parms);
+                    } catch (const std::exception& e) {
+                        logger::log_error("PE", "pre-hook callback threw: %s — ignored, game continues.", e.what());
+                    } catch (...) {
+                        logger::log_error("PE", "pre-hook callback threw a non-std exception — ignored.");
+                    }
+                    if (block)
                     {
                         blocked = true;
                         break;
@@ -409,12 +420,18 @@ namespace pe_hook
                     s_original(self, func, parms);
                 }
 
-                // Post-hooks
+                // Post-hooks (guarded the same way as pre-hooks)
                 for (auto &cb : snap_post)
                 {
                     if (!cb)
                         continue; // defense-in-depth: skip null callbacks
-                    cb(self, func, parms);
+                    try {
+                        cb(self, func, parms);
+                    } catch (const std::exception& e) {
+                        logger::log_error("PE", "post-hook callback threw: %s — ignored, game continues.", e.what());
+                    } catch (...) {
+                        logger::log_error("PE", "post-hook callback threw a non-std exception — ignored.");
+                    }
                 }
             }
         }

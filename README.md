@@ -73,6 +73,8 @@ The modloader is injected as a shared library (`libmodloader.so`) and provides:
 | `deploy.py` | All-in-one deploy script (mods, modloader, logs, launch, SDK) |
 | Bridge Console | Interactive REPL for live Lua execution on device |
 | SDK Dump | Full class/struct/enum dump for IntelliSense |
+| IDA Mapping | Dumper-7-style function-rename scripts for IDA/Ghidra — see [docs/IDA_MAPPING.md](docs/IDA_MAPPING.md) |
+| LSPosed Module | Root injection with no APK patching — see [lsposed-module/](lsposed-module/) |
 
 ## Quick Start
 
@@ -80,7 +82,7 @@ The modloader is injected as a shared library (`libmodloader.so`) and provides:
 
 - **Meta Quest** (Quest 2/3/Pro) with developer mode enabled
 - **ADB** installed and device connected (USB or wireless)
-- *APK Patching* Required to load libmodloader.so 
+- *APK Patching* Required to load libmodloader.so — **or** use the [LSPosed module](lsposed-module/) to inject via root with no patching
 - **Android NDK r23c** (for building from source — see [Building](#building))
 - **Python 3.8+** (for deployment tools)
 
