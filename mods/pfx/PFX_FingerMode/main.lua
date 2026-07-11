@@ -7,7 +7,7 @@
 --
 -- Chain (offsets from IDA, runtime = GetLibBase()+IDA):
 --   S = x0 of GetBall (sub_48A4710), captured via native hook.
---   S+0x5C0 = ball array ; array[i] = holder ; *(holder+0xA8) = ball_struct.
+--   S+0x5E0 = ball array ; array[i] = holder ; *(holder+0xA8) = ball_struct.
 --   ball_struct: pos @ +0/+4/+8 (table-local m); vel @ +0x38/+0x3C/+0x40. Parked = (-1,-1,-1).
 --
 -- Reads/writes use MemReadU64/MemReadFloat/MemWriteFloat (/proc/self/mem): direct
@@ -26,7 +26,7 @@
 -- one that steers. ALL active balls follow (multiball); velocity-steer so they COLLIDE.
 
 local TAG = "PFX_FingerMode"
-Log(TAG .. ": Loading v7.8 (validated stash-mask manager capture, S-tied cabinet)...")
+Log(TAG .. ": Loading v7.9 (offsets re-anchored for game APK update)...")
 
 -- Reload generation: a hot-reload bumps this; older LoopAsync callbacks compare it
 -- and self-terminate, so re-loading this file never stacks a second follow loop.
@@ -34,9 +34,9 @@ _G._FM_GEN = (_G._FM_GEN or 0) + 1
 local MY_GEN = _G._FM_GEN
 
 -- ── Native offsets ──────────────────────────────────────────────────────────
-local OFF_GETBALL  = 0x48A4710
-local OFF_VTABLE_S = 0x6cb6788
-local ARR_OFF    = 0x5C0
+local OFF_GETBALL  = 0x48A3798   -- game update (APK bump): was 0x48A4710
+local OFF_VTABLE_S = 0x6cba7c8   -- was 0x6cb6788
+local ARR_OFF    = 0x5E0         -- board struct grew +0x20; was 0x5C0
 local HOLDER_BS  = 0xA8
 local HOLDER_ACT = 0x90   -- holder+0x90: in-play flag (1 = active/simulating, 0 = trough/locked)
 
@@ -114,7 +114,7 @@ local function live(o) if not o then return false end local ok,v=pcall(function(
 -- (248) flags balls held by a gate/kicker/holder (a "stash"); the sim SKIPS those,
 -- so an in-play ball has its M+0x248 bit == 0. This is the game's OWN determination
 -- (from IDA sub_49995EC), far more reliable than velocity/holder flags.
-local OFF_BALLSIM = 0x49995EC   -- sub_49995EC(this=M, ...) — ball state update
+local OFF_BALLSIM = 0x4998F84   -- sub_4998F84(this=M, ...) — ball state update (was 0x49995EC)
 local OFF_M_STASH = 0x248       -- M+0x248: u32 bitmask of stashed (skipped) balls
 local function install_capture()
   if _G._FM_SHOOK then return end
@@ -134,7 +134,7 @@ local function install_capture()
         local m = PtrToInt(x0)
         local s = _G._FM_S or 0
         if s == 0 or MemReadU64(m + 8) ~= s then return end
-        local cnt = MemReadU64(s + 0x5C8) & 0xFFFFFFFF
+        local cnt = MemReadU64(s + 0x5E8) & 0xFFFFFFFF
         if cnt == 0 or cnt > 8 then return end
         local mask = MemReadU64(m + 0x248) & 0xFFFFFFFF
         if (mask >> cnt) == 0 then _G._FM_M = m end
@@ -144,7 +144,7 @@ local function install_capture()
   Log(TAG .. ": GetBall capture hook = " .. tostring(ok))
 end
 
-local OFF_BALLCOUNT = 0x5C8   -- *(int*)(S+0x5C8) = number of ball holders in the array
+local OFF_BALLCOUNT = 0x5E8   -- *(int*)(S+0x5E8) = number of ball holders (was 0x5C8)
 
 -- The manager's live STASH bitmask (M+0x248): bit i set ⇒ ball i is held by a gate/
 -- kicker/holder (not in play). Returns the mask ONLY when it's demonstrably valid —

@@ -17,7 +17,8 @@
 #include <android/log.h>
 #include <atomic>
 #include <cstring>
-#include <sys/stat.h> // umask
+#include <sys/stat.h>   // umask
+#include <sys/prctl.h>  // PR_SET_DUMPABLE (anti-tamper unbind)
 
 #define LOG_TAG "UEModLoader"
 
@@ -153,10 +154,41 @@ static void *boot_thread(void *arg)
     return nullptr;
 }
 
+// ═══ Anti-tamper unbind ════════════════════════════════════════════════════
+// Some game builds harden the process to NON-DUMPABLE (prctl PR_SET_DUMPABLE=0),
+// which makes /proc/self/mem root-owned and unreadable by our own uid — so every
+// /proc/self/mem read (MemReadU64 etc.) silently returns 0 and the modloader is
+// blind. Flip it back to dumpable at load, and keep re-applying on a thread so a
+// game that re-hardens (e.g. after a table/scene load) can't lock us out again.
+static void *anti_tamper_thread(void *)
+{
+    for (;;)
+    {
+        prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+        usleep(2 * 1000 * 1000); // 2s
+    }
+    return nullptr;
+}
+
+static void unbind_anti_tamper()
+{
+    prctl(PR_SET_DUMPABLE, 1, 0, 0, 0); // immediate, before anything reads /proc/self/mem
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, 64 * 1024);
+    pthread_create(&tid, &attr, anti_tamper_thread, nullptr);
+    pthread_attr_destroy(&attr);
+}
+
 // ═══ JNI_OnLoad — called when the .so is loaded by System.loadLibrary ══
 extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved)
 {
     (void)reserved;
+
+    // FIRST: undo any non-dumpable hardening so /proc/self/mem reads work.
+    unbind_anti_tamper();
 
     // Store the JavaVM* globally — this is the ONLY reliable way to get it
     g_jvm = vm;
@@ -219,6 +251,9 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved)
 // ═══ Constructor attribute — fallback if JNI_OnLoad is not called ═══════
 __attribute__((constructor)) static void modloader_constructor()
 {
+    // Earliest possible unbind (before JNI_OnLoad); the looping thread is started
+    // in JNI_OnLoad / unbind_anti_tamper().
+    prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
                         "Constructor called — library loaded into process");
 }
