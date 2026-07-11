@@ -281,6 +281,25 @@ public class UeModLoaderModule implements IXposedHookLoadPackage, IXposedHookZyg
             }
         }
 
+        // Make /sdcard/UnrealModloader/<pkg> the source of truth and bind it onto the
+        // game's scoped modloader dir — BEFORE loading the modloader, so the mods are
+        // visible at the scoped path when it enumerates them. Runs on a worker thread
+        // joined with a bounded wait so a hung `su` grant can't freeze the game launch;
+        // never touches app-ops, so it can't kill/restart the game.
+        final String bindPkg = pkg;
+        Thread bindThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                RootShell.bindPublicToScoped(bindPkg);
+            }
+        }, "uemodloader-bind");
+        bindThread.setDaemon(true);
+        bindThread.start();
+        try {
+            bindThread.join(9000);  // covers su's 8s timeout + margin; proceed regardless
+        } catch (InterruptedException ignored) {
+        }
+
         if (loadInGameNamespace(loadPath)) {
             sInjected = true;
             log("loaded " + PAYLOAD_SO + " into " + pkg + " (game namespace) from " + loadPath);
@@ -297,18 +316,8 @@ public class UeModLoaderModule implements IXposedHookLoadPackage, IXposedHookZyg
             }
         }
 
-        // Expose the modloader's data at /sdcard/UnrealModloader/<pkg> via a root
-        // bind-mount (see RootShell.mirrorToSdcard). Runs on a detached daemon
-        // thread — never touches app-ops, so it can't kill/restart the game.
-        final String target = pkg;
-        Thread mirrorThread = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                RootShell.mirrorToSdcard(target);
-            }
-        }, "uemodloader-mirror");
-        mirrorThread.setDaemon(true);
-        mirrorThread.start();
+        // (Storage bind is set up above, before the .so load, so the public store is
+        // already the source of truth by the time the modloader reads its mods.)
     }
 
     /**

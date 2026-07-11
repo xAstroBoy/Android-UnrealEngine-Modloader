@@ -65,30 +65,43 @@ final class RootShell {
      * even that one restart.
      */
     /**
-     * Expose the modloader's data at /sdcard/UnrealModloader/&lt;pkg&gt; without any
-     * app permission.
+     * Make /sdcard/UnrealModloader/&lt;pkg&gt; the SOURCE OF TRUTH for the modloader's
+     * data, and expose it to the injected game with no app permission.
      *
-     * An unpatched game can't be granted MANAGE_EXTERNAL_STORAGE (it isn't declared,
-     * and setting the app-op both fails to stick AND kills the app). Instead we use
-     * full root: the modloader writes to its own app-writable scoped dir
-     * (/sdcard/Android/data/&lt;pkg&gt;/files/modloader — no permission needed), and we
-     * bind-mount that, in the GLOBAL namespace, onto /sdcard/UnrealModloader/&lt;pkg&gt;.
-     * The same files then show up at the clean /sdcard path for MTP / file managers,
-     * and anything dropped there flows back to the app. Idempotent; re-run each launch
-     * (bind-mounts don't survive reboot). Never touches app-ops, so it can't kill the app.
+     * The game can't be granted MANAGE_EXTERNAL_STORAGE (not declared; setting the
+     * app-op fails to stick AND kills the app), so it can only touch its own scoped
+     * dir (/sdcard/Android/data/&lt;pkg&gt;/files/modloader). Rather than let that scoped
+     * dir be the real store — which an app UNINSTALL would wipe — we keep the real
+     * data in the public /sdcard/UnrealModloader/&lt;pkg&gt; and bind-mount THAT onto the
+     * scoped path (global namespace via `su -M`, so file managers/MTP see it too).
+     * The modloader then reads/writes the public store transparently, and an uninstall
+     * only clears the empty scoped mountpoint — the mods survive.
+     *
+     * MUST run BEFORE the modloader enumerates mods (the bind has to be in place when
+     * it reads the scoped path). One-time migration copies any pre-existing scoped data
+     * into the public store so upgrading users don't lose their current mods. Idempotent
+     * (skips if already bound); re-run each launch — bind-mounts don't survive reboot.
      */
-    static void mirrorToSdcard(String pkg) {
+    static void bindPublicToScoped(String pkg) {
         if (pkg == null || pkg.isEmpty()) {
             return;
         }
         String scoped = "/data/media/0/Android/data/" + pkg + "/files/modloader";
-        String mirror = "/data/media/0/UnrealModloader/" + pkg;
+        String pub = "/data/media/0/UnrealModloader/" + pkg;
         boolean ok = run(
-                "mkdir -p '" + scoped + "' '" + mirror + "'; "
-                        + "mountpoint -q '" + mirror + "' || mount --bind '" + scoped + "' '" + mirror + "'; "
-                        + "chmod -R 0777 /data/media/0/UnrealModloader 2>/dev/null; "
-                        + "echo mirror-ready");
-        XposedBridge.log("[UEModLoaderLSP] /sdcard/UnrealModloader/" + pkg
-                + (ok ? " mirrored (root)" : " mirror skipped (no root) — using scoped storage"));
+                "mkdir -p '" + pub + "' '" + scoped + "'; "
+                        + "if ! mountpoint -q '" + scoped + "'; then "
+                        // one-time migration: real scoped data -> public store (only if public is empty)
+                        + "  if [ -z \"$(ls -A '" + pub + "' 2>/dev/null)\" ] && [ -n \"$(ls -A '" + scoped + "' 2>/dev/null)\" ]; then "
+                        + "    cp -a '" + scoped + "/.' '" + pub + "/' 2>/dev/null; "
+                        + "  fi; "
+                        // public is the source of truth; bind it onto the app's scoped path
+                        + "  mount --bind '" + pub + "' '" + scoped + "'; "
+                        + "fi; "
+                        + "chmod -R 0777 '" + pub + "' 2>/dev/null; "
+                        + "echo bind-ready");
+        XposedBridge.log("[UEModLoaderLSP] " + pub + (ok
+                ? " is the source of truth (bound onto scoped; survives uninstall)"
+                : " bind skipped (no root) — falling back to scoped storage (lost on uninstall)"));
     }
 }
