@@ -259,7 +259,7 @@ namespace game_profile
         p.stable_global_offsets = {
             // Core UE engine functions (p_vaddr = file_offset + 0x1000)
             {"ProcessEvent", 0x167E4DC},                   // file: 0x167D4DC (verified via old→new caller/callee port)
-            {"StaticConstructObject_Internal", 0x169EFDC}, // file: 0x169DFDC
+            {"StaticConstructObject_Internal", 0x169EB90}, // params-struct form (was 0x169EFDC=StaticAllocateObject, wrong)
             {"StaticFindObject", 0x14F7004},               // file: 0x14F6004
             {"StaticLoadObject", 0x169B630},               // file: 0x169A630
             {"FName::Init", 0x14B41F0},                    // file: 0x14A41F0
@@ -396,8 +396,13 @@ namespace game_profile
             {"ProcessEvent",
              "FD 7B BA A9 FC 0B 00 F9 FD 03 00 91 FA 67 02 A9 F8 5F 03 A9 F6 57 04 A9 F4 4F 05 A9 FF 03 03 D1 58 D0 3B D5",
              -1, 0},
+            // StaticConstructObject_Internal (UE5 params-struct form) — function START through
+            // the distinctive body (MOV W9,#0x10000080; LDP X20,X21,[X0]; LDR W22,[X0,#0x18];
+            // LDR W8,[X20,#0xD4]); volatile stack-frame/canary ops wildcarded. The OLD pattern
+            // here mis-resolved to FObjectInitializer::PostConstructInit (+0x144C), which crashed
+            // when called with the construct ABI. Verified unique.
             {"StaticConstructObject_Internal",
-             "?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? F8 03 14 AA 1F 03 00 F1 62 06 40 F9",
+             "FD 7B BB A9 FC 0B 00 F9 FD 03 00 91 F8 5F 02 A9 F6 57 03 A9 F4 4F 04 A9 ?? ?? ?? ?? ?? ?? ?? ?? F3 03 00 AA ?? ?? ?? ?? 09 10 80 52 09 00 A2 72 ?? ?? ?? ?? 14 54 40 A9 16 18 40 B9 88 D6 40 B9 1F 01 09 6A",
              -1, 0},
             {"StaticFindObject",
              "09 0D 40 B9 4B 25 40 B9 7F 01 09 6B 6D 01 00 54 2B FD 4D D3 4A 09 40 F9 6B 3D 7D 92 29 3D 00 12 4A 69 6B F8 8B 02 80 52 29 29 AB 9B 29 09 40 B9 ?? ?? ?? ?? ?? ?? ?? ?? E9 03 1F AA 29 09 40 B9 ?? ?? ?? ?? 14 89 40 F9 ?? ?? ?? ?? ?? ?? ?? ??",

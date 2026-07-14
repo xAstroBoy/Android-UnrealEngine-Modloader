@@ -1099,8 +1099,14 @@ namespace lua_uobject
         }
 
         // Defensive validation — queued calls may execute later when object/function
-        // is already destroyed or GC'd.
-        if (!item.obj || !ue::is_mapped_ptr(item.obj) || !ue::is_valid_ptr(item.obj) || !ue::is_valid_uobject(item.obj) || !is_live_in_guobjectarray(item.obj))
+        // is already destroyed or GC'd. CDOs live outside the transient GUObjectArray
+        // region and have out-of-range internal indices, so is_valid_uobject /
+        // is_live_in_guobjectarray reject them despite being permanently valid; skip
+        // those two checks for CDOs (still require mapped + valid pointer).
+        const bool item_is_cdo = ue::is_mapped_ptr(item.obj) && ue::is_valid_ptr(item.obj) &&
+                                 (ue::uobj_get_flags(item.obj) & ue::RF_ClassDefaultObject) != 0;
+        if (!item.obj || !ue::is_mapped_ptr(item.obj) || !ue::is_valid_ptr(item.obj) ||
+            (!item_is_cdo && (!ue::is_valid_uobject(item.obj) || !is_live_in_guobjectarray(item.obj))))
         {
             logger::log_warn("CALLBG", "[GT] Dropping call %s::%s — invalid/stale object %p",
                              item.class_name.c_str(), item.func_name.c_str(), item.obj);
@@ -2897,7 +2903,12 @@ namespace lua_uobject
 
         // GUObjectArray round-trip: skip if object was freed/reallocated since captured.
         // Uses untagged (MTE-excluded) pointer read to detect stale MTE-tagged ptrs.
-        if (!is_live_in_guobjectarray(obj))
+        // EXCEPTION: CDOs (Class Default Objects) are permanent, ProcessEvent-callable
+        // instances that legitimately live outside the transient region this scan covers,
+        // so they fail the check though they're perfectly valid. Allow them — the sigsetjmp
+        // guard below still protects the call. (Enables GetCDO(x):Call(fn, args...).)
+        const bool obj_is_cdo = (ue::uobj_get_flags(obj) & ue::RF_ClassDefaultObject) != 0;
+        if (!obj_is_cdo && !is_live_in_guobjectarray(obj))
         {
             logger::log_warn("CALL", "Skipping %s::%s on %p — not in GUObjectArray (stale/freed)",
                              class_name.c_str(), func_name.c_str(), obj);

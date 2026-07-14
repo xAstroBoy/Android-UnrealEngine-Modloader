@@ -72,6 +72,17 @@ namespace symbols
     extern ue::StaticLoadObjectFn StaticLoadObject;
     extern ue::StaticLoadClassFn StaticLoadClass;
     extern ue::StaticConstructObjectFn StaticConstructObject;
+    // true = StaticConstructObject uses the UE4.26+ params-struct ABI (form B in types.h);
+    // false = legacy multi-arg ABI (form A). Set by find_static_construct_object() at resolve.
+    extern bool StaticConstructObject_is_params_struct;
+
+    // Construct a UObject via StaticConstructObject_Internal, handling BOTH ABIs.
+    // Returns nullptr if the symbol isn't resolved or cls is null. Construction touches
+    // UObject internals — call from a game-safe context. This is THE way to make objects
+    // (NewObject, cheat managers, etc.) so any future construction is ABI-correct.
+    ue::UObject *construct_object(ue::UClass *cls, ue::UObject *outer,
+                                  ue::FName name = ue::FName{0, 0}, int32_t set_flags = 0);
+
     extern ue::PakMountFn PakMount;
 
     // Globals (pointers to the global variables in libUE4.so)

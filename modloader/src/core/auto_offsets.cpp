@@ -1224,9 +1224,35 @@ namespace auto_offsets
         std::vector<std::string> log;
         uintptr_t result = 0;
 
-        // StaticConstructObject_Internal uses these strings:
+        // ── PRIMARY: UE4.26+ params-struct form (ABI form B) ────────────────
+        // Assert strings are stripped in shipping UE5, so the string heuristics below
+        // mis-resolve to a NEIGHBORING function (e.g. FObjectInitializer::PostConstructInit),
+        // which then crashes when called with the wrong ABI. Anchor instead on the
+        // distinctive BODY of StaticConstructObject_Internal reading the params struct:
+        //   MOV W9,#0x10000080 ; LDP X20,X21,[X0] (Class,Outer) ; LDR W22,[X0,#0x18] (SetFlags)
+        //   ; LDR W8,[X20,#0xD4] (Class flags) ; TST W8,W9
+        // Verified unique across the image; walk back to the prologue for the entry.
+        {
+            void *hit = pattern::scan(
+                "09 10 80 52 09 00 A2 72 A8 83 1F F8 14 54 40 A9 16 18 40 B9 88 D6 40 B9 1F 01 09 6A");
+            if (hit)
+            {
+                uintptr_t fn = find_function_start(reinterpret_cast<uintptr_t>(hit), 0x100);
+                if (fn)
+                {
+                    symbols::StaticConstructObject_is_params_struct = true;
+                    char buf[96];
+                    snprintf(buf, sizeof(buf), "StaticConstructObject(params-struct AOB) @ 0x%lX", (unsigned long)fn);
+                    log.push_back(buf);
+                    result = fn;
+                    goto done;
+                }
+            }
+        }
+
+        // ── FALLBACK: legacy multi-arg form (ABI form A) via string refs ────
         // UE4: "StaticConstructObject_Internal" in logging/asserts
-        // UE5: Uses FStaticConstructObjectParameters struct, still has string refs
+        symbols::StaticConstructObject_is_params_struct = false;
         result = find_func_near_string("StaticConstructObject_Internal", "StaticConstructObject(literal)", log);
         if (result)
             goto done;

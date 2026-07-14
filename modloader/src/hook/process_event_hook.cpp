@@ -4,6 +4,7 @@
 // Returning true from a pre-hook cancels the ProcessEvent call entirely
 
 #include "modloader/process_event_hook.h"
+#include "modloader/crash_handler.h"
 #include "modloader/pe_trace.h"
 #include "modloader/symbols.h"
 #include "modloader/logger.h"
@@ -213,6 +214,12 @@ namespace pe_hook
     static void hooked_process_event(ue::UObject *self, ue::UFunction *func, void *parms)
     {
         s_call_count.fetch_add(1, std::memory_order_relaxed);
+
+        // Ensure THIS thread (the game thread — PE always fires here) has a large
+        // alternate signal stack, so the crash handler can survive a stack
+        // overflow/smash from any guarded call and siglongjmp-recover instead of
+        // taking the whole game down. Idempotent + ~free after the first call.
+        crash_handler::ensure_thread_sigaltstack();
 
         // PE trace logger (atomic early-out if inactive — ~1 cycle cost when off)
         pe_trace::record(self, func);

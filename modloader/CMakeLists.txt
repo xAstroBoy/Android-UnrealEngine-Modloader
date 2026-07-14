@@ -36,6 +36,7 @@ set(MOD_SOURCES
     src/reflection/class_rebuilder.cpp
     src/lua/lua_engine.cpp
     src/lua/lua_bindings.cpp
+    src/lua/lua_memtools.cpp
     src/lua/lua_uobject.cpp
     src/lua/lua_types.cpp
     src/lua/lua_enums.cpp

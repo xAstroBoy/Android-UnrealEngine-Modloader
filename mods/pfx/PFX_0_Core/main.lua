@@ -31,6 +31,34 @@ local function base()
 end
 local function heap(p) return p and p > 0x7000000000 and p < 0x8000000000 end
 
+-- ── UPDATE-RESISTANT address resolution (AOB signature → RVA fallback) ───────
+-- Mods should NOT hardcode libUnreal.so RVAs (they rot every game update).
+-- Instead: resolve(name, sig, rva) — AOBScan the byte signature first (survives
+-- updates that only shift addresses), and fall back to base()+rva for the
+-- current build. Result cached. sig = a UNIQUE raw/wildcarded pattern (generate
+-- with the AOBUnique / aob_make_unique tool, or IDA make_signature). If the AOB
+-- and the RVA disagree, the game moved the function → we log it and trust AOB.
+local _res_cache = {}
+local function resolve(name, sig, rva)
+  if _res_cache[name] then return _res_cache[name] end
+  local addr = 0
+  if sig and sig ~= "" and rawget(_G, "AOBScan") then
+    pcall(function()
+      local m = AOBScan(sig, "libUnreal.so", 2)
+      if m and #m == 1 then addr = m[1].abs end
+    end)
+  end
+  local rva_addr = rva and (base() + rva) or 0
+  if addr == 0 then
+    addr = rva_addr                                  -- AOB miss → hardcoded RVA
+  elseif rva_addr ~= 0 and addr ~= rva_addr then
+    Log(TAG .. string.format(": resolve('%s') AOB=0x%X != RVA=0x%X — GAME UPDATED, trusting AOB",
+      name, addr, rva_addr))
+  end
+  _res_cache[name] = addr
+  return addr
+end
+
 -- ── 2. YUP offsets — THE single place to update on a game update ─────────────
 -- (verified for the current build; the game APK bump grew the board struct +0x20)
 local OFF = {
@@ -111,7 +139,7 @@ end
 install()
 
 _G.PFXCore = {
-  base = base, heap = heap, OFF = OFF, unharden = unharden,
+  base = base, heap = heap, OFF = OFF, unharden = unharden, resolve = resolve,
   get_S = get_S, get_M = get_M, each_ball = each_ball,
   ball_pos = ball_pos, ball_radius = ball_radius, set_ball_radius = set_ball_radius,
   ball_active = ball_active, stash_mask = stash_mask,

@@ -3,6 +3,7 @@
 // Every function is fully implemented. No stubs. No TODOs.
 
 #include "modloader/lua_bindings.h"
+#include "modloader/crash_handler.h"
 #include "modloader/lua_uobject.h"
 #include "modloader/class_rebuilder.h"
 #include "modloader/reflection_walker.h"
@@ -290,6 +291,12 @@ namespace lua_bindings
         typedef uint64_t (*fn_7)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
         typedef uint64_t (*fn_8)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 
+        // Guard the raw native call: a bad game function can stack-overflow/smash.
+        // With the per-thread alt-stack the handler recovers via siglongjmp instead
+        // of killing the game; we then return nil. FULL TOLERANCE for any callee.
+        crash_handler::ensure_thread_sigaltstack();
+        bool native_call_ok = safe_call::execute([&]()
+        {
         if (!is_float_ret)
         {
             switch (x_idx)
@@ -353,6 +360,12 @@ namespace lua_bindings
                 result_float = ((fn_f4)addr)(x_regs[0], x_regs[1], x_regs[2], x_regs[3]);
                 break;
             }
+        }
+        }, "CallNative").ok;
+        if (!native_call_ok)
+        {
+            logger::log_error("LUA", "CallNative @ %p crashed (recovered via alt-stack guard) — returning nil", addr);
+            return sol::nil;
         }
 
         // Return value based on ret_type
@@ -858,18 +871,11 @@ namespace lua_bindings
         std::thread([pc, cheat_class, cm_offset]() {
             logger::log_info("LUA", "EnableCheatsAsync: [BG] calling StaticConstructObject_Internal...");
 
-            ue::FName fname_none = {0, 0};
-            ue::UObject* new_cm = symbols::StaticConstructObject(
-                cheat_class,    // class
-                pc,             // outer = the PlayerController
-                fname_none,     // name = NAME_None
-                0,              // flags
-                0,              // internal flags
-                nullptr,        // template
-                false,          // copy transients
-                nullptr,        // instance graph
-                false           // assume archetype
-            );
+            // ABI-correct construction: params-struct on UE4.26+, multi-arg on legacy.
+            // (Previously this called the multi-arg ABI unconditionally, which on UE5
+            // scribbled a UClass* as if it were an FStaticConstructObjectParameters& and
+            // crashed at fault 0x10. construct_object() picks the right ABI.)
+            ue::UObject* new_cm = symbols::construct_object(cheat_class, pc);
 
             if (!new_cm) {
                 logger::log_error("LUA", "EnableCheatsAsync: [BG] StaticConstructObject returned NULL!");
@@ -1960,6 +1966,102 @@ namespace lua_bindings
 
         return native_hooks::install_at(addr, hook_name, pre_cb, post_cb); });
 
+        // ── RegisterNativeArgFilter — a PURE-C++ hook (no Lua callback) ──────
+        // On every call to `addr`, read a u32 field at (argN + field_off); if it
+        // equals match_value, zero `clear_size` bytes at (argN + clear_off). The
+        // predicate runs INLINE in the native hook dispatch — it is NEVER deferred
+        // to the Lua game-thread queue — so it is safe on hot / mid-emulation
+        // functions where a Lua hook callback crashes (see the WPC switch-setter).
+        // enable_ptr (optional lightuserdata → a byte): while *enable_ptr == 0 the
+        // filter is inert, so a mod can toggle it live without reinstalling.
+        // Sig: RegisterNativeArgFilter(addr, name, argIdx, fieldOff, matchVal,
+        //                              clearOff, clearSize?, enablePtr?)
+        lua.set_function("RegisterNativeArgFilter",
+            [](void* addr, const std::string& name, int arg_index, int64_t field_off,
+               uint32_t match_value, int64_t clear_off, sol::optional<int> clear_size_opt,
+               sol::optional<void*> enable_ptr_opt) -> bool
+        {
+            if (!addr || arg_index < 0 || arg_index > 7) {
+                logger::log_error("LUA", "RegisterNativeArgFilter: bad addr/argIdx for '%s'", name.c_str());
+                return false;
+            }
+            int clear_size = clear_size_opt.value_or(1);
+            void* enable_ptr = enable_ptr_opt.value_or(nullptr);
+            native_hooks::NativePreCallback pre =
+                [arg_index, field_off, match_value, clear_off, clear_size, enable_ptr]
+                (native_hooks::NativeCallContext& ctx)
+            {
+                if (enable_ptr) {
+                    if (!ue::is_mapped_ptr(enable_ptr)) return;
+                    if (*reinterpret_cast<volatile uint8_t*>(enable_ptr) == 0) return; // toggled off
+                }
+                uintptr_t argp = ctx.x[arg_index];
+                if (!argp || !ue::is_mapped_ptr(reinterpret_cast<void*>(argp))) return;
+                if (*reinterpret_cast<uint32_t*>(argp + field_off) != match_value) return;
+                void* cp = reinterpret_cast<void*>(argp + clear_off);
+                switch (clear_size) {
+                    case 2: *reinterpret_cast<uint16_t*>(cp) = 0; break;
+                    case 4: *reinterpret_cast<uint32_t*>(cp) = 0; break;
+                    case 8: *reinterpret_cast<uint64_t*>(cp) = 0; break;
+                    default: *reinterpret_cast<uint8_t*>(cp)  = 0; break;
+                }
+            };
+            bool ok = native_hooks::install_at(addr, name, pre, nullptr) != 0;
+            logger::log_info("LUA", "RegisterNativeArgFilter '%s' @%p arg%d (+%lld)==%u -> zero(+%lld) sz%d : %s",
+                             name.c_str(), addr, arg_index, (long long)field_off, match_value,
+                             (long long)clear_off, clear_size, ok ? "OK" : "FAIL");
+            return ok;
+        });
+
+        // ── RegisterNativeCapture — a PURE-C++ hook (no Lua callback) ───────
+        // On every call to `addr`, if arg `argIdx` is a pointer in the half-open
+        // range [minHeap, maxHeap) (maxHeap == 0 → no upper bound), store its VALUE
+        // into the 8-byte slot at destPtr. The predicate runs INLINE in the native
+        // hook dispatch — NEVER deferred to the Lua game-thread queue, and it does
+        // NO syscall and NEVER dereferences the captured pointer — so it is safe and
+        // cheap on functions that fire thousands of times/sec on the ROM/emulation
+        // thread. This replaces Lua-callback capture hooks (RegisterNativeHookAt) on
+        // such hot functions: a Lua callback there runs the shared lua_State from the
+        // emulation thread (or re-entrantly mid-VM), racing the game thread and
+        // corrupting a live closure → the classic garbage-Proto luaV_execute crash.
+        // destPtr must be a stable malloc'd slot the mod reads with MemReadU64; the
+        // dereference of the captured object happens later, safely, on the game
+        // thread. Sig: RegisterNativeCapture(addr,name,argIdx,destPtr,minHeap?,maxHeap?)
+        lua.set_function("RegisterNativeCapture",
+            [](void* addr, const std::string& name, int arg_index, void* dest_ptr,
+               sol::optional<double> min_heap_opt, sol::optional<double> max_heap_opt) -> bool
+        {
+            if (!addr || arg_index < 0 || arg_index > 7 || !dest_ptr) {
+                logger::log_error("LUA", "RegisterNativeCapture: bad addr/argIdx/dest for '%s'", name.c_str());
+                return false;
+            }
+            // Strip a possible MTE / top-byte tag from the destination slot, then
+            // validate it ONCE here (never in the hot per-call path).
+            void* dest = reinterpret_cast<void*>(
+                reinterpret_cast<uintptr_t>(dest_ptr) & 0x00FFFFFFFFFFFFFFULL);
+            if (!ue::is_mapped_ptr(dest)) {
+                logger::log_error("LUA", "RegisterNativeCapture: dest %p not mapped for '%s'", dest, name.c_str());
+                return false;
+            }
+            uint64_t min_heap = min_heap_opt.has_value()
+                ? (uint64_t)(int64_t)min_heap_opt.value() : 0x7000000000ULL;
+            uint64_t max_heap = max_heap_opt.has_value()
+                ? (uint64_t)(int64_t)max_heap_opt.value() : 0ULL;
+            native_hooks::NativePreCallback pre =
+                [arg_index, dest, min_heap, max_heap](native_hooks::NativeCallContext& ctx)
+            {
+                uint64_t argp = (uint64_t)ctx.x[arg_index];
+                if (argp < min_heap) return;
+                if (max_heap && argp >= max_heap) return;
+                *reinterpret_cast<volatile uint64_t*>(dest) = argp;
+            };
+            bool ok = native_hooks::install_at(addr, name, pre, nullptr) != 0;
+            logger::log_info("LUA", "RegisterNativeCapture '%s' @%p arg%d -> [%p] heap[0x%llx,0x%llx) : %s",
+                             name.c_str(), addr, arg_index, dest,
+                             (unsigned long long)min_heap, (unsigned long long)max_heap, ok ? "OK" : "FAIL");
+            return ok;
+        });
+
         // ── CallNative — call any resolved address ──────────────────────────
         lua.set_function("CallNative", [](sol::this_state ts, void *addr, const std::string &sig, sol::variadic_args va) -> sol::object
                          { return call_native_impl(ts, addr, sig, va); });
@@ -2815,6 +2917,9 @@ namespace lua_bindings
 
         lua.set_function("GetDataDir", []() -> std::string
                          { return paths::data_dir(); });
+
+        // Memory toolkit: scanner / inspector / hardware watchpoint / AOB (lua_memtools.cpp)
+        register_memtools(lua);
 
         logger::log_info("LUA", "All global Lua API functions registered");
     }
