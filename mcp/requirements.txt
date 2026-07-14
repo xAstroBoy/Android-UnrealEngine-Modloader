@@ -1,0 +1,3 @@
+# Both MCP servers need only the MCP SDK; everything else is Python stdlib.
+# Device I/O goes through the `adb` CLI (must be on PATH, or set the ADB env var).
+mcp>=1.2.0

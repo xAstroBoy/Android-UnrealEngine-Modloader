@@ -70,17 +70,29 @@ local SPREAD     = 0.03   -- m: fan multiball out so they don't stack on one poi
 -- keep it for the whole grip (so it doesn't drop when we slow it at your hand).
 local MOVE_THRESH = 0.10  -- m/s; staged balls measured ~0.01, in-play ~0.3+
 
--- ── Active (in-play) detection ───────────────────────────────────────────────
--- From IDA of the YUP ball-sim loop (sub_49995EC): a ball is processed (in play)
--- only when holder+0x90==1 (simulating) AND holder+0x4A==0. holder+0x4A is the
--- "held" flag the sim uses to SKIP balls sitting in a kicker/lock/kickout (verified
--- live: lock-held balls read 0x4A=1, the free playfield ball reads 0). The sim also
--- excludes balls matched to a lock mechanism (a bitmask we can't cheaply rebuild) —
--- those staged balls sit at rest, so the loop's motion gate covers them.
-local HOLDER_SKIP = 0x4A
+-- ── Active (in-play) detection — the ball_struct LOCK-ASSIGNMENT fields ───────
+-- The holder flag bytes (0x48/0x49/0x4A/0x50) are table/state-fragile and the sim's
+-- lock bitmask is empty at table-start, so none of them isolate the ONE controllable
+-- ball from balls sitting in a multiball lock. The reliable signal lives on the
+-- ball_struct itself (verified live: 1 in-play + 2 table-locked balls):
+--   ball_struct+0xE2 (byte) == 1  ONLY for the controllable in-play ball; 0 when locked.
+--   ball_struct+0xE4 (byte) == 0  for in-play; == a non-zero LOCK-SLOT ID when locked.
+--   (0xE0 stays 1 for all, so it can't discriminate; 0xE2 is the clean boolean.)
+-- These are lock-assignment fields (set when a ball is locked/released, stable per
+-- lock-state — not per-frame like velocity), so a launched ball keeps 0xE2==1 and a
+-- ball that gets locked flips to 0. holder+0x4A==0 (not in a kicker) is kept as a cheap
+-- extra gate. No get_M / lock-array walk needed → 3 reads, fast at 90 Hz.
+local function fm_mapped(p) return p > 0x7000000000 and p < 0x8000000000 end
 local function ball_active(h)
-  return (MemReadU64(h + HOLDER_ACT) & 0xFFFFFFFF) == 1
-     and (MemReadU64(h + HOLDER_SKIP) & 0xFF) == 0
+  local bs = MemReadU64(h + HOLDER_BS)                                    -- 0xA8 -> ball_struct
+  if not fm_mapped(bs) then return false end
+  -- ball_struct+0xE2 == 1 marks THE current ball in play (verified live: it was the
+  -- shooter-lane ball at rest, then followed the ball as it launched & rolled; the 2
+  -- table-locked balls stay 0). 0xE4 is NOT a lock flag (the rolling ball also had
+  -- 0xE4=239) so we do NOT gate on it. holder+0x4A==0 keeps a kicker/scoop ball out.
+  if (MemReadU8(bs + 0xE2) & 0xFF) == 0 then return false end             -- not the in-play ball
+  if (MemReadU8(h  + 0x4A) & 0xFF) ~= 0 then return false end             -- held in a kicker/scoop
+  return true
 end
 
 -- ── State ───────────────────────────────────────────────────────────────────
@@ -118,6 +130,15 @@ local OFF_BALLSIM = 0x4998F84   -- sub_4998F84(this=M, ...) — ball state updat
 local OFF_M_STASH = 0x248       -- M+0x248: u32 bitmask of stashed (skipped) balls
 local function install_capture()
   if _G._FM_SHOOK then return end
+  -- PFX_0_Core (loads first) already hooks GetBall + ball-sim at these exact
+  -- addresses. Registering our OWN hooks at the same addresses just clashes — only
+  -- one fires, so _FM_S/_FM_M stay 0 and finger mode goes dead. When Core is present,
+  -- skip our hooks and read S/M/stash straight from it (get_S/stash_mask below).
+  if _G.PFXCore then
+    _G._FM_SHOOK = true
+    Log(TAG .. ": using PFX_0_Core S/M capture (no duplicate GetBall hook)")
+    return
+  end
   local base = YUP.GetLibBase()
   local ok = false
   pcall(function()
@@ -152,6 +173,8 @@ local OFF_BALLCOUNT = 0x5E8   -- *(int*)(S+0x5E8) = number of ball holders (was 
 -- ball count (a valid mask fits in `count` bits; a stale/reused field has high bits).
 -- Returns nil when we can't trust it, so the caller falls back to a motion gate.
 local function stash_mask(s)
+  -- Prefer Core's validated stash bitmask (its ball-sim hook is the one that fires).
+  if _G.PFXCore then local m = _G.PFXCore.stash_mask(); if m ~= nil then return m end end
   local M = _G._FM_M or 0
   if M == 0 or not s or s == 0 then return nil end
   if MemReadU64(M + 8) ~= s then return nil end
@@ -170,6 +193,8 @@ local function valid_S(s)
 end
 
 local function get_S()
+  -- Prefer Core's capture (its GetBall hook is the one that fires when both mods run).
+  if _G.PFXCore then local s = _G.PFXCore.get_S(); if s and s ~= 0 then return s end end
   local cand = _G._FM_S or 0
   if valid_S(cand) then return cand end
   return 0
@@ -562,31 +587,61 @@ local function start_loop()
     if not (rx and ux) then rx, ry, rz = 1, 0, 0; ux, uy, uz = 0, 0, 1 end
 
     grabbing = true
-    -- Chase only ACTUALLY-IN-PLAY balls. Preferred test = the game's own stash bitmask
-    -- (bit i == 0 ⇒ in play); a stashed ball is NEVER grabbed even if our ripping bumps
-    -- it loose. When the bitmask can't be trusted (validation fails), fall back to a
-    -- motion gate. The multiball set fans out along the hand's axes so it rotates in 3D.
-    local mask = stash_mask(s)
+    -- Three-signal grab, robust against table-locked balls:
+    --  1. GATE  ball_active(h) — the game's own in-play test. A locked/held/staged ball
+    --           (holder+0x4A!=0, or in a lock/stash) fails this; we release it (clear the
+    --           latch) and NEVER steer it. This is what stops us ripping locked balls.
+    --  2. ACQUIRE  only a MOVING in-play ball (speed>MOVE_THRESH) is grabbed. A resting
+    --           ball sitting in a trough/lock (even if momentarily 0x4A==0) is NOT moving,
+    --           so we don't yank it out. The one you're PLAYING rolls -> it's grabbed.
+    --  3. HOLD  once grabbed, the latch keeps steering it while it stays in-play, so
+    --           holding it still at your hand (speed -> 0) doesn't drop it. The latch is
+    --           cleared on grip release, on drain (parked), and when it leaves in-play (1).
     local n = 0
     each_ball(s, function(i, bs, h)
-      if ball_active(h) then
-        local x, y = ball_pos(bs)
-        if not is_parked(x, y) then
-          local inplay
-          if mask then inplay = ((mask >> i) & 1) == 0
-          else inplay = ball_speed(bs) > MOVE_THRESH end
-          if inplay then
-            local a = (n % 3 - 1) * SPREAD
-            local b = (math.floor(n / 3) - 1) * SPREAD
-            steer_ball(bs, tx + a*rx + b*ux, ty + a*ry + b*uy, tz + a*rz + b*uz)
-            n = n + 1
-          end
-        end
+      if not ball_active(h) then grabbed[bs] = nil; return end   -- not in play -> release, don't touch
+      local x, y = ball_pos(bs)
+      if is_parked(x, y) then grabbed[bs] = nil; return end       -- drained -> release
+      if grabbed[bs] or ball_speed(bs) > MOVE_THRESH then
+        grabbed[bs] = true
+        local a = (n % 3 - 1) * SPREAD
+        local b = (math.floor(n / 3) - 1) * SPREAD
+        steer_ball(bs, tx + a*rx + b*ux, ty + a*ry + b*uy, tz + a*rz + b*uz)
+        n = n + 1
       end
     end)
     return false
   end)
   Log(TAG .. ": follow loop started (hold grip to control)")
+end
+
+-- ── Background PRE-WARM ───────────────────────────────────────────────────────
+-- The first grip used to FREEZE the game ~¼s: get_cabinet() and calibrate() each do
+-- a FindAllOf("ball_C") (~130ms) + reflection the very first time per table, and both
+-- ran lazily inside the grip path. This low-rate (3 Hz) loop does that heavy resolve
+-- PROACTIVELY once a ball is in play — before you grip — so the results are cached and
+-- the grip path is instant. The unavoidable FindAllOf hitch now lands at ball-launch
+-- (masked by the ball flying out) instead of the moment you try to steer. Cheap when
+-- already cached (a live()/S compare), so it costs nothing on subsequent ticks.
+local prewarm_active = false
+local function start_prewarm()
+  if prewarm_active then return end
+  prewarm_active = true
+  LoopAsync(333, function()
+    if _G._FM_GEN ~= MY_GEN then return true end        -- superseded by a reload
+    if not enabled then prewarm_active = false; return true end
+    local s = get_S(); if s == 0 then return false end
+    local cab = get_cabinet(); if not cab then return false end   -- FindAllOf; cached after 1st
+    if cal_cool > 0 then cal_cool = cal_cool - 1 end
+    if cal_cab ~= cab and cal_cool == 0 then
+      local hasball = false                             -- cheap memory precheck (no FindAllOf)
+      each_ball(s, function(i, bs, h)
+        if ball_active(h) then local x, y = ball_pos(bs); if not is_parked(x, y) then hasball = true end end
+      end)
+      if hasball and not calibrate(cab, s) then cal_cool = 90 end
+    end
+    return false
+  end)
 end
 
 -- ── Arm / disarm ─────────────────────────────────────────────────────────────
@@ -596,6 +651,7 @@ local function arm()
   ovr_setup()
   epi_init()
   start_loop()
+  start_prewarm()   -- resolve cabinet + calibrate off the grip path (no first-grip freeze)
 end
 
 local function disarm()
@@ -617,6 +673,36 @@ end) end)
 pcall(function() RegisterCommand("finger_off", function()
   disarm()
   return TAG .. ": OFF"
+end) end)
+
+-- ── Unstuck: teleport every in-play ball to the centre of the playfield, raised a
+-- little with zero velocity so it drops back into play. The ball can wedge in a wall
+-- or corner (esp. in finger mode); this frees it. Struct axes (table-local metres):
+-- x=+0 width, y=+4 height, z=+8 length; vel x/y/z at +0x38/+0x3C/+0x40. Centre (0,*,0)
+-- is always on the playfield on every table, so it's a safe generic drop point.
+local function unstuck()
+  local s = get_S(); if s == 0 then return 0 end
+  local n = 0
+  each_ball(s, function(i, bs, h)
+    if ball_active(h) then
+      local x, y = ball_pos(bs)
+      if not is_parked(x, y) then
+        MemWriteFloat(bs + 0,    0.0)    -- x: centre width
+        MemWriteFloat(bs + 4,    0.13)   -- y: raised above the surface so it drops in
+        MemWriteFloat(bs + 8,    0.0)    -- z: centre length
+        MemWriteFloat(bs + 0x38, 0.0)    -- zero velocity (let physics take over)
+        MemWriteFloat(bs + 0x3C, 0.0)
+        MemWriteFloat(bs + 0x40, 0.0)
+        n = n + 1
+      end
+    end
+  end)
+  return n
+end
+pcall(function() RegisterCommand("finger_unstuck", function()
+  local s = get_S(); if s == 0 then return TAG .. ": no table/ball in play" end
+  local n = unstuck()
+  return TAG .. ": unstuck " .. n .. " ball(s) — dropped at centre of playfield"
 end) end)
 
 -- force-grab for testing without gripping (right/left)
@@ -677,8 +763,16 @@ end
 _G.PFX_FingerMode = {
   enable  = arm,
   disable = disarm,
+  -- toggle() flips armed state and RETURNS the new state (bool). PFX_ModMenu's
+  -- "Finger Mode" entry calls api.toggle(); without this it silently no-op'd and
+  -- the menu switch could never be flipped back. Bidirectional + idempotent.
+  toggle  = function()
+    if enabled then disarm() else arm() end
+    return enabled
+  end,
   is_enabled = function() return enabled end,
   is_grabbed = function() return grabbing end,
+  unstuck = unstuck,
   grip = grip_state,
   set_local_xform = function(tl, im)
     for i = 1, 3 do T_local[i] = tl[i] end

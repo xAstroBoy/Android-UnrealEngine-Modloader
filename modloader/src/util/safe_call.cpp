@@ -15,6 +15,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include "modloader/safe_call.h"
+#include "modloader/crash_handler.h"
 #include "modloader/logger.h"
 #include <atomic>
 #include <cstring>
@@ -66,6 +67,11 @@ namespace safe_call
         result.ok = false;
         result.signal = 0;
         result.fault_addr = 0;
+
+        // Ensure this thread has a large alt-stack so the SA_ONSTACK handler can
+        // run (and siglongjmp back here) even after a stack overflow/smash inside
+        // func(). Without it the handler double-faults on the broken stack.
+        crash_handler::ensure_thread_sigaltstack();
 
         // ── Layer 1: sigsetjmp for signal-based crashes ─────────────────────
         // Set up the recovery point FIRST so that if a signal fires inside

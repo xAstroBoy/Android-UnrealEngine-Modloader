@@ -455,11 +455,19 @@ namespace ue
                                           const char16_t *filename, uint32_t load_flags, void *sandbox);
 
     // ═══ StaticConstructObject_Internal signature ═══════════════════════════
-    // RE4 VR uses the multi-arg form (not the params-struct form)
+    // TWO ABIs exist across UE versions/ports — resolve picks which (see
+    // symbols::StaticConstructObject_is_params_struct):
+    //   (A) Legacy multi-arg form (pre-4.26 / some ports e.g. RE4 VR):
     using StaticConstructObjectFn = UObject *(*)(UClass * cls, UObject *outer, FName name,
                                                  int32_t flags, int32_t internal_flags,
                                                  UObject *tmpl, bool copy_transients,
                                                  void *instance_graph, bool assume_archetype);
+    //   (B) UE4.26+ params-struct form: StaticConstructObject_Internal(const FStaticConstructObjectParameters&).
+    //       Layout VERIFIED against libUnreal.so (PFX / UE5):
+    //         +0x00 Class  +0x08 Outer  +0x10 Name(FName)  +0x18 SetFlags(u32)  +0x1C InternalFlags(u32)
+    //         +0x20 bCopyTransientsFromClassDefaults  +0x21 bAssumeTemplateIsArchetype
+    //         +0x28 Template  +0x30 InstanceGraph  +0x38 ExternalPackage
+    using StaticConstructObjectParamsFn = UObject *(*)(const void *params);
 
     // ═══ FPakPlatformFile::Mount ════════════════════════════════════════════
     // Mount(const TCHAR* InPakFilename, uint32 PakOrder, const TCHAR* InPath, bool bLoadIndex)

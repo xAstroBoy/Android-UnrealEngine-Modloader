@@ -89,10 +89,56 @@ local click_stats = { hits=0, actions=0, misses=0, last_id="", last_src="" }
 -- ============================================================================
 -- ACTIONS
 -- ============================================================================
+-- == Score stepper state (compact: one Amount selector + / - buttons) ========─
+local SCORE_AMOUNTS = { {"1M", 1000000}, {"10M", 10000000}, {"100M", 100000000}, {"1B", 1000000000}, {"10B", 10000000000}, {"100B", 100000000000} }
+local score_sel = 2   -- default: 10M
+local function score_api() return rawget(_G, "PFX_ScoreControl") end
+local function score_amt() return SCORE_AMOUNTS[score_sel][2] end
+local function score_apply(sign)
+    local api = score_api()
+    if not (api and api.add) then return "Score: mod not loaded" end
+    if api.ready and not api.ready() then return "Score: play a table first" end
+    local amt = sign * score_amt()
+    local ok, msg = api.add(amt)
+    local tag = (sign > 0 and "+" or "-") .. SCORE_AMOUNTS[score_sel][1]
+    -- keep the feedback SHORT so it fits the menu widget (the engine msg is verbose).
+    -- On success just confirm; on failure show the (already short) reason.
+    if ok then return tag .. " OK" end
+    return tag .. ": " .. tostring(msg)
+end
+
 local ACTIONS = {
 
-    -- ── CHEATS ───────────────────────────────────────────────────────────────
-    { id="hdr_cheats", header=true, label="── CHEATS ──" },
+    -- == SCORE ================================================================
+    { id="hdr_score", header=true, label="== SCORE ==" },
+    {
+        id="score_amt",
+        label = function()
+            local t = ""
+            local api = score_api()
+            if api and api.total then
+                local ok, v = pcall(api.total)
+                if ok and v then t = "   [now: " .. tostring(v) .. "]" end
+            end
+            return "Amount:  " .. SCORE_AMOUNTS[score_sel][1] .. "  (tap)" .. t
+        end,
+        fn = function()
+            score_sel = (score_sel % #SCORE_AMOUNTS) + 1
+            return "Amount:  " .. SCORE_AMOUNTS[score_sel][1]
+        end,
+    },
+    { id="score_plus",  label=function() return "Score  +  " .. SCORE_AMOUNTS[score_sel][1] end, fn=function() return score_apply(1)  end },
+    { id="score_minus", label=function() return "Score  -  " .. SCORE_AMOUNTS[score_sel][1] end, fn=function() return score_apply(-1) end },
+    { id="score_zero",  label="Score  =  0  (reset)", fn=function()
+        local api = score_api()
+        if not (api and api.set) then return "Score: mod not loaded" end
+        if api.ready and not api.ready() then return "Score: play a table first" end
+        local _, msg = api.set(0)
+        return "Score = 0: " .. tostring(msg)
+    end },
+
+    -- == GAMEPLAY ============================================================─
+    { id="hdr_gameplay", header=true, label="== GAMEPLAY ==" },
 
     {
         id="ball_save", toggle=true, label="Ball Save (Infinite)",
@@ -130,7 +176,7 @@ local ACTIONS = {
     },
     {
         id="flipper_length", slider=true, label="Flipper Length",
-        min=1.0, max=5.0, step=0.5,
+        min=1.0, max=2.5, step=0.2,   -- capped: >2.5 wrecks the flipper collider/pivot
         get_value=function()
             local api = rawget(_G, "PFX_Cheats")
             return (api and api.get_flipper_scale_x and api.get_flipper_scale_x()) or 1.0
@@ -144,6 +190,17 @@ local ACTIONS = {
         end,
     },
     {
+        id="reset_flippers", label="Reset Flippers/Ball (Fix)",
+        fn=function()
+            local api = rawget(_G, "PFX_Cheats")
+            if api and api.reset_scale then
+                local ok, msg = api.reset_scale()
+                return "Reset: " .. tostring(msg)
+            end
+            return "Reset: PFX_Cheats not loaded"
+        end,
+    },
+    {
         id="finger_mode", toggle=true, label="Finger Mode",
         fn=function()
             local api = rawget(_G, "PFX_FingerMode")
@@ -152,6 +209,16 @@ local ACTIONS = {
                 return "Finger: " .. (on and "ON" or "OFF")
             end
             return "Finger: PFX_FingerMode not loaded"
+        end,
+    },
+    {
+        id="finger_unstuck", label="Unstuck Ball",
+        fn=function()
+            local api = rawget(_G, "PFX_FingerMode")
+            if api and api.unstuck then
+                return "Unstuck " .. tostring(api.unstuck()) .. " ball(s)"
+            end
+            return "Unstuck: PFX_FingerMode not loaded"
         end,
     },
     {
@@ -167,8 +234,8 @@ local ACTIONS = {
         end,
     },
 
-    -- ── ACTIONS ───────────────────────────────────────────────────────────────
-    { id="hdr_actions", header=true, label="── ACTIONS ──" },
+    -- == ACTIONS ==============================================================─
+    { id="hdr_actions", header=true, label="== ACTIONS ==" },
 
     {
         id="cheat_saveball", label="Save Ball NOW",
@@ -195,8 +262,8 @@ local ACTIONS = {
         end,
     },
 
-    -- ── MAX & UNLOCK ──────────────────────────────────────────────────────────
-    { id="hdr_max", header=true, label="── MAX & UNLOCK ──" },
+    -- == MAX & UNLOCK ==========================================================
+    { id="hdr_max", header=true, label="== MAX & UNLOCK ==" },
 
     {
         id="max_all", label="Max All + Unlock All",
@@ -226,8 +293,8 @@ local ACTIONS = {
         end,
     },
 
-    -- ── RANDOMIZE ─────────────────────────────────────────────────────────────
-    { id="hdr_rand", header=true, label="── RANDOMIZE ──" },
+    -- == RANDOMIZE ============================================================─
+    { id="hdr_rand", header=true, label="== RANDOMIZE ==" },
 
     {
         id="rand_all", label="Randomize All Hub Slots",
@@ -295,6 +362,7 @@ local ACTIONS = {
     },
 }
 
+
 -- ============================================================================
 -- ACTION HELPERS
 -- ============================================================================
@@ -351,6 +419,19 @@ local function sync_switcher_widget(idx)
     if nm ~= "" then syncing_guard[nm] = nil end
 end
 
+-- Refresh every OTHER dynamic (function-label) button so shared state — e.g. the
+-- score Amount + the live "[now: N]" total — stays in sync after any tap. The
+-- tapped button keeps its result message (reset by its own 2s timer), so skip it.
+local function refresh_dynamic_labels(except)
+    for i, act in ipairs(ACTIONS) do
+        if i ~= except and not act.header and not act.toggle and not act.slider
+           and type(act.label) == "function" then
+            local b = action_buttons[i]
+            if is_live(b) then pcall(function() set_button_text(b, get_action_label(i)) end) end
+        end
+    end
+end
+
 -- Core dispatcher: logs result, updates button display.
 local function dispatch_action(idx, source)
     local a = ACTIONS[idx]
@@ -378,6 +459,8 @@ local function dispatch_action(idx, source)
             end)
         end)
     end
+    -- keep sibling dynamic labels (score +/-, Amount total) current after this tap
+    refresh_dynamic_labels(idx)
 end
 
 -- ============================================================================
@@ -510,6 +593,33 @@ local function build_mod_panel_on(w)
                 pcall(function() sep:Set("IsEnabled", false) end)
             end
 
+        elseif a.selector then
+            -- WBP_OptionsEntry_C Type=1 carousel with CUSTOM options (e.g. amount)
+            local entry = nil
+            pcall(function() entry = CreateWidget("WBP_OptionsEntry_C", pc) end)
+            if is_live(entry) then
+                pcall(function() llc:Call("AddChild", entry) end)
+                pcall(function() entry:Set("Type", 1) end)
+                pcall(function() entry:Set("Title", a.label) end)
+                local opts = (type(a.options) == "function") and a.options() or a.options
+                local init = ((a.get_index and a.get_index()) or 1) - 1
+                pcall(function()
+                    local os = entry:Get("OptionSwitcher")
+                    if is_live(os) then
+                        pcall(function() os:Call("SetOptions", opts) end)
+                        pcall(function() os:Call("SetSelectedIndex", init) end)
+                        pcall(function() os:Set("SelectedIndex", init) end)
+                    end
+                end)
+                pcall(function() entry:Set("SelectedOptionIndex", init) end)
+                pcall(function() entry:Call("SetupEntry") end)
+                pcall(function() entry:Call("PreInitButtons") end)
+                pcall(function() entry:Call("UpdateSelection") end)
+                reg_widget(entry, idx)
+            else
+                Log(TAG .. ": build: CreateWidget selector failed for " .. a.id)
+            end
+
         elseif a.toggle then
             -- WBP_OptionsEntry_C Type=1 — native OFF/ON carousel
             local entry = nil
@@ -624,7 +734,7 @@ local ok3, err3 = pcall(function()
 end)
 Log(TAG .. ": SelectStartingCategory hook: " .. (ok3 and "OK" or ("FAILED: " .. tostring(err3))))
 
--- ── WBP_Button_Default_C CLICK ──────────────────────────────────────────────
+-- == WBP_Button_Default_C CLICK ==============================================
 -- PE trace confirmed: BndEvt functions DO go through ProcessEvent when the
 -- runtime name includes "K2Node_" — decompiled blueprints omit it.
 -- Correct runtime name: K2Node_ComponentBoundEvent_0 (not ComponentBoundEvent_0)
@@ -649,7 +759,7 @@ local ok4, err4 = pcall(function()
 end)
 Log(TAG .. ": WBP_Button_Default_C click hook: " .. (ok4 and "OK" or ("FAILED: " .. tostring(err4))))
 
--- ── WBP_OptionsEntry_C TOGGLE (carousel Type=1) ─────────────────────────────
+-- == WBP_OptionsEntry_C TOGGLE (carousel Type=1) ============================─
 local ok5, err5 = pcall(function()
     RegisterHook("WBP_OptionsEntry_C:HandleSwitcherValueChanged", function(ctx)
         local nm = ctx_name(ctx)
@@ -663,6 +773,18 @@ local ok5, err5 = pcall(function()
         local idx = name_to_idx[nm]
         if not idx then return end
         local a = ACTIONS[idx]
+        if a and a.selector then
+            local entry = ctx_obj(ctx)
+            local opt_idx = 0
+            pcall(function()
+                local os = entry:Get("OptionSwitcher")
+                if is_live(os) then opt_idx = tonumber(os:Get("SelectedIndex")) or 0
+                else opt_idx = tonumber(entry:Get("SelectedOptionIndex")) or 0 end
+            end)
+            if a.on_change then a.on_change(opt_idx + 1) end
+            Log(TAG .. ": [selector] " .. a.id .. " -> " .. (opt_idx + 1))
+            return
+        end
         if not a or not a.toggle then return end
 
         local entry = ctx_obj(ctx)
@@ -693,7 +815,7 @@ local ok5, err5 = pcall(function()
 end)
 Log(TAG .. ": HandleSwitcherValueChanged hook: " .. (ok5 and "OK" or ("FAILED: " .. tostring(err5))))
 
--- ── WBP_OptionsEntry_C SLIDER (Type=2) ──────────────────────────────────────
+-- == WBP_OptionsEntry_C SLIDER (Type=2) ======================================
 local ok6, err6 = pcall(function()
     RegisterHook(
         "WBP_OptionsEntry_C:BndEvt__WBP_OptionsEntry_Slider_K2Node_ComponentBoundEvent_2_OnValueChanged__DelegateSignature",

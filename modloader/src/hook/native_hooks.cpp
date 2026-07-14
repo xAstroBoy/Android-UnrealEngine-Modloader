@@ -130,11 +130,17 @@ extern "C" uint64_t dispatch_full(int slot,
         FloatSaveArea& fsa = s_float_save[slot];
         for (int i = 0; i < 8; i++) fsa.d[i] = fsa.d[i]; // preserve floats
 
+        // Nesting-safe guard (see the on-game-thread path below for rationale).
+        const int saved_in_call = g_in_hook_original_call;
+        sigjmp_buf saved_jmp;
+        __builtin_memcpy(&saved_jmp, &g_hook_recovery_jmp, sizeof(sigjmp_buf));
+
         g_in_hook_original_call = 1;
         int crash_sig = sigsetjmp(g_hook_recovery_jmp, 1);
 
         if (crash_sig != 0) {
-            g_in_hook_original_call = 0;
+            __builtin_memcpy(&g_hook_recovery_jmp, &saved_jmp, sizeof(sigjmp_buf));
+            g_in_hook_original_call = saved_in_call;
             // Silent recovery — don't log every frame (rendering thread is high-frequency)
             return 0;
         }
@@ -170,7 +176,8 @@ extern "C" uint64_t dispatch_full(int slot,
               "cc", "memory"
         );
 
-        g_in_hook_original_call = 0;
+        __builtin_memcpy(&g_hook_recovery_jmp, &saved_jmp, sizeof(sigjmp_buf));
+        g_in_hook_original_call = saved_in_call;
         fsa.d[0] = ret_d0;
         return ret_x0;
     }
@@ -216,18 +223,32 @@ extern "C" uint64_t dispatch_full(int slot,
 
         void* orig = rec->original;
 
-        // ── SAFE-CALL GUARD ──────────────────────────────────────────
+        // ── SAFE-CALL GUARD (NESTING-SAFE) ───────────────────────────
         // sigsetjmp saves full register state. If the original function
         // crashes (SIGSEGV/SIGBUS on dangling pointer, null vtable, etc.),
         // the crash_handler detects g_in_hook_original_call and calls
         // siglongjmp to return here with the signal number.
-        // This prevents ANY hooked native function from crashing the game.
+        //
+        // NESTING: a hooked original may itself call ANOTHER hooked function
+        // (e.g. a hot per-switch setter reached from inside a bigger hooked
+        // fn). Without saving state, that inner dispatch overwrites our
+        // g_hook_recovery_jmp and resets g_in_hook_original_call to 0 on
+        // return — so a later crash in OUR original either isn't recovered,
+        // or siglongjmps into the inner's already-returned frame and corrupts
+        // memory (surfacing as an unrelated luaV_execute SIGSEGV later). We
+        // snapshot the outer guard state and restore it after the original
+        // returns / on recovery, making the guard fully re-entrant.
+        const int saved_in_call = g_in_hook_original_call;
+        sigjmp_buf saved_jmp;
+        __builtin_memcpy(&saved_jmp, &g_hook_recovery_jmp, sizeof(sigjmp_buf));
+
         g_in_hook_original_call = 1;
         int crash_sig = sigsetjmp(g_hook_recovery_jmp, 1);
 
         if (crash_sig != 0) {
             // ── CRASH RECOVERED ──────────────────────────────────────
-            g_in_hook_original_call = 0;
+            __builtin_memcpy(&g_hook_recovery_jmp, &saved_jmp, sizeof(sigjmp_buf));
+            g_in_hook_original_call = saved_in_call;
             logger::log_error("NHOOK",
                 "SAFE-CALL RECOVERY: Hook '%s' original function crashed "
                 "(signal %d) — returning safe defaults (0/0.0). "
@@ -271,7 +292,8 @@ extern "C" uint64_t dispatch_full(int slot,
                   "cc", "memory"
             );
 
-            g_in_hook_original_call = 0;
+            __builtin_memcpy(&g_hook_recovery_jmp, &saved_jmp, sizeof(sigjmp_buf));
+            g_in_hook_original_call = saved_in_call;
             ctx.ret_x0 = ret_x0;
             ctx.ret_d0 = ret_d0;
         }

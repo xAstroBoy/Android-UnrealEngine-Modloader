@@ -133,10 +133,8 @@ namespace lua_console
             return nullptr;
         }
 
-        // Construct the CheatManager
-        ue::FName fname_none = {0, 0};
-        ue::UObject *new_cm = symbols::StaticConstructObject(
-            cheat_class, pc, fname_none, 0, 0, nullptr, false, nullptr, false);
+        // Construct the CheatManager (ABI-correct: params-struct on UE4.26+, multi-arg legacy)
+        ue::UObject *new_cm = symbols::construct_object(cheat_class, pc);
 
         if (!new_cm)
         {

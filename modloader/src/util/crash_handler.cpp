@@ -597,8 +597,53 @@ namespace crash_handler
         }
     }
 
+    // ── Per-thread alternate signal stack ───────────────────────────────────
+    // SA_ONSTACK on the handler is a NO-OP unless an alt-stack is registered on
+    // the crashing thread. Without it, a stack OVERFLOW or stack SMASH (return
+    // address corrupted, SP into a guard page) makes the handler run on the
+    // already-broken stack → instant double-fault → process death, defeating
+    // every siglongjmp recovery guard. With a clean alt-stack the handler always
+    // runs and can siglongjmp back to the guard checkpoint (whose SP is above the
+    // corruption), so even a smashed/overflowed stack is survivable.
+    //
+    // This MUST be called on every thread that runs guarded game code (esp. the
+    // game thread). It's cheap + idempotent per thread.
+    static thread_local void *t_altstack_sp = nullptr;
+
+    void ensure_thread_sigaltstack()
+    {
+        if (t_altstack_sp)
+            return;
+        const size_t kSize = 512 * 1024; // generous — report path + deep game frames
+        // Keep any existing alt-stack that's already large enough (e.g. bionic's).
+        stack_t cur;
+        memset(&cur, 0, sizeof(cur));
+        if (sigaltstack(nullptr, &cur) == 0 && (cur.ss_flags & SS_DISABLE) == 0 &&
+            cur.ss_sp != nullptr && cur.ss_size >= kSize)
+        {
+            t_altstack_sp = cur.ss_sp;
+            return;
+        }
+        void *sp = malloc(kSize);
+        if (!sp)
+            return;
+        stack_t ss;
+        memset(&ss, 0, sizeof(ss));
+        ss.ss_sp = sp;
+        ss.ss_size = kSize;
+        ss.ss_flags = 0;
+        if (sigaltstack(&ss, nullptr) == 0)
+            t_altstack_sp = sp; // leak intentionally — lives for the thread's lifetime
+        else
+            free(sp);
+    }
+
     void install()
     {
+        // Install a big alt-stack on THIS thread up front so the handler survives
+        // stack overflow/smash from the very first guarded call.
+        ensure_thread_sigaltstack();
+
         // Find our own library's address range first
         dl_iterate_phdr(find_modloader_cb, nullptr);
         if (s_modloader_base != 0)

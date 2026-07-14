@@ -91,10 +91,10 @@ final class RootShell {
         boolean ok = run(
                 "mkdir -p '" + pub + "' '" + scoped + "'; "
                         + "if ! mountpoint -q '" + scoped + "'; then "
-                        // one-time migration: real scoped data -> public store (only if public is empty)
-                        + "  if [ -z \"$(ls -A '" + pub + "' 2>/dev/null)\" ] && [ -n \"$(ls -A '" + scoped + "' 2>/dev/null)\" ]; then "
-                        + "    cp -a '" + scoped + "/.' '" + pub + "/' 2>/dev/null; "
-                        + "  fi; "
+                        // migrate anything written while unbound (e.g. su failed last launch,
+                        // or the public store pre-existed with only a subset like mods/) into
+                        // the public store. No-clobber: public is the source of truth.
+                        + "  cp -an '" + scoped + "/.' '" + pub + "/' 2>/dev/null; "
                         // public is the source of truth; bind it onto the app's scoped path
                         + "  mount --bind '" + pub + "' '" + scoped + "'; "
                         + "fi; "

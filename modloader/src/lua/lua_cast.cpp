@@ -810,9 +810,8 @@ namespace lua_cast
                 outer = symbols::GetTransientPackage();
             }
 
-            ue::FName name_none = {0, 0};
-            ue::UObject* result = symbols::StaticConstructObject(
-                cls, outer, name_none, 0, 0, nullptr, false, nullptr, false);
+            // ABI-correct construction (params-struct on UE4.26+, multi-arg on legacy).
+            ue::UObject* result = symbols::construct_object(cls, outer);
 
             if (!result) {
                 logger::log_warn("SPAWN", "StaticConstructObject returned NULL");

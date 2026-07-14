@@ -34,7 +34,11 @@ local stats = {
 -- Ball scales uniformly. Flippers now scale on actor Y (table width axis)
 -- so collider + visible mesh widen together.
 local BIG_BALL_SCALE   = 2.50
-local FLIPPER_SCALE_X  = 10.00  -- current X stretch (runtime-mutable via slider)
+-- Flipper Y-stretch. 10x SCALED THE ACTOR COLLIDER/PIVOT so hard the flippers stopped
+-- working (ball glitched through / stuck). 1.6x is a visible-but-safe enlargement that
+-- keeps the pivot + collision usable. Clamp the slider to this sane band too.
+local FLIPPER_SCALE_X  = 1.60   -- was 10.00 (broke flippers)
+local FLIPPER_SCALE_MAX = 2.50  -- hard cap so a slider/command can't re-break them
 local FLIPPER_SCALE_Y  = 1.0    -- keep width unchanged
 local FLIPPER_SCALE_Z  = 1.0    -- keep height unchanged
 
@@ -1031,6 +1035,12 @@ end
 
 local function cheats_set_large_flippers(enable)
     cheats.large_flippers = not not enable
+    if not cheats.large_flippers then
+        -- HARD RESET: drop the actor cache so we re-find the CURRENT flippers before
+        -- restoring scale 1.0. A stale cache (2s TTL) could miss flippers recreated by a
+        -- table change and leave them stuck scaled = the "flippers broken" the user hit.
+        flipper_actor_cache.actors = nil
+    end
     local ok, msg = apply_large_flippers()
     if cheats.large_flippers then
         schedule_large_flipper_reapply_burst()
@@ -1049,7 +1059,7 @@ end
 -- Set flipper length (X scale, 1.0 = none/default, up to 5.0).
 -- Immediately re-applies flipper scale if flippers are currently active.
 local function set_flipper_length_x(val)
-    val = math.max(1.0, math.min(10.0, tonumber(val) or 10.0))
+    val = math.max(1.0, math.min(FLIPPER_SCALE_MAX, tonumber(val) or 1.6))
     FLIPPER_SCALE_X = val
     if val > 1.0 then
         cheats.large_flippers = true
@@ -1063,6 +1073,8 @@ end
 local function cheats_reset_scale()
     cheats.big_ball = false
     cheats.large_flippers = false
+    flipper_actor_cache.actors = nil        -- re-find current flippers before restoring
+    FLIPPER_SCALE_X = 1.60                   -- back to the safe default
     local bok, bmsg = apply_big_ball()
     local fok, fmsg = apply_large_flippers()
     return (bok and fok), "reset ball=" .. tostring(bmsg) .. " flippers=" .. tostring(fmsg)

@@ -171,6 +171,29 @@ namespace symbols
     ue::StaticLoadObjectFn StaticLoadObject = nullptr;
     ue::StaticLoadClassFn StaticLoadClass = nullptr;
     ue::StaticConstructObjectFn StaticConstructObject = nullptr;
+    bool StaticConstructObject_is_params_struct = false;
+
+    ue::UObject *construct_object(ue::UClass *cls, ue::UObject *outer, ue::FName name, int32_t set_flags)
+    {
+        if (!StaticConstructObject || !cls)
+            return nullptr;
+        if (StaticConstructObject_is_params_struct)
+        {
+            // Build FStaticConstructObjectParameters on the stack (ABI form B). Zero all of it;
+            // only Class/Outer/Name/SetFlags matter for a plain construct. 0xA0 is generous
+            // headroom over the ~0x60 real struct so any later-UE fields can't overflow.
+            alignas(16) uint8_t params[0xA0];
+            memset(params, 0, sizeof(params));
+            *reinterpret_cast<ue::UClass **>(params + 0x00) = cls;
+            *reinterpret_cast<ue::UObject **>(params + 0x08) = outer;
+            *reinterpret_cast<ue::FName *>(params + 0x10) = name;
+            *reinterpret_cast<int32_t *>(params + 0x18) = set_flags;
+            auto fn = reinterpret_cast<ue::StaticConstructObjectParamsFn>(StaticConstructObject);
+            return fn(reinterpret_cast<const void *>(params));
+        }
+        // Legacy multi-arg ABI (form A)
+        return StaticConstructObject(cls, outer, name, set_flags, 0, nullptr, false, nullptr, false);
+    }
     ue::PakMountFn PakMount = nullptr;
     GetTransientPackageFn GetTransientPackage = nullptr;
     void *GUObjectArray = nullptr;
@@ -1518,7 +1541,9 @@ namespace symbols
         // StaticConstructObject_Internal — fallback offset registered in init()
         void *sco = resolve("StaticConstructObject_Internal");
         StaticConstructObject = reinterpret_cast<ue::StaticConstructObjectFn>(sco);
-        logger::log_info("SYMBOL", "StaticConstructObject: %s", sco ? "OK" : "NOT FOUND");
+        // find_static_construct_object() set the ABI flag while resolving.
+        logger::log_info("SYMBOL", "StaticConstructObject: %s (ABI=%s)", sco ? "OK" : "NOT FOUND",
+                         StaticConstructObject_is_params_struct ? "params-struct/UE4.26+" : "multi-arg/legacy");
 
         // GetTransientPackage
         void *gtp = resolve("_Z19GetTransientPackagev");

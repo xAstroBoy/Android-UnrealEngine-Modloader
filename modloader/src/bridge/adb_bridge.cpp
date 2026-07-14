@@ -31,6 +31,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <unordered_map>
+#include <functional>
+#include <memory>
 
 using json = nlohmann::json;
 
@@ -120,12 +122,54 @@ namespace adb_bridge
         return ok_response(result);
     }
 
+    // Run a mod load/reload on the GAME THREAD and block for the result. Loading a mod
+    // executes its Lua chunk (FindAllOf / RegisterHook / UObject calls) against the
+    // game-thread-owned Lua state; doing that on the bridge thread races the game
+    // thread's Lua (ProcessEvent hooks, delayed actions) and corrupts it -> crash on
+    // reload. Queue it the same way exec_lua does. `timed_out` is set if the game
+    // thread didn't finish within the window (the work still completes on the game
+    // thread; only the bridge reply gives up).
+    static bool run_modop_on_game_thread(const std::function<bool()> &fn, int timeout_s, bool &timed_out)
+    {
+        struct Ctx
+        {
+            std::mutex mtx;
+            std::condition_variable cv;
+            std::atomic<bool> done{false};
+            std::atomic<bool> cancelled{false};
+            bool ok{false};
+        };
+        auto ctx = std::make_shared<Ctx>();
+        pe_hook::queue_game_thread([ctx, fn]()
+                                   {
+            if (ctx->cancelled.load(std::memory_order_acquire)) return;
+            GameThreadCommandScope scope;
+            bool r = fn();
+            { std::lock_guard<std::mutex> lk(ctx->mtx); ctx->ok = r; ctx->done.store(true, std::memory_order_release); }
+            ctx->cv.notify_one(); });
+
+        std::unique_lock<std::mutex> lk(ctx->mtx);
+        if (!ctx->cv.wait_for(lk, std::chrono::seconds(timeout_s), [&]
+                              { return ctx->done.load(); }))
+        {
+            ctx->cancelled.store(true, std::memory_order_release);
+            timed_out = true;
+            return false;
+        }
+        timed_out = false;
+        return ctx->ok;
+    }
+
     static std::string handle_reload_mod(const json &payload)
     {
         if (!payload.contains("name"))
             return error_response("missing 'name' parameter");
         std::string name = payload["name"];
-        bool ok = mod_loader::reload_mod(name);
+        bool timed_out = false;
+        bool ok = run_modop_on_game_thread([name]()
+                                           { return mod_loader::reload_mod(name); }, 20, timed_out);
+        if (timed_out)
+            return error_response("reload_mod queued on game thread but exceeded 20s (heavy mod?); it may still finish");
         return ok ? ok_response("reloaded: " + name) : error_response("reload failed: " + name);
     }
 
@@ -134,7 +178,11 @@ namespace adb_bridge
         if (!payload.contains("name"))
             return error_response("missing 'name' parameter");
         std::string name = payload["name"];
-        bool ok = mod_loader::load_mod(name);
+        bool timed_out = false;
+        bool ok = run_modop_on_game_thread([name]()
+                                           { return mod_loader::load_mod(name); }, 20, timed_out);
+        if (timed_out)
+            return error_response("load_mod queued on game thread but exceeded 20s; it may still finish");
         return ok ? ok_response("loaded: " + name) : error_response("load failed: " + name);
     }
 

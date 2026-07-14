@@ -27,7 +27,26 @@
 local TAG = "PFX_Randomizer"
 local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
-Log(TAG .. ": Loading v40...")
+Log(TAG .. ": Loading v49...")
+
+-- Reload generation: older LoopAsync/ExecuteWithDelay callbacks compare this and
+-- self-terminate, so a reload never stacks duplicate loops.
+_G._RAND_GEN = (_G._RAND_GEN or 0) + 1
+local MY_GEN = _G._RAND_GEN
+
+-- SAFE ONLY AT THE HUB. When the user enters a table, the hub slots / entries /
+-- cabinets we operate on are torn down; reflecting on / Blueprint-calling those stale
+-- objects crashes the Lua VM (the v43/v44 crash-loop). PFXCore.get_S() is non-zero
+-- once a table's physics container is live, so we use it to STOP all randomizer
+-- activity the instant a table is entered — the mod goes inert during play.
+local function hub_active()
+  if _G.PFXCore and _G.PFXCore.get_S then
+    local s = 0
+    pcall(function() s = _G.PFXCore.get_S() end)
+    if type(s) == "number" and s ~= 0 then return false end
+  end
+  return true
+end
 
 -- ============================================================================
 -- CATEGORY CONSTANTS
@@ -68,27 +87,38 @@ local STRICT_REPLACE_CATEGORIES = {
     [5] = true,   -- Gadget
 }
 
--- Entries whose localized name contains any of these substrings are excluded from pools
+-- Entries are blacklisted if their NORMALIZED (lowercased, punctuation/space-stripped)
+-- localized name, object name, OR gameplay tag contains one of these tokens. Keep the
+-- tokens normalized too (no spaces/punctuation) so "Silver Ball", "X-Arcade",
+-- "Arcade2TV-XR" all match regardless of how the game spells them.
 local ENTRY_NAME_BLACKLIST = {
-    "arcade2tv",
-    "arcade 2 tv",
-    "arcade2 tv",
-    "silver ball",
-    "xarcade",
-    "x arcade",
+    "arcade2tv",   -- "Arcade2TV-XR" poster
+    "silverball",  -- "Silver Ball" statue
+    "xarcade",     -- X-Arcade / XArcade promo cosmetics
 }
+
+-- strip everything that isn't a letter or digit, lowercase
+local function norm_name(s)
+    if type(s) ~= "string" then return "" end
+    return (s:lower():gsub("[^%a%d]", ""))
+end
 
 local function is_blacklisted_entry(entry)
     if not entry then return false end
-    local locName = ""
-    pcall(function() locName = tostring(entry:Call("GetLocalizedName")) end)
-    if locName == "" then
-        pcall(function() locName = entry:GetName() end)
-    end
-    if type(locName) ~= "string" or locName == "" then return false end
-    local lower = locName:lower()
+    local loc = ""; pcall(function() loc = tostring(entry:Call("GetLocalizedName")) end)
+    local nm  = ""; pcall(function() nm  = entry:GetName() end)
+    local tag = ""
+    pcall(function()
+        local t = entry:Call("GetEntryID")
+        if t then
+            local tn = nil
+            pcall(function() tn = t.TagName end)
+            if tn then tag = tostring(tn) end
+        end
+    end)
+    local hay = norm_name(loc) .. "|" .. norm_name(nm) .. "|" .. norm_name(tag)
     for _, bl in ipairs(ENTRY_NAME_BLACKLIST) do
-        if lower:find(bl, 1, true) then return true end
+        if hay:find(bl, 1, true) then return true end
     end
     return false
 end
@@ -309,6 +339,8 @@ local ENTRY_CLASSES = {
 
 local entryPool = {}   -- catID -> { entry UObject, ... }
 local poolReady = false
+local _poolByIP = nil  -- catID -> ipkey -> { entries }  (lazy; rebuilt from entryPool)
+local _cyclesByIP = {} -- catID -> ipkey -> no-repeat cycle state
 
 -- Pre-filtered pools for table cosmetics grouped by IP
 -- ALL ball/trail/flipper entries are IP-locked (zero global)
@@ -458,6 +490,7 @@ local function build_entry_pool()
     end
 
     poolReady = total > 0
+    _poolByIP = nil; _cyclesByIP = {}   -- invalidate IP pools; rebuilt lazily from the new entryPool
     stats.pool_size = total
 
     for catID, items in pairs(entryPool) do
@@ -618,12 +651,39 @@ local function swap_slot_entry(slot, newEntry)
     local previousEntry = nil
     pcall(function() previousEntry = slot:Get("m_slotEntry") end)
 
+    -- ── PERSISTENT EQUIP (the game's OWN save path) ─────────────────────────────
+    -- ChangeSlotEntry(newEntry, saveToProfile=true) is what the game calls when YOU
+    -- equip something (BP_VR_Pawn uses it with `true` for wall/floor). When it accepts
+    -- the entry it spawns the actor AND writes {slotKey -> entry} into the profile store
+    -- (sub_4F1A5A0 on qword_76B4910), so on the next hub load RestoreSlotEntryFromProfile
+    -- restores OUR pick — the randomization PERSISTS (no re-apply needed). It VALIDATES
+    -- first and no-ops if the entry's category/IP doesn't fit the slot or the slot has no
+    -- station yet; we detect that (m_slotEntry didn't change to newEntry) and fall through
+    -- to the runtime-only path below, so this never regresses the current visual apply.
+    -- Floor/Wall slots persist via ChangeSlotEntry too, but it does NOT drive the texture
+    -- or the customization-machine PREVIEW, so we must still run ApplyFloorStyle +
+    -- SetPreview below (skipping them left the wall/floor menu BLANK). So only early-return
+    -- on a took for NON floor/wall slots (where ChangeSlotEntry also spawns the actor).
+    local persistedFW = false
+    if newEntry ~= previousEntry then
+        local took = false
+        pcall(function() slot:Call("ChangeSlotEntry", newEntry, true) end)
+        pcall(function() took = (slot:Get("m_slotEntry") == newEntry) end)
+        if took then
+            stats.persisted = (stats.persisted or 0) + 1
+            if not is_floor_wall_slot(slot) then return true end
+            persistedFW = true
+        end
+    end
+
     if is_floor_wall_slot(slot) then
-        -- FloorAndWall slots are texture-based (no spawned actor).
-        -- Set the entry, then call ApplyFloorStyle/ApplyWallStyle on the
-        -- BP_VR_Room_C actor (accessed via machine.RoomRef) to apply the texture.
-        local wrote = pcall(function() slot:Set("m_slotEntry", newEntry) end)
-        if not wrote then return false end
+        -- FloorAndWall slots are texture-based (no spawned actor). ChangeSlotEntry above
+        -- already set+saved the entry (persistedFW); here we drive the TEXTURE + the
+        -- customization-machine PREVIEW so the menu shows the pick (not blank).
+        if not persistedFW then
+            local wrote = pcall(function() slot:Set("m_slotEntry", newEntry) end)
+            if not wrote then return false end
+        end
         -- Apply to ALL rooms (there are multiple BP_VR_Room_C instances)
         local cat = nil
         pcall(function() cat = slot:Get("SlotCategory") end)
@@ -757,17 +817,116 @@ end
 local SCRAMBLE_BATCH_SIZE = 8   -- swaps per batch
 local SCRAMBLE_BATCH_DELAY = 200 -- ms between batches
 
-local function scramble_all_slots()
+-- Remove the game's slot IP/category restriction so ANY collectible can be equipped into
+-- ANY slot AND saved to profile (RestoreSlotEntryFromProfile then restores our pick =
+-- persists). Patches PFXCollectibleSlotComponent::ChangeSlotEntry (sub_4F1B00C): right
+-- after its station-null check at libUnreal+0x4F1B054, branch straight to the accept+save
+-- path at +0x4F1B134, skipping the category + IP validation.
+--   original @+0x4F1B054: LDR W8,[X23,#0x310]  = 0xB94312E8
+--   patched:              B  0x4F1B134         = 0x14000038   (rel +0xE0)
+-- Written via /proc/self/mem (bypasses the RO code page). Re-applied per game session
+-- (the .so is fresh on restart). VERIFIED live: a cross-IP entry then persists.
+-- Also patches out the SINGLE-INSTANCE DUPLICATE EVICTION in the profile-save function
+-- sub_4F1A5A0: at libUnreal+0x4F1A7EC it reads the collectible's single-instance flag
+-- (LDRB W9,[X26,#0x91]) and `CBZ W9, loc_4F1AA1C` skips building the evict-list only when
+-- the flag is 0. We force that branch UNCONDITIONAL (B loc_4F1AA1C = 0x1400008C, was
+-- 0x34001189) so the evict-list is NEVER built -> the same collectible can sit in multiple
+-- slots without the game clearing the others. VERIFIED live: dup kept in both slots.
+local function patch_slot_ip_restriction()
+    if _G._RAND_IP_PATCHED then return true end
+    local base = (_G.PFXCore and _G.PFXCore.base and _G.PFXCore.base()) or 0
+    if not (type(base) == "number" and base > 0x1000) then return false end
+    pcall(function() if _G.PFXCore.unharden then _G.PFXCore.unharden() end end)
+    -- idempotent single-dword patch; only writes if the bytes match the expected original
+    local function patch1(off, orig, new, label)
+        local addr = base + off
+        local cur = 0; pcall(function() cur = MemReadU32(addr) end)
+        if cur == new then return true end
+        if cur ~= orig then
+            Log(TAG .. string.format(": %s patch SKIPPED — unexpected 0x%08X @+0x%X (game updated?)", label, cur, off))
+            return false
+        end
+        pcall(function() MemWriteU32(addr, new) end)
+        local now = 0; pcall(function() now = MemReadU32(addr) end)
+        return now == new
+    end
+    -- (1) IP/category restriction in ChangeSlotEntry -> branch to the accept+save path
+    local ok1 = patch1(0x4F1B054, 0xB94312E8, 0x14000038, "IP-restriction")
+    -- (2) single-instance duplicate eviction in the save fn -> skip building the evict-list
+    local ok2 = patch1(0x4F1A7EC, 0x34001189, 0x1400008C, "dup-eviction")
+    if ok1 then
+        _G._RAND_IP_PATCHED = true
+        Log(TAG .. string.format(": PATCHED — any collectible persists in any slot; duplicates allowed (evict-patch=%s)", tostring(ok2)))
+        return true
+    end
+    return false
+end
+
+-- IP KEY of an entry. With the restriction patched out (patch_slot_ip_restriction), IP no
+-- longer matters, so ALL entries collapse to one pool per category ("*") = full cross-IP
+-- randomization. If the patch ever fails (game update), we fall back to the real IP key
+-- (tag minus the trailing item segment) so same-IP swaps still take.
+local function entry_ipkey(entry)
+    if _G._RAND_IP_PATCHED then return "*" end
+    local t = ""
+    pcall(function()
+        local id = entry:Call("GetEntryID")
+        if id then local tn; pcall(function() tn = id.TagName end); if tn then t = tostring(tn) end end
+    end)
+    if t == "" then return "?" end
+    return (t:gsub("%.[^%.]*$", ""))
+end
+
+-- Pick a random entry sharing `ipkey` from category `cID`, cycled WITHOUT repeats (a
+-- collectible is single-instance: reusing it evicts it from its other slot -> new empty).
+-- Lazily indexes entryPool by IP on first use; invalidated when the pool rebuilds. Shared
+-- by scramble_all_slots + maintenance_pass so they never fight over the same entry.
+local function pick_same_ip(cID, ipkey, excludeKey)
+    if not _poolByIP then
+        _poolByIP = {}
+        for c2, pool in pairs(entryPool) do
+            local m = {}
+            for _, e in ipairs(pool) do
+                local ip = entry_ipkey(e)
+                if not m[ip] then m[ip] = {} end
+                m[ip][#m[ip] + 1] = e
+            end
+            _poolByIP[c2] = m
+        end
+        _cyclesByIP = {}
+    end
+    local m = _poolByIP[cID]
+    local cands = m and m[ipkey]
+    if not cands or #cands == 0 then return nil end
+    if not _cyclesByIP[cID] then _cyclesByIP[cID] = {} end
+    local c = _cyclesByIP[cID][ipkey]
+    if not c then c = make_cycle_state(cands, entry_key); _cyclesByIP[cID][ipkey] = c end
+    return take_from_cycle(c, excludeKey) or cands[math.random(#cands)]
+end
+
+local function scramble_all_slots(incremental)
+    if not poolReady then pcall(build_entry_pool) end
     if not poolReady then
         Log(TAG .. ": Scramble skipped — pool not ready")
         return 0
     end
+    pcall(patch_slot_ip_restriction)   -- remove IP/category limit BEFORE we pick (collapses pools to cross-IP)
 
     local slotCount, liveSlots = count_registered_slots()
     if slotCount == 0 or not liveSlots then
         Log(TAG .. ": Scramble skipped — RegisteredSlots empty (" .. slotCount .. ")")
         return 0
     end
+
+    -- Per-slot SEEN tracking. `incremental` (the auto-loop, as new stations stream in)
+    -- skips slots already randomized this session so it ONLY touches newly-loaded slots —
+    -- posters/statues/walls/floors get randomized when you reach their station, spread,
+    -- without re-randomizing (or re-lagging) the ones already done. A full manual/init
+    -- run passes incremental=false, which resets SEEN and re-randomizes everything.
+    if not incremental then _G._RAND_SLOT_SEEN = {} end
+    _G._RAND_SLOT_SEEN = _G._RAND_SLOT_SEEN or {}
+    local SEEN = _G._RAND_SLOT_SEEN
+    local function seen_key(s) local n = nil; pcall(function() n = s:GetName() end); return n end
 
     -- Build work list: {slot, picked_entry} pairs
     local workList = {}
@@ -778,14 +937,17 @@ local function scramble_all_slots()
     for _, slot in ipairs(liveSlots) do
         pcall(function()
             if not is_live(slot) then return end
+            local sk = seen_key(slot)
+            if incremental and sk and SEEN[sk] then return end   -- already randomized this session
             local entry = nil
             pcall(function() entry = slot:Get("m_slotEntry") end)
             if not entry or not is_live(entry) then
-                emptySlots[#emptySlots + 1] = slot
+                emptySlots[#emptySlots + 1] = slot   -- marked SEEN only if actually filled below
                 return
             end
             local catID = get_category_id(entry)
             if not catID or SKIP_CATEGORIES[catID] then return end
+            if sk then SEEN[sk] = true end
 
             local stationKey = ""
             pcall(function()
@@ -807,51 +969,26 @@ local function scramble_all_slots()
                 slot = slot,
                 currentKey = entry_key(entry),
                 stationKey = stationKey,
+                ipkey = entry_ipkey(entry),   -- slot's IP: replacements MUST share it
             }
         end)
     end
 
     local totalSkip = 0
-    local cyclesByCategory = {}
 
-    -- Build work items for each category
+    -- Slots are IP-RESTRICTED (a "Collectibles.IP.General" slot rejects a "...PacificRim"
+    -- entry — the game's ChangeSlotEntry no-ops), so replacements MUST share the slot's IP
+    -- key; pick_same_ip (module-level) cycles each (category,IP) pool without repeats.
+    -- Filled slots: swap to a random SAME-IP, same-category entry.
     for catID, slotList in pairs(slotsByCategory) do
-        local pool = entryPool[catID]
-        if not pool or #pool == 0 then
+        if not entryPool[catID] or #entryPool[catID] == 0 then
             totalSkip = totalSkip + #slotList
-            goto next_cat
-        end
-
-        if STRICT_UNIQUE_CATEGORIES[catID] then
-            -- v30: Global cycle for strict-unique categories — no repeats across
-            -- ALL stations until the entire pool is exhausted, then reshuffle.
-            if not cyclesByCategory[catID] then
-                cyclesByCategory[catID] = make_cycle_state(pool, entry_key)
-            end
-            local cycle = cyclesByCategory[catID]
-
-            -- Shuffle slot order so different shelves get variety each run
+        else
             local shuffledSlots = {}
             for i, si in ipairs(slotList) do shuffledSlots[i] = si end
             shuffle(shuffledSlots)
-
             for _, slotInfo in ipairs(shuffledSlots) do
-                local picked = take_from_cycle(cycle, slotInfo.currentKey)
-                if picked then
-                    workList[#workList + 1] = { slot = slotInfo.slot, entry = picked }
-                else
-                    -- Fallback: force pick first from pool (never leave empty)
-                    workList[#workList + 1] = { slot = slotInfo.slot, entry = pool[math.random(#pool)] }
-                end
-            end
-        else
-            if not cyclesByCategory[catID] then
-                cyclesByCategory[catID] = make_cycle_state(pool, entry_key)
-            end
-            local cycle = cyclesByCategory[catID]
-
-            for _, slotInfo in ipairs(slotList) do
-                local picked = take_from_cycle(cycle, slotInfo.currentKey)
+                local picked = pick_same_ip(catID, slotInfo.ipkey, slotInfo.currentKey)
                 if picked then
                     workList[#workList + 1] = { slot = slotInfo.slot, entry = picked }
                 else
@@ -859,96 +996,55 @@ local function scramble_all_slots()
                 end
             end
         end
-
-        ::next_cat::
     end
 
-    -- Fill empty slots — v30: also probe sibling slots for category hints
+    -- Fill empty slots: an empty slot has no entry to reveal its IP, so we take the IP
+    -- (and, when infer_slot_category can't tell, the category) from a sibling slot on the
+    -- SAME station/shelf, then fill via the persistent same-IP path. Slots we can't
+    -- categorize/IP are LEFT ALONE (v43: forcing a wrong entry onto a pedestal is exactly
+    -- what caused "empty gadget slots when not supposed to").
     if #emptySlots > 0 then
-        local emptyByCategory = {}
-        local uncategorized = {}
+        local byStation = {}
+        for catID, slotList in pairs(slotsByCategory) do
+            for _, si in ipairs(slotList) do
+                if si.stationKey and si.stationKey ~= "" then
+                    if not byStation[si.stationKey] then byStation[si.stationKey] = {} end
+                    local b = byStation[si.stationKey]
+                    b[#b + 1] = { cat = catID, ipkey = si.ipkey }
+                end
+            end
+        end
+        local filledEmpty, stillEmpty = 0, 0
         for _, emptySlot in ipairs(emptySlots) do
             pcall(function()
-                local targetCat = infer_slot_category(emptySlot)
-                if targetCat and not SKIP_CATEGORIES[targetCat] then
-                    if not emptyByCategory[targetCat] then emptyByCategory[targetCat] = {} end
-                    emptyByCategory[targetCat][#emptyByCategory[targetCat] + 1] = emptySlot
-                else
-                    -- Try to infer from sibling slots on the same station
-                    local stationKey = nil
-                    pcall(function()
-                        local ownerStation = emptySlot:Get("m_ownerStationComponent")
-                        if ownerStation and is_live(ownerStation) then
-                            stationKey = entry_id(ownerStation)
-                        end
-                    end)
-                    if not stationKey then
-                        pcall(function()
-                            local outer = emptySlot:GetOuter()
-                            if outer and is_live(outer) then stationKey = entry_id(outer) end
-                        end)
-                    end
-
-                    -- Find what category other slots on the same station have
-                    local siblingCat = nil
-                    if stationKey then
-                        for catID, slotList in pairs(slotsByCategory) do
-                            for _, slotInfo in ipairs(slotList) do
-                                if slotInfo.stationKey == stationKey then
-                                    siblingCat = catID
-                                    break
-                                end
-                            end
-                            if siblingCat then break end
-                        end
-                    end
-
-                    if siblingCat and not SKIP_CATEGORIES[siblingCat] then
-                        if not emptyByCategory[siblingCat] then emptyByCategory[siblingCat] = {} end
-                        emptyByCategory[siblingCat][#emptyByCategory[siblingCat] + 1] = emptySlot
-                    else
-                        uncategorized[#uncategorized + 1] = emptySlot
+                local stationKey = nil
+                pcall(function() local os = emptySlot:Get("m_ownerStationComponent"); if os and is_live(os) then stationKey = entry_id(os) end end)
+                if not stationKey then pcall(function() local o = emptySlot:GetOuter(); if o and is_live(o) then stationKey = entry_id(o) end end) end
+                local cat = infer_slot_category(emptySlot)
+                local sibs = stationKey and byStation[stationKey]
+                local ipkey, sibCat = nil, nil
+                if sibs then
+                    for _, sb in ipairs(sibs) do
+                        sibCat = sibCat or sb.cat
+                        ipkey = ipkey or sb.ipkey                 -- shelf-mates share the station IP
+                        if cat and sb.cat == cat then ipkey = sb.ipkey end
                     end
                 end
-            end)
-        end
-
-        -- For uncategorized empties, try Gadget first (most common empty), then Statue
-        for _, emptySlot in ipairs(uncategorized) do
-            local bestCat = 5  -- default to Gadget
-            if entryPool[5] and #entryPool[5] > 0 then
-                bestCat = 5
-            elseif entryPool[4] and #entryPool[4] > 0 then
-                bestCat = 4
-            elseif entryPool[3] and #entryPool[3] > 0 then
-                bestCat = 3  -- Poster
-            end
-            if not emptyByCategory[bestCat] then emptyByCategory[bestCat] = {} end
-            emptyByCategory[bestCat][#emptyByCategory[bestCat] + 1] = emptySlot
-        end
-
-        for catID, catEmptySlots in pairs(emptyByCategory) do
-            local pool = entryPool[catID]
-            if pool and #pool > 0 then
-                if not cyclesByCategory[catID] then
-                    cyclesByCategory[catID] = make_cycle_state(pool, entry_key)
-                end
-                local cycle = cyclesByCategory[catID]
-                for _, emptySlot in ipairs(catEmptySlots) do
-                    local picked = take_from_cycle(cycle, nil)
-                    if not picked then
-                        -- Force pick: never leave a slot empty
-                        picked = pool[math.random(#pool)]
-                    end
+                cat = cat or sibCat
+                if cat and not SKIP_CATEGORIES[cat] and ipkey then
+                    local picked = pick_same_ip(cat, ipkey, nil)
                     if picked then
                         workList[#workList + 1] = { slot = emptySlot, entry = picked, isEmpty = true }
+                        local esk = seen_key(emptySlot); if esk then SEEN[esk] = true end
+                        filledEmpty = filledEmpty + 1
+                        return
                     end
                 end
-            end
+                stillEmpty = stillEmpty + 1
+            end)
         end
-
-        Log(TAG .. ": Empty slots: " .. #emptySlots .. " total, "
-            .. #uncategorized .. " uncategorized (assigned to fallback cat)")
+        Log(TAG .. string.format(": Empty slots: %d total, %d fill (same-IP), %d left (uncat/no-IP)",
+            #emptySlots, filledEmpty, stillEmpty))
     end
 
     -- Execute work list in staggered batches
@@ -1054,43 +1150,47 @@ end
 -- ============================================================================
 local hookRegistered = false
 local hook_used_by_category = {}
-local hookPoolBuilt = false   -- lazy pool build on first hook call
-local hookCallCount = 0       -- how many times the hook fired
+local hookCallCount = 0       -- RestoreSlotEntryFromProfile fire count = load activity
 
--- v36: Remove initDone guard — swap entries AS the game restores them.
--- The game calls RestoreSlotEntryFromProfile during hub load. If actors are
--- spawned AFTER all restores complete, our post-hook entry swaps will cause
--- the game to spawn the correct actors. If actors are spawned during each
--- restore, we at least ensure m_slotEntry is correct for future reference.
+-- v44 CRASH FIX: the post-hook NO LONGER scrambles during the restore. Swapping
+-- entries / calling Blueprint setup (SetupWithCollectibleEntry) WHILE the hub is
+-- still streaming — on half-constructed, still-loading UObjects, inside the
+-- modloader's deferred-Lua queue — corrupted the Lua VM (tick_game_thread ->
+-- luaV_execute SIGSEGV, a crash-loop at hub load). We now ONLY COUNT restores; the
+-- init gate below waits until they STOP (data fully loaded + settled) and then does
+-- every swap once, gently, on stable objects.
 pcall(function()
     RegisterHook("/Script/PFXCollectibles.PFXCollectibleSlotComponent:RestoreSlotEntryFromProfile",
-        function(self)  -- pre-hook: do nothing, let the game restore
-        end,
-        function(self)  -- post-hook: immediately scramble entry
+        function(self) end,   -- pre-hook: nothing
+        function(self)        -- post-hook: only tally load activity (no reflection, no swap)
             hookCallCount = hookCallCount + 1
-            pcall(function()
-                -- Lazy-build the entry pool on first call
-                if not hookPoolBuilt then
-                    pcall(build_entry_pool)
-                    hookPoolBuilt = true
-                    if poolReady then
-                        Log(TAG .. ": Hook: pool built lazily on first RestoreSlotEntryFromProfile (size="
-                            .. stats.pool_size .. ")")
-                    else
-                        Log(TAG .. ": Hook: pool build FAILED on first RestoreSlotEntryFromProfile")
-                    end
-                end
-                if not poolReady then return end
-                scramble_one_slot(self:get(), "hook")
-            end)
         end
     )
     hookRegistered = true
-    Log(TAG .. ": Hook: RestoreSlotEntryFromProfile post-hook ENABLED (v36 — no initDone guard)")
+    Log(TAG .. ": Hook: RestoreSlotEntryFromProfile counter ENABLED (v44 — no in-load scramble)")
 end)
 if not hookRegistered then
     Log(TAG .. ": Hook: RestoreSlotEntryFromProfile FAILED to register")
 end
+
+-- v46: gate the ENTIRE randomizer on the game's OWN readiness signal. The boot
+-- flow (BP_GameflowStart_C, in LVL_VR_Main) fires, in order: OnSettingsLoaded ->
+-- OnProfileLoaded -> OnUserLoggedIn -> OnTablesDataLoaded. OnTablesDataLoaded is the
+-- definitive "player initialized, tables and all loaded" event. We touch NOTHING
+-- until it fires — running before it meant operating on half-initialized objects,
+-- which corrupted the Lua VM (the crash-loop). After it fires we STILL wait for the
+-- hub slots to settle, then scramble once.
+local tablesReady = false
+pcall(function()
+    RegisterHook("/Game/Blueprints/BP_GameflowStart.BP_GameflowStart_C:OnTablesDataLoaded",
+        function(self) end,
+        function(self)
+            tablesReady = true
+            Log(TAG .. ": SIGNAL — OnTablesDataLoaded fired (player + tables initialized)")
+        end
+    )
+    Log(TAG .. ": Hook: BP_GameflowStart.OnTablesDataLoaded gate ENABLED")
+end)
 
 -- ============================================================================
 -- PER-TABLE COSMETICS — Ball + Trail + Flippers (IP-MATCHED)
@@ -1100,13 +1200,33 @@ end
 -- Table→IP mapping is built from entry tags + bundle name matching.
 -- ============================================================================
 
--- Resolve table ID to IP by matching bundle name against tableHintToIP map
+-- Some tables' entry-tag hint names are ABBREVIATIONS that don't literal-substring
+-- match their bundle name (the game shortens them). Without these, exactly 3 tables
+-- resolve hint=nil and get NO ball/trail/flipper cosmetic:
+--   adamsf     (tag) vs 156_AddamsFamily_Bundle
+--   bsg        (tag) vs 170_BattlestarGalactica_Bundle
+--   croftmanor (tag) vs 192_TombRaider_Manor_Bundle
+-- Each alias below is unique to its one bundle, so there's no cross-match risk.
+local HINT_ALIASES = {
+    adamsf     = { "addams" },
+    bsg        = { "battlestar", "galactica" },
+    croftmanor = { "manor" },
+}
+
+-- Resolve a table hint from ANY identifying string (bundle key, cabinet name,
+-- Table Info name/IP) by normalized substring match against known hints + aliases.
 local function resolve_table_hint(bundleKey)
     if not bundleKey or bundleKey == "" then return nil end
-    local bk = bundleKey:lower()
+    local bk = norm_name(bundleKey)
     for hint, _ in pairs(tableHintToIP) do
         if bk:find(hint, 1, true) then
             return hint
+        end
+        local aliases = HINT_ALIASES[hint]
+        if aliases then
+            for _, a in ipairs(aliases) do
+                if bk:find(a, 1, true) then return hint end
+            end
         end
     end
     return nil
@@ -1117,218 +1237,121 @@ local function resolve_table_ip(bundleKey)
     return hint and tableHintToIP[hint] or nil
 end
 
-local function scramble_table_cosmetics()
-    local tcm = find_live("BP_TableCustomizationManager_C", "PFXTableCustomizationManager")
-    if not tcm then
-        Log(TAG .. ": Table cosmetics skipped — no TableCustomizationManager")
-        return 0
-    end
+-- v43 REWRITE: apply per-table ball/trail/flipper cosmetics by calling each
+-- cabinet's OWN BP_CabinetBase_C::SetupFromCollectibleEntry(entry) — the exact
+-- path the game uses when you equip a cosmetic. This is the ONLY correct route:
+--   * it uses the cabinet's real Table Info->PITId (NOT the bundle-prefix number),
+--   * it does the UObject->TSoftObjectPtr conversion the SetTableXxxOverride
+--     natives require (BallSkin/BallTrail are hard ObjectProperties on the entry,
+--     but the override params are TSoftObjectPtr — passing the hard ptr straight
+--     in mis-marshalled the ProcessEvent buffer => out-of-bounds => crash + no
+--     visible skin). The entry's CATEGORY selects ball(10)/trail(11)/flipper(9).
+-- Apply ONE cabinet's random ball/trail/flipper RIGHT NOW (no batching). Idempotent via
+-- the per-PitID _RAND_*_DONE trackers. Driven per-cabinet from the AllLoadingFinished hook
+-- so the cosmetic's soft-asset load happens DURING that cabinet's own load (masked) instead
+-- of a bulk burst after all cabinets stream in (the "customization fires in bulk" lag).
+local function apply_one_cabinet(cab)
+    if not poolReady or not is_live(cab) then return 0 end
+    if #ballPoolValid == 0 and #trailPoolValid == 0 and #flipperPoolAll == 0 then return 0 end
+    _G._RAND_FLIP_DONE  = _G._RAND_FLIP_DONE  or {}
+    _G._RAND_BALL_DONE  = _G._RAND_BALL_DONE  or {}
+    _G._RAND_TRAIL_DONE = _G._RAND_TRAIL_DONE or {}
+    local applied = 0
+    pcall(function()
+        local ti = nil
+        pcall(function() ti = cab:Call("GetTableInfo") end)
+        if not (ti and is_live(ti)) then pcall(function() ti = cab:Get("Table Info") end) end
+        if not (ti and is_live(ti)) then pcall(function() ti = cab:Get("TableInfo") end) end
+        if not (ti and is_live(ti)) then return end
+        local pit = nil; pcall(function() pit = ti:Get("PitID") end)
+        if type(pit) ~= "number" then return end
+        local tname = ""; pcall(function() tname = tostring(ti:Get("Name")) end)
+        local hint = resolve_table_hint(tname) or resolve_table_hint(name_of(cab))
+        if not hint then return end
+        local tip = tableHintToIP[hint]
+        local function apply(entry)
+            if entry and is_live(entry) then
+                if pcall(function() cab:Call("SetupFromCollectibleEntry", entry) end) then applied = applied + 1 end
+            end
+        end
+        if not _G._RAND_BALL_DONE[pit] then
+            local bp = ballByHint[hint]; if not (bp and #bp > 0) and tip then bp = ballByIP[tip] end; if not (bp and #bp > 0) then bp = ballPoolValid end
+            if bp and #bp > 0 then local pk = bp[math.random(#bp)]; if pk and pk.entry then _G._RAND_BALL_DONE[pit] = true; apply(pk.entry) end end
+        end
+        if not _G._RAND_TRAIL_DONE[pit] then
+            local tp = trailByHint[hint]; if not (tp and #tp > 0) and tip then tp = trailByIP[tip] end; if not (tp and #tp > 0) then tp = trailPoolValid end
+            if tp and #tp > 0 then local pk = tp[math.random(#tp)]; if pk and pk.entry then _G._RAND_TRAIL_DONE[pit] = true; apply(pk.entry) end end
+        end
+        if not _G._RAND_FLIP_DONE[pit] then
+            local fp = flipperByHint[hint]
+            if fp and #fp > 0 then local pk = fp[math.random(#fp)]; if pk then _G._RAND_FLIP_DONE[pit] = true; apply(pk) end end
+        end
+    end)
+    return applied
+end
 
+-- Per-cabinet event hook: apply THIS cabinet's cosmetic as it finishes loading (targeted,
+-- spread across cabinets' natural load times — no bulk spike). A tiny delay lets the
+-- cabinet's own SetupFromCollectibleEntry (its default cosmetic) run first.
+pcall(function()
+    RegisterHook("/Game/Blueprints/BP_CabinetBase.BP_CabinetBase_C:AllLoadingFinished",
+        function(self) end,
+        function(self)
+            if _G._RAND_GEN ~= MY_GEN then return end
+            local cab = self
+            ExecuteWithDelay(60, function()
+                if _G._RAND_GEN == MY_GEN and poolReady then pcall(function() apply_one_cabinet(cab) end) end
+            end)
+        end)
+    Log(TAG .. ": Hook: BP_CabinetBase.AllLoadingFinished — per-cabinet cosmetics (no bulk spike)")
+end)
+
+local function scramble_table_cosmetics()
+    if not poolReady then pcall(build_entry_pool) end   -- build on demand (e.g. manual/API call before auto-init)
     if not poolReady then
         Log(TAG .. ": Table cosmetics skipped — pool not ready")
         return 0
     end
-
     if #ballPoolValid == 0 and #trailPoolValid == 0 and #flipperPoolAll == 0 then
-        Log(TAG .. ": Table cosmetics skipped — no valid ball/trail/flipper entries")
+        Log(TAG .. ": Table cosmetics skipped — no ball/trail/flipper entries loaded")
         return 0
     end
 
-    -- Get table IDs from BundleNameMap
-    local cm = find_live("BP_CollectiblesManager_C", "PFXCollectiblesManager")
-    if not cm then
-        Log(TAG .. ": Table cosmetics skipped — no CollectiblesManager")
+    local cabinets = nil
+    pcall(function() cabinets = FindAllOf("BP_CabinetBase_C") end)
+    if not cabinets or #cabinets == 0 then
+        Log(TAG .. ": Table cosmetics skipped — no BP_CabinetBase_C cabinets present")
         return 0
     end
 
-    local bnm = nil
-    pcall(function() bnm = cm:Get("BundleNameMap") end)
-    if not bnm then
-        Log(TAG .. ": Table cosmetics skipped — no BundleNameMap")
-        return 0
+    -- FALLBACK / manual pass: apply ONE cabinet per staggered tick (never a bulk burst)
+    -- for cabinets that were already loaded before the AllLoadingFinished hook could fire
+    -- (mod reload, or /randomize). apply_one_cabinet is idempotent (per-PitID _RAND_*_DONE),
+    -- so cabinets the hook already handled cost almost nothing here.
+    local seen, list = {}, {}
+    for _, cab in ipairs(cabinets) do
+        if is_live(cab) then
+            local id = entry_id(cab)
+            if id == "" or not seen[id] then
+                if id ~= "" then seen[id] = true end
+                list[#list + 1] = cab
+            end
+        end
     end
-
-    local bnmCount = 0
-    pcall(function()
-        bnm:ForEach(function(k, v) bnmCount = bnmCount + 1 end)
-    end)
-    if bnmCount == 0 then
-        Log(TAG .. ": Table cosmetics skipped — BundleNameMap empty")
-        return 0
-    end
-
-    local ballOk, trailOk, flipperOk, flipperFail, failed, noIP = 0, 0, 0, 0, 0, 0
-    local tableCount = 0
-
-    local tableEntries = {}
-    local seenTableID = {}
-
-    bnm:ForEach(function(k, bundle)
-        local tableID = nil
-        local bundleKey = tostring(k)
-
-        local num = bundleKey:match("^(%d+)_")
-        if num then
-            tableID = tonumber(num)
-        end
-
-        if not tableID and bundle and is_live(bundle) then
-            local probe = nil
-            pcall(function() probe = bundle:Get("TableID") end)
-            if type(probe) == "number" then tableID = probe end
-            if not tableID then
-                pcall(function() probe = bundle:Get("m_tableID") end)
-                if type(probe) == "number" then tableID = probe end
-            end
-        end
-
-        if type(tableID) == "number" and tableID > 0 and not seenTableID[tableID] then
-            seenTableID[tableID] = true
-            tableEntries[#tableEntries + 1] = { tableID = tableID, bundleKey = bundleKey }
-        end
-    end)
-
-    table.sort(tableEntries, function(a, b) return a.tableID < b.tableID end)
-
-    -- Build work items for ball/trail, queue flippers separately
-    local cosmeticWork = {}  -- {func, tableID, arg1, arg2, kind}
-
-    for _, te in ipairs(tableEntries) do
-        local tableID = te.tableID
-        local hint = resolve_table_hint(te.bundleKey)
-        tableCount = tableCount + 1
-
-        if not hint then
-            noIP = noIP + 1
-            goto next_table
-        end
-
-        -- Queue BallSkin override — pick randomly from this table's own entries
-        local bpool = ballByHint[hint]
-        if bpool and #bpool > 0 then
-            local pick = bpool[math.random(#bpool)]
-            if pick then
-                cosmeticWork[#cosmeticWork + 1] = {
-                    kind = "ball", tableID = tableID,
-                    fn = "SetTableBallMeshOverride", args = { tableID, pick.mesh, pick.entry }
-                }
-            end
-        end
-
-        -- Queue BallTrail override — pick randomly from this table's own entries
-        local tpool = trailByHint[hint]
-        if tpool and #tpool > 0 then
-            local pick = tpool[math.random(#tpool)]
-            if pick then
-                cosmeticWork[#cosmeticWork + 1] = {
-                    kind = "trail", tableID = tableID,
-                    fn = "SetTableBallTrailOverride", args = { tableID, pick.trail, pick.entry }
-                }
-            end
-        end
-
-        -- Queue flipper arm override — pick randomly from this table's own entries
-        local fpool = flipperByHint[hint]
-        if fpool and #fpool > 0 then
-            local pick = fpool[math.random(#fpool)]
-            if pick then
-                local fmats = nil
-                pcall(function() fmats = pick:Get("OverrideMaterials") end)
-                table.insert(pendingFlipperOverrides, {
-                    tableID = tableID,
-                    pick = pick,
-                })
-                flipperOk = flipperOk + 1
-            end
-        end
-
-        ::next_table::
-    end
-
-    -- Count queued work items synchronously
-    local ballQueued, trailQueued = 0, 0
-    for _, w in ipairs(cosmeticWork) do
-        if w.kind == "ball" then ballQueued = ballQueued + 1
-        elseif w.kind == "trail" then trailQueued = trailQueued + 1 end
-    end
-
-    -- Execute ball/trail overrides in staggered batches (4 per batch, 150ms apart)
-    local COSMETIC_BATCH = 4
-    local COSMETIC_DELAY = 150
-    local totalCos = #cosmeticWork
-    local numCosBatches = math.ceil(totalCos / COSMETIC_BATCH)
-
-    for batch = 1, numCosBatches do
-        local si = (batch - 1) * COSMETIC_BATCH + 1
-        local ei = math.min(batch * COSMETIC_BATCH, totalCos)
-        local delay = (batch - 1) * COSMETIC_DELAY
-
-        ExecuteWithDelay(delay, function()
-            local liveTcm = find_live("BP_TableCustomizationManager_C", "PFXTableCustomizationManager")
-            if not liveTcm then return end
-            for i = si, ei do
-                local w = cosmeticWork[i]
-                if w then
-                    local ok, err = pcall(function()
-                        liveTcm:Call(w.fn, w.args[1], w.args[2], w.args[3])
-                    end)
-                    if w.kind == "ball" then ballOk = ballOk + 1
-                    elseif w.kind == "trail" then trailOk = trailOk + 1 end
-                    if not ok then
-                        Log(TAG .. ": Cosmetic FAIL " .. w.kind .. " tbl=" .. w.tableID .. " fn=" .. w.fn .. " err=" .. tostring(err))
-                    end
-                end
-            end
+    local DELAY = 120   -- ms between cabinets — spread the (rare) fallback work out
+    for i, cab in ipairs(list) do
+        ExecuteWithDelay((i - 1) * DELAY, function()
+            if _G._RAND_GEN == MY_GEN and is_live(cab) then pcall(function() apply_one_cabinet(cab) end) end
         end)
     end
-
-    stats.table_ball = ballQueued
-    stats.table_trail = trailQueued
-    stats.table_flipper = flipperOk
-    stats.table_fail = failed
-    Log(TAG .. ": Table cosmetics: " .. tableCount .. " tables (noIP=" .. noIP .. ")"
-        .. " | ball=" .. ballQueued .. " trail=" .. trailQueued
-        .. " flipper=" .. flipperOk .. "/" .. (flipperOk + flipperFail)
-        .. (failed > 0 and (" FAIL=" .. failed) or ""))
-    return ballQueued + trailQueued
+    Log(TAG .. string.format(": Table cosmetics: %d cabinets scheduled 1/%dms (per-cabinet, hook-driven primary)", #list, DELAY))
+    return #list
 end
 
--- Deferred flipper arm application — staggered with delays to avoid rapid SIGSEGV
+-- v43: flippers are now applied through cabinet:SetupFromCollectibleEntry inside
+-- scramble_table_cosmetics (the same path the game uses to equip an arm skin), so
+-- this deferred applier is a no-op kept only so existing callers stay valid.
 local function apply_pending_flipper_overrides()
-    if #pendingFlipperOverrides == 0 then return end
-    local tcm = find_live("BP_TableCustomizationManager_C", "PFXTableCustomizationManager")
-    if not tcm then return end
-    local total = #pendingFlipperOverrides
-    local ok_count, fail_count = 0, 0
-    local DELAY_MS = 300  -- 300ms between each call
-
-    Log(TAG .. ": Starting staggered flipper overrides: " .. total .. " calls, " .. DELAY_MS .. "ms apart")
-
-    for i, pf in ipairs(pendingFlipperOverrides) do
-        ExecuteWithDelay(DELAY_MS * (i - 1), function()
-            local name = "?"
-            pcall(function() name = pf.pick:GetName() end)
-            local mats = nil
-            pcall(function() mats = pf.pick:Get("OverrideMaterials") end)
-            if mats and #mats > 0 then
-                local ok = pcall(function()
-                    tcm:Call("SetTableArmSkinOverride", pf.tableID,
-                             { OverrideMaterials = mats }, pf.pick)
-                end)
-                Log(TAG .. ": Flipper " .. i .. "/" .. total .. " tbl=" .. pf.tableID
-                    .. " entry=" .. name .. " ok=" .. tostring(ok))
-            else
-                Log(TAG .. ": Flipper " .. i .. "/" .. total .. " tbl=" .. pf.tableID
-                    .. " entry=" .. name .. " NO MATS (skipped)")
-            end
-        end)
-    end
-
-    -- Schedule final summary after all calls complete
-    ExecuteWithDelay(DELAY_MS * total + 500, function()
-        Log(TAG .. ": Staggered flipper overrides complete (" .. total .. " scheduled)")
-    end)
-
     pendingFlipperOverrides = {}
 end
 
@@ -1439,104 +1462,236 @@ local MAX_XARCADE_CHECKS = 15  -- 15 checks * 6s = 90s
 -- Hub has ~206 slots. We require 150+ AND 3 consecutive stable polls so all
 -- RestoreSlotEntryFromProfile calls finish before we scramble.
 -- ============================================================================
-local MAX_POLLS = 90
-local MIN_SLOTS = 150
-local READY_STABLE_POLLS = 3
+-- v44: WAIT FOR FULL HUB LOAD before touching anything. Require slot count,
+-- restore-hook fire count (RestoreSlotEntryFromProfile), AND entry-pool size to ALL
+-- stop changing for STABLE_POLLS consecutive 3s polls — i.e. the hub finished
+-- streaming its slots + entries and the game finished restoring the profile. Only
+-- then (plus a settle margin) do we scramble, each stage on its own delayed tick.
+-- Doing this mid-load, on half-constructed objects, crashed the Lua VM.
+local MAX_POLLS = 120           -- 6-min ceiling at 3s/poll
+-- The hub STREAMS its slots by area, so the count varies (57 in the gadget area,
+-- ~164 with the full customization view). 150 was far too high — it blocked forever
+-- in smaller areas. Fire once there are enough slots to be meaningfully loaded AND
+-- they've stopped changing; the bounded finalize + the /randomize command cover the
+-- rest as the user moves around.
+local MIN_SLOTS = 20
+local STABLE_POLLS = 4          -- slots+restores+pool all unchanged this many polls
 local initDone = false
 local pollCount = 0
-local maintRuns = 0
-local MAX_MAINT_RUNS = 30
-local lastMaintSlotCount = 0
-local stableReadyCount = 0
-local lastReadySlotCount = 0
+local prevSlots, prevRestores, prevPool = -1, -1, -1
+local stableStreak = 0
 
 LoopAsync(3000, function()
+    if _G._RAND_GEN ~= MY_GEN then return true end   -- superseded by a reload
     pollCount = pollCount + 1
-
     if initDone then return true end
-
     if pollCount > MAX_POLLS then
-        Log(TAG .. ": GAVE UP after " .. MAX_POLLS .. " polls")
+        Log(TAG .. ": GAVE UP waiting for a stable hub after " .. MAX_POLLS .. " polls")
         return true
+    end
+
+    -- PRIMARY GATE: the game's own readiness signal. Do NOTHING until the boot flow
+    -- reports the player + tables are initialized. Fall back to slot-stability only if
+    -- the signal never arrives (hook missed) after ~90s, so we never hang forever.
+    if not tablesReady and pollCount < 30 then
+        if pollCount % 4 == 0 then
+            Log(TAG .. ": waiting for OnTablesDataLoaded (player/tables init)... poll " .. pollCount)
+        end
+        return false
     end
 
     local slotCount = count_registered_slots()
     if slotCount < MIN_SLOTS then
-        Log(TAG .. ": Poll #" .. pollCount .. " — slots " .. slotCount .. "/" .. MIN_SLOTS)
+        stableStreak = 0
+        Log(TAG .. ": Poll #" .. pollCount .. " — slots " .. slotCount .. "/" .. MIN_SLOTS .. " (hub loading)")
         return false
     end
 
-    -- Build pool (all entries should exist by now)
-    pcall(build_entry_pool)
-    if not poolReady then
-        Log(TAG .. ": Poll #" .. pollCount .. " — slots=" .. slotCount
-            .. " but pool empty!")
+    -- LIGHT entry-load probe: raw FindAllOf COUNTS only, NO per-entry reflection.
+    -- CRITICAL: build_entry_pool() reflects on every entry (GetEntryID/GetClassName/
+    -- Get("ballskin")) and that SIGSEGVs (uncatchable, pcall can't stop it) on the
+    -- half-constructed entries that are still STREAMING in — this was the boot crash.
+    -- So we must NOT build the pool while entries are still loading; here we only count
+    -- them (cheap, no deref of their fields) to detect when streaming has stopped, and
+    -- build the pool ONCE below, after the counts have held steady.
+    local function raw_n(cls) local a = FindAllOf(cls); return a and #a or 0 end
+    local poolTotal = raw_n("PFXCollectibleEntry_BallSkin")
+                    + raw_n("PFXCollectibleEntry_BallTrail")
+                    + raw_n("PFXCollectibleEntry_FlipperArm")
+                    + raw_n("PFXCollectibleEntry_Gadget")
+                    + raw_n("PFXCollectibleEntry_Statue")
+                    + raw_n("PFXCollectibleEntry_Poster")
+    if poolTotal == 0 then
+        stableStreak = 0
+        Log(TAG .. ": Poll #" .. pollCount .. " — slots=" .. slotCount .. " but no entries yet, waiting")
         return false
     end
 
-    if slotCount ~= lastReadySlotCount then
-        lastReadySlotCount = slotCount
-        stableReadyCount = 1
-        if READY_STABLE_POLLS <= 1 then
-            Log(TAG .. ": Poll #" .. pollCount .. " — slots threshold met, starting init now ("
-                .. slotCount .. ")")
-        else
-        Log(TAG .. ": Poll #" .. pollCount .. " — waiting for stable slots ("
-            .. slotCount .. ", stable " .. stableReadyCount .. "/" .. READY_STABLE_POLLS .. ")")
-        return false
-        end
+    -- Ready only when slots, restore-count, and pool size have ALL held steady.
+    if slotCount == prevSlots and hookCallCount == prevRestores and poolTotal == prevPool then
+        stableStreak = stableStreak + 1
+    else
+        stableStreak = 0
     end
+    prevSlots, prevRestores, prevPool = slotCount, hookCallCount, poolTotal
 
-    stableReadyCount = stableReadyCount + 1
-    if stableReadyCount < READY_STABLE_POLLS then
-        Log(TAG .. ": Poll #" .. pollCount .. " — waiting for stable slots ("
-            .. slotCount .. ", stable " .. stableReadyCount .. "/" .. READY_STABLE_POLLS .. ")")
+    if stableStreak < STABLE_POLLS then
+        Log(TAG .. string.format(": Poll #%d — settling (slots=%d restores=%d pool=%d) stable %d/%d",
+            pollCount, slotCount, hookCallCount, poolTotal, stableStreak, STABLE_POLLS))
         return false
     end
-
-    Log(TAG .. ": Poll #" .. pollCount .. " — READY! Pool=" .. stats.pool_size
-        .. " entries, " .. slotCount .. " slots"
-        .. " | BallValid=" .. #ballPoolValid
-        .. " TrailValid=" .. #trailPoolValid
-        .. " Flipper=" .. #flipperPoolAll)
-
-    -- Run table cosmetics first (per-table overrides)
-    pcall(scramble_table_cosmetics)
-
-    -- Run hub slot scramble (with visual updates)
-    pcall(scramble_all_slots)
-
-    -- Destroy XArcade promo actors — runs once now, then repeats on a timer
-    -- to catch late-loaded sublevel actors (LVL_Arcade_80s_Rooms_OPTI_DLC1)
-    pcall(destroy_xarcade_actors)
 
     initDone = true
-    lastMaintSlotCount = slotCount
-    Log(TAG .. ": === Init complete ===")
+    -- Entry counts have held steady for STABLE_POLLS (~12s) => streaming has finished,
+    -- so it's now SAFE to reflect on the entries. Build the pool exactly ONCE here.
+    pcall(build_entry_pool)
+    Log(TAG .. string.format(": READY — fully loaded (slots=%d rawEntries=%d restores=%d | Ball=%d Trail=%d Flip=%d). Scrambling staggered...",
+        slotCount, poolTotal, hookCallCount, #ballPoolValid, #trailPoolValid, #flipperPoolAll))
 
-    -- Start repeating XArcade destroy timer (catches late-streamed sublevel)
+    -- Work AFTER an extra settle margin, each stage on its own delayed tick so no two
+    -- heavy passes share a frame. Nothing here ran during the load storm, and each is
+    -- gated on hub_active() so nothing runs if a table was entered in the meantime.
+    ExecuteWithDelay(1500, function() if _G._RAND_GEN==MY_GEN and hub_active() then pcall(scramble_all_slots) end end)
+    ExecuteWithDelay(5000, function() if _G._RAND_GEN==MY_GEN and hub_active() then pcall(scramble_table_cosmetics) end end)
+    ExecuteWithDelay(8000, function() if _G._RAND_GEN==MY_GEN and hub_active() then pcall(destroy_xarcade_actors) end end)
+
+    -- Repeating XArcade destroy timer (catches late-streamed sublevel actors)
     LoopAsync(6000, function()
+        if _G._RAND_GEN ~= MY_GEN then return true end
+        if not hub_active() then return true end
         xarcadeCheckCount = xarcadeCheckCount + 1
         if xarcadeCheckCount > MAX_XARCADE_CHECKS then return true end
         pcall(destroy_xarcade_actors)
         return false
     end)
 
-    -- Schedule deferred flipper arm overrides (15s delay for tables to fully load)
-    if #pendingFlipperOverrides > 0 then
-        Log(TAG .. ": Scheduling " .. #pendingFlipperOverrides .. " deferred flipper overrides in 15s")
-        ExecuteWithDelay(15000, function()
-            pcall(apply_pending_flipper_overrides)
-        end)
-    end
-
     return true
 end)
 
--- Post-init maintenance: catch late-loaded slots and refill empties.
-LoopAsync(4000, function()
+-- ============================================================================
+-- POST-INIT MAINTENANCE (v43) — the previous version was a NO-OP, so late-loaded
+-- and never-restored (unowned) empty slots were left empty forever and blacklisted
+-- entries the game restored into slots were never removed. This pass, run on a
+-- bounded adaptive timer, (a) fills any empty slot whose category we can infer and
+-- (b) replaces any blacklisted entry sitting in a live slot. Capped per pass to
+-- avoid a spawn spike; stops once two consecutive passes are clean.
+-- ============================================================================
+local maint_cycles = {}
+local MAINT_PER_PASS = 12   -- cap swaps per pass (spreads async actor spawns)
+
+local function maintenance_pass()
+    if not poolReady then return 0, 0 end
+    pcall(patch_slot_ip_restriction)   -- ensure any-entry-any-slot before we equip
+    local _, liveSlots = count_registered_slots()
+    if not liveSlots then return 0, 0 end
+    local filled, cleaned = 0, 0
+    for _, slot in ipairs(liveSlots) do
+        if (filled + cleaned) >= MAINT_PER_PASS then break end
+        pcall(function()
+            if not is_live(slot) then return end
+            local entry = nil
+            pcall(function() entry = slot:Get("m_slotEntry") end)
+            local elive = entry and is_live(entry)
+
+            if elive and is_blacklisted_entry(entry) then
+                -- (b) blacklisted entry sitting in a slot -> replace with a clean pick
+                local catID = get_category_id(entry) or infer_slot_category(slot)
+                if catID and not SKIP_CATEGORIES[catID] then
+                    local pick = pick_same_ip(catID, entry_ipkey(entry), entry_key(entry))
+                    if pick and swap_slot_entry(slot, pick) then cleaned = cleaned + 1 end
+                end
+            elseif not elive then
+                -- (a) empty slot -> fill if we can infer its category. IP key is "*" once
+                -- the restriction is patched out; otherwise borrow a sibling slot's IP.
+                local catID = infer_slot_category(slot)
+                if catID and not SKIP_CATEGORIES[catID] then
+                    local ipkey = _G._RAND_IP_PATCHED and "*" or nil
+                    if not ipkey then
+                        local sk; pcall(function() local os = slot:Get("m_ownerStationComponent"); if os and is_live(os) then sk = entry_id(os) end end)
+                        if sk then
+                            for _, s2 in ipairs(liveSlots) do
+                                if is_live(s2) and s2 ~= slot then
+                                    local e2; pcall(function() e2 = s2:Get("m_slotEntry") end)
+                                    if e2 and is_live(e2) then
+                                        local sk2; pcall(function() local o2 = s2:Get("m_ownerStationComponent"); if o2 and is_live(o2) then sk2 = entry_id(o2) end end)
+                                        if sk2 == sk then ipkey = entry_ipkey(e2); break end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    if ipkey then
+                        local pick = pick_same_ip(catID, ipkey, nil)
+                        if pick and swap_slot_entry(slot, pick) then filled = filled + 1 end
+                    end
+                end
+            end
+        end)
+    end
+    return filled, cleaned
+end
+
+-- v48 AUTO-APPLY — the playable cabinets AND hub slots STREAM by proximity (24
+-- cabinets loaded in one spot, 0 in another), so a one-shot pass misses whatever
+-- isn't loaded yet. This loop keeps applying cosmetics + filling/cleaning slots as
+-- content streams in, doing the HEAVY work only when the loaded cabinet/slot count
+-- CHANGES (cheap otherwise). It PAUSES (touches nothing) while a table is being
+-- played and resumes at the hub — that pause is what keeps it from crashing on the
+-- stale objects a table-load tears down. Bounded to ~5 min so it isn't a permanent
+-- VR hitch; /randomize re-triggers it any time.
+local lastCab, lastSlots, lastEntryRaw = -1, -1, -1
+local autoWarmup = 3         -- ~21s after init so the one-shot scrambles finish first
+-- Counts HUB passes only (it returns early when in a table), so this is ~30 min of
+-- actual hub time spread across the whole session — enough to cover every table's
+-- cabinet as you pass it, incl. BSG / Tomb Raider Manor. /randomize re-arms it.
+local autoRun, AUTO_MAX = 0, 220
+local function live_cabinet_count()
+    local nc = 0
+    for _, c in ipairs(FindAllOf("BP_CabinetBase_C") or {}) do
+        local ok, v = pcall(function() return c:IsValid() end)
+        if ok and v then nc = nc + 1 end
+    end
+    return nc
+end
+LoopAsync(8000, function()
+    if _G._RAND_GEN ~= MY_GEN then return true end   -- superseded by a reload
     if not initDone then return false end
-    return true
+    if not hub_active() then return false end        -- in a table: pause, resume at hub
+    if autoWarmup > 0 then autoWarmup = autoWarmup - 1; return false end
+    autoRun = autoRun + 1
+    if autoRun > AUTO_MAX then
+        Log(TAG .. ": auto-apply window ended — inert (use /randomize to re-run)")
+        return true
+    end
+    -- change detection + streaming guard. build_entry_pool reflects on collectible
+    -- entries (GetEntryID/GetClassName/Get) and takes an UNCATCHABLE SIGSEGV on
+    -- half-streamed ones. So we ONLY rebuild the pool when the raw entry count has
+    -- held steady across two ticks (i.e. streaming has settled). Raw counts are
+    -- FindAllOf-#-only — no reflection — so they're safe to read every tick.
+    local function raw_n(cls) local a = FindAllOf(cls); return a and #a or 0 end
+    local er = raw_n("PFXCollectibleEntry_BallSkin") + raw_n("PFXCollectibleEntry_BallTrail")
+             + raw_n("PFXCollectibleEntry_FlipperArm") + raw_n("PFXCollectibleEntry_Gadget")
+             + raw_n("PFXCollectibleEntry_Statue") + raw_n("PFXCollectibleEntry_Poster")
+    local entriesStable = (er == lastEntryRaw)
+    lastEntryRaw = er
+    local nc = live_cabinet_count()
+    local ns = count_registered_slots()
+    if nc == lastCab and ns == lastSlots then return false end   -- nothing new streamed in
+    if not entriesStable then return false end                   -- entries mid-stream: wait a tick
+    lastCab, lastSlots = nc, ns
+    pcall(build_entry_pool)
+    -- Randomize slots at stations that just streamed in (incremental: skips ones already
+    -- done, so posters/statues/walls/floors get randomized when you reach them — no bulk).
+    local newSwaps = 0
+    pcall(function() newSwaps = scramble_all_slots(true) end)
+    local filled, cleaned = 0, 0
+    pcall(function() filled, cleaned = maintenance_pass() end)
+    stats.empty_filled = stats.empty_filled + filled
+    local queued = 0
+    pcall(function() queued = scramble_table_cosmetics() end)
+    Log(TAG .. string.format(": auto-apply (cab=%d slots=%d) newSlots=%d filled=%d blacklist=%d cosmetics=%d",
+        nc, ns, newSwaps, filled, cleaned, queued))
+    return false
 end)
 
 -- ============================================================================
@@ -1612,8 +1767,11 @@ pcall(function()
     end)
 end)
 
-Log(TAG .. ": v42 loaded — hook=" .. tostring(hookRegistered)
-    .. " | Fixes: entry blacklist, XArcade repeating destroy, all-room floor/wall+preview, Silver Ball+XArcade blacklist")
+Log(TAG .. ": v46 loaded — hook=" .. tostring(hookRegistered)
+    .. " | v46: gate the WHOLE mod on the game's own BP_GameflowStart.OnTablesDataLoaded event"
+    .. " (player + tables initialized) before ANY work — never touches half-initialized objects."
+    .. " Keeps v45 hub_active/get_S table-entry guard + bounded inert finalize + generation guard,"
+    .. " v44 slot-settle gate, cabinet SetupFromCollectibleEntry cosmetics, gadget fill, blacklist")
 
 -- ============================================================================
 -- GLOBAL EXPORTS — callable by other mods (e.g. PFX_ModMenu)
