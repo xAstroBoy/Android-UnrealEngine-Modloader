@@ -162,51 +162,26 @@ pcall(function()
     end
 end)
 
--- ── cObjWep::reloadable — BYTE PATCH, not a Lua hook ────────────────────
--- This was a Lua post-hook that unconditionally `return 1`. Two problems in one:
--- the decision is STATIC (always 1 when the mod is on), and `reloadable` is a
--- per-frame weapon query, so the callback ran Lua on the game thread every frame
--- and raced the shared lua_State. That corruption never crashes where it happens —
--- it surfaced as FMallocBinned2 in GC, pc=lr=0x1, a fault inside atan2f, and a
--- jump to pc=0x24cc. Same class as the ScoreControl / DualFire / Tyrant /
--- NoVignette hot-hook crashes.
+-- ── cObjWep::reloadable — REMOVED ENTIRELY (broke the Chicago Typewriter) ──
 --
--- The whole function is a tail call:
---     __int64 cObjWep::reloadable(cObjWep *this) { return cItemMgr::reloadable(&ItemMgr); }
--- so "always reloadable" is 2 instructions. Decide it once, run at full speed,
--- nothing to race. Original saved so the toggle restores it exactly.
-local ARM64_MOV_W0_1 = 0x52800020   -- mov w0, #1
-local ARM64_RET      = 0xD65F03C0   -- ret
-
-local RELOADABLE = { name = "cObjWep::reloadable",
-                     mangled = "_ZN7cObjWep10reloadableEv", fb = 0x5FC0F04 }
-local reloadablePatched = false
-
-local function applyReloadablePatch(on)
-    if on == reloadablePatched then return end
-    pcall(function()
-        if not RELOADABLE.addr then
-            local a = Resolve(RELOADABLE.mangled, RELOADABLE.fb)
-            if a and not IsNull(a) then
-                RELOADABLE.addr = a
-                RELOADABLE.orig = { ReadU32(a), ReadU32(Offset(a, 4)) }
-            end
-        end
-        if not RELOADABLE.addr then return end
-        if on then
-            WriteU32(RELOADABLE.addr, ARM64_MOV_W0_1)
-            WriteU32(Offset(RELOADABLE.addr, 4), ARM64_RET)
-        else
-            WriteU32(RELOADABLE.addr, RELOADABLE.orig[1])
-            WriteU32(Offset(RELOADABLE.addr, 4), RELOADABLE.orig[2])
-        end
-        reloadablePatched = on
-        Log(TAG .. ": " .. RELOADABLE.name .. " byte-patch " .. (on and "APPLIED (always reloadable)" or "reverted")
-            .. " @ " .. ToHex(RELOADABLE.addr))
-    end)
-end
-
-applyReloadablePatch(state.enabled and true or false)
+-- This started as a Lua post-hook that unconditionally `return 1`, which was a
+-- per-frame Lua callback on the game thread (a lua_State race). I replaced it
+-- with a MOV W0,#1 / RET byte patch — and that BROKE THE CHICAGO TYPEWRITER: it
+-- could not fire at all.
+--
+-- Why, from IDA:
+--     __int64 cObjTompson::reloadable(cObjTompson *this) {   // a pure thunk
+--         return cObjWep::reloadable(this);
+--     }
+-- The Tommy Gun does NOT have an independent override — it DELEGATES to the base.
+-- So forcing cObjWep::reloadable to 1 tells the Chicago Typewriter it can always
+-- reload, and it sits in the reload state instead of ever firing.
+--
+-- It is gone rather than re-hooked, because it was never the fix. This mod's real
+-- no-recharge is below and unaffected:
+--     GetCurrentAmmo -> 999           (chamber never empties)
+--     Rifle::IsReadyToFire CBZ -> B   (ignore the spent-chamber gate)
+-- Forcing `reloadable` on top of those bought nothing and cost a whole weapon.
 
 if sym_InstantReload then
     pcall(function()
@@ -227,7 +202,6 @@ end
 
 RegisterCommand("norecharge", function()
     state.enabled = not state.enabled
-    applyReloadablePatch(state.enabled and true or false)
     V("toggle: enabled=%s", tostring(state.enabled))
     ModConfig.Save("NoRecharge", state)
     Log(TAG .. ": " .. (state.enabled and "ON" or "OFF"))
@@ -260,7 +234,6 @@ if SharedAPI and SharedAPI.DebugMenu then
         function() return state.enabled end,
         function(v)
             state.enabled = v
-            applyReloadablePatch(v and true or false)
             ModConfig.Save("NoRecharge", state)
         end)
 end
