@@ -231,6 +231,25 @@ pub fn push(serial: &str, local: &Path, remote: &str) -> Result<()> {
 // Rename dirs BEFORE uninstall so Android doesn't wipe them,
 // rename back AFTER install so the game finds them.
 
+/// Move the game's data aside so `uninstall` cannot delete it, and hand back the
+/// (original, backup) pairs for restore_game_dirs().
+///
+/// Uninstall wipes the OBB, the app's external data AND its internal data. On RE4
+/// that is 7.9 GB of OBB plus the actual progress save — re-downloading 8 GB per
+/// re-patch is what makes people avoid updating. `mv` on the same filesystem is
+/// instant regardless of size, so this costs nothing.
+///
+/// What lives where (verified on com.Armature.VR4):
+///   /sdcard/Android/obb/<pkg>/              main+patch .obb   ~7.9 GB
+///   /sdcard/Android/data/<pkg>/files/savegame00.sav           ~2 MB  ← REAL PROGRESS SAVE
+///   /data/data/<pkg>/.../Saved/SaveGames/System.sav           ~3 KB  ← settings only
+///
+/// The internal dir needs root (the stock APK is not debuggable, so `run-as` is
+/// refused and its manifest has allowBackup=false, so `adb backup` is refused too
+/// — which is exactly why saves seem impossible to extract from a stock install).
+/// It is therefore BEST-EFFORT: if root is unavailable we log and continue, since
+/// only settings are at stake. Note the patched APK sets debuggable + allowBackup,
+/// so afterwards `run-as <pkg>` and `adb backup` both work with no root.
 pub fn backup_game_dirs(serial: &str, package: &str) -> Result<Vec<(String, String)>> {
     let mut backed = Vec::new();
     let dirs = [
@@ -247,11 +266,58 @@ pub fn backup_game_dirs(serial: &str, package: &str) -> Result<Vec<(String, Stri
             backed.push((dir.clone(), bak));
         }
     }
+
+    // Internal data (settings). Root-only, best-effort — never fail the install.
+    let internal = format!("/data/data/{}", package);
+    let bak = format!("/data/local/tmp/{}.internal_bak", package);
+    let probe = shell(serial, &format!(
+        "su -c \"[ -d '{}' ] && echo Y || echo N\" 2>/dev/null", internal
+    )).unwrap_or_default();
+    if probe.contains('Y') {
+        let _ = shell(serial, &format!("su -c \"rm -rf '{}'\" 2>/dev/null", bak));
+        let r = shell(serial, &format!(
+            "su -c \"cp -a '{}' '{}' && echo OK\" 2>/dev/null", internal, bak
+        )).unwrap_or_default();
+        if r.contains("OK") {
+            log::info!("Backed up internal data (settings) → {}", bak);
+            backed.push((internal, bak));
+        } else {
+            log::warn!("Could not back up {} — settings will reset (progress save is safe)", internal);
+        }
+    } else {
+        log::info!("No root: skipping internal-data backup (settings only; the \
+                    progress save lives in /sdcard/Android/data and IS preserved)");
+    }
     Ok(backed)
 }
 
 pub fn restore_game_dirs(serial: &str, backups: &[(String, String)]) -> Result<()> {
     for (orig, bak) in backups {
+        // Internal data lives under /data — needs root and must keep the NEW
+        // install's uid ownership, so it is merged via su + restorecon instead.
+        if orig.starts_with("/data/data/") {
+            let ok = shell(serial, &format!(
+                "su -c \"cp -a '{}/.' '{}/' && restorecon -R '{}' 2>/dev/null; echo OK\" 2>/dev/null",
+                bak, orig, orig
+            )).unwrap_or_default();
+            if ok.contains("OK") {
+                // The new install owns the dir; re-apply its uid to the merged files.
+                let uid = shell(serial, &format!(
+                    "su -c \"stat -c %u '{}'\" 2>/dev/null", orig
+                )).unwrap_or_default();
+                let uid = uid.trim();
+                if !uid.is_empty() {
+                    let _ = shell(serial, &format!(
+                        "su -c \"chown -R {}:{} '{}'\" 2>/dev/null", uid, uid, orig
+                    ));
+                }
+                let _ = shell(serial, &format!("su -c \"rm -rf '{}'\" 2>/dev/null", bak));
+                log::info!("Restored internal data (settings) → {}", orig);
+            } else {
+                log::warn!("Could not restore {} (left at {})", orig, bak);
+            }
+            continue;
+        }
         let exists = shell(serial, &format!("[ -d '{}' ] && echo Y || echo N", bak))?;
         if exists.contains('Y') {
             // If new install created the dir, merge
