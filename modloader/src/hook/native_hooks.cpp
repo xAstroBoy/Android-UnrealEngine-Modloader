@@ -1539,6 +1539,67 @@ bool install_u3_killable_fix(uintptr_t em32_init, uintptr_t setobj00) {
 uint32_t u3_rescued_count() { return s_u3_rescued.load(std::memory_order_relaxed); }
 
 // ═══════════════════════════════════════════════════════════════════════
+// LASER SIGHT — aiming at an enemy with no part 0 killed the game
+// ═══════════════════════════════════════════════════════════════════════
+//     fault addr 0x80
+//     MTXMultVec+4
+//     GetWepTargetPos(Vec*, Vec*, uint, uint, cEm**, uint*)+980
+//     AVR4GamePlayerGun::UpdateLaserSight(float)+700   <- every frame you aim
+//
+//     5eef82c  MOV X0, X23              ; the cEm
+//     5eef830  MOV W1, WZR              ; part index 0
+//     5eef834  BL  cModel::getPartsPtr  ; -> NULL when the rig has no part 0
+//     5eef844  B.HI loc_5EEF8C4
+//     5eef8c4  ADD X1, X0, #0x80        ; NULL + 0x80 = 0x80
+//     5eef8d0  BL  MTXMultVec           ; LDP S2,S3,[X1] -> fault 0x80
+// getPartsPtr correctly returns NULL for a crossover enemy whose rig lacks that
+// bone; the caller adds 0x80 and hands it to MTXMultVec unchecked. So merely
+// POINTING THE LASER at such an enemy kills the game.
+//
+// NOT fixed with a crash guard — install_safe_call_guard is INERT. The crash
+// handler's siglongjmp recovery was removed on purpose ("Crashes are meant to be
+// seen and fixed, not hidden"), so dispatch_full's sigsetjmp is armed and nothing
+// ever jumps back. A guard here would log "installed" and do absolutely nothing;
+// this tombstone has thunk_4 -> dispatch_full right in it, proving exactly that.
+//
+// So fix the actual NULL, the way em32 site 2 was fixed (and that one held):
+// one instrument, and when getPartsPtr returned NULL point X0 at a zeroed buffer.
+// MTXMultVec then reads zeros and writes a zero vector — the laser simply gets no
+// lock-on for that target instead of taking the process down. No-op when the part
+// exists, so normal targeting is untouched. ONE instrument: nothing else is hooked
+// within 16 bytes (the 4-byte-apart disaster is documented at install_em32_*).
+alignas(16) static uint8_t g_zero_parts[0x100];   // reads land at +0x80..+0x88
+
+static void laser_null_parts_to_zero(void* addr, DobbyRegisterContext* ctx) {
+    (void)addr;
+    if (ctx->general.x[0] == 0)
+        ctx->general.x[0] = reinterpret_cast<uint64_t>(g_zero_parts);
+}
+
+bool install_laser_sight_fix(uintptr_t add_x1_site) {
+    if (!add_x1_site) return false;
+    // Verify it really is `ADD X1, X0, #0x80` before touching it.
+    //   ADD (immediate, 64-bit): sf=1 op=0 S=0 100010 sh imm12 Rn Rd
+    //   = 0x91000000 | (0x80 << 10) | (0 << 5) | 1
+    const uint32_t kAddX1X0_80 = 0x91020001u;
+    uint32_t w = *reinterpret_cast<const uint32_t*>(add_x1_site);
+    if (w != kAddX1X0_80) {
+        logger::log_warn("LASER", "0x%lX is not `ADD X1,X0,#0x80` (insn 0x%08X) — fix skipped",
+                         (unsigned long)add_x1_site, w);
+        return false;
+    }
+    if (DobbyInstrument(reinterpret_cast<void*>(add_x1_site),
+                        laser_null_parts_to_zero) != RT_SUCCESS) {
+        logger::log_error("LASER", "DobbyInstrument failed at 0x%lX", (unsigned long)add_x1_site);
+        return false;
+    }
+    logger::log_info("LASER", "laser-sight null-parts fix installed @0x%lX — aiming at an enemy "
+                              "whose rig has no part 0 now yields no lock-on instead of SIGSEGV 0x80",
+                     (unsigned long)add_x1_site);
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // MINE THROWER fast reload — pure C++, because moveReload is a VTABLE entry
 // ═══════════════════════════════════════════════════════════════════════
 // The Mine Thrower has no ::InstantReload, so after each shot cObjMine::moveReload

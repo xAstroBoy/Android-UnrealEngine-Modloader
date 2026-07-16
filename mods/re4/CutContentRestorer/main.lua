@@ -201,44 +201,40 @@ do
     -- the safe-call guard instead. The circuit breaker means a permanently broken
     -- IK trips after 8 faults and stops being called — enemies lose IK (foot
     -- placement), the game keeps its frame rate.
-    -- Functions where the game calls cModel::getPartsPtr and derefs the result
-    -- with no null check. getPartsPtr correctly returns NULL when the model has
-    -- no such bone/part — routine for a crossover enemy whose rig doesn't match.
-    -- `this` is valid in both, so the null-this guard can't help; route them
-    -- through the safe-call guard. The circuit breaker means a permanently broken
-    -- one trips after 8 faults and stops being called, so it degrades (no IK / no
-    -- laser lock-on) instead of crashing or tanking the frame rate.
-    if InstallCrashGuard then
-        for _, g in ipairs({
-            -- PartsPtr = getPartsPtr(model, motion->partIdx[i]);
-            -- v11 = *(_DWORD *)(PartsPtr + 472);        472 = 0x1D8 -> fault 0x1d8
-            { sym = "_Z6IKInitP6cModelP11MOTION_INFO", rva = 0x5F53D90, name = "IKInit" },
-            -- LASER SIGHT. Aiming at an enemy whose rig lacks part 0 killed the game:
-            --   5eef834  BL  cModel::getPartsPtr     ; -> NULL
-            --   5eef8c4  ADD X1, X0, #0x80           ; NULL + 0x80
-            --   5eef8d0  BL  MTXMultVec              ; LDP S2,S3,[X1] -> fault 0x80
-            -- seen as MTXMultVec+4 <- GetWepTargetPos+980 <- UpdateLaserSight
-            -- <- PostBio4Tick, i.e. every frame the laser is on a bad target.
-            { sym = "_Z15GetWepTargetPosP3VecS0_jjPP3cEmPj", rva = 0x5EEF4FC,
-              name = "GetWepTargetPos (laser sight)" },
-            -- The enemy's SOUND BANK. cEmMgr::construct loads it per spawn:
-            --   ArmLoadSoundBlockEnemy(emId) -> CArmSoundBlock::TryLoadGenericFromDas
-            --   -> ExtractTracksFromXSB -> ExtractTrackIndex -> SEGV_ACCERR
-            -- ACCERR (not MAPERR) = it ran off the END of a buffer: the XSB parser
-            -- walking a sound bank that isn't in this room's archive, which is
-            -- exactly what a crossover enemy has. Sound is not essential — an
-            -- enemy with no voice beats a dead game — and the breaker means a
-            -- permanently missing bank stops being retried after 8 tries.
-            { sym = "_Z22ArmLoadSoundBlockEnemyi", rva = 0x61AAC50,
-              name = "ArmLoadSoundBlockEnemy (enemy sound bank)" },
-        }) do
-            pcall(function()
-                local a = Resolve(g.sym, g.rva)
-                local ok = InstallCrashGuard(a, g.name)
-                Log(TAG .. ": crash guard " .. g.name .. ": " .. (ok and "installed" or "FAILED"))
-            end)
-        end
+    -- LASER SIGHT — a REAL fix, not a crash guard.
+    --
+    -- Aiming at a crossover enemy whose rig has no part 0 killed the game every
+    -- frame the laser was on it:
+    --   5eef834  BL  cModel::getPartsPtr   ; -> NULL
+    --   5eef8c4  ADD X1, X0, #0x80         ; NULL + 0x80
+    --   5eef8d0  BL  MTXMultVec            ; LDP S2,S3,[X1] -> fault 0x80
+    --
+    -- I first "fixed" this with InstallCrashGuard. That did NOTHING, and the next
+    -- tombstone proved it — thunk_4 -> dispatch_full -> GetWepTargetPos -> fault
+    -- 0x80, i.e. the guard was right there in the stack and the game still died.
+    -- crash_handler.cpp DELIBERATELY REMOVED all five siglongjmp recovery paths
+    -- ("Crashes are meant to be seen and fixed, not hidden"), so the sigsetjmp in
+    -- dispatch_full is armed and nothing ever jumps back. install_safe_call_guard
+    -- logs "installed (sigsetjmp active)" and protects nothing. Same for the
+    -- circuit breaker: it only counts recoveries, which never happen.
+    --
+    -- So neutralise the pointer instead — the em32 site-2 pattern, which held.
+    if InstallLaserSightFix then
+        pcall(function()
+            local site = Offset(GetLibBase(), 0x5EEF8C4)   -- ADD X1, X0, #0x80
+            local ok = InstallLaserSightFix(site)
+            Log(TAG .. ": laser-sight null-parts fix: " .. (ok and "installed" or "FAILED"))
+        end)
+    else
+        LogWarn(TAG .. ": InstallLaserSightFix missing — rebuild the modloader")
     end
+
+    -- NOTE: IKInit and ArmLoadSoundBlockEnemy had InstallCrashGuard here too. They
+    -- were removed, not kept "just in case" — they are inert for the same reason
+    -- and only served to make the log claim protection that does not exist. Both
+    -- still need real fixes when their tombstones come back:
+    --   IKInit                 getPartsPtr NULL -> *(NULL+472)  fault 0x1d8
+    --   ArmLoadSoundBlockEnemy XSB parser walks off a missing bank, SEGV_ACCERR
 
     -- U3 "It" (emId 50 = 0x32 = cEm32) — killable OUTSIDE its scripted level.
     --

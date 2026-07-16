@@ -106,6 +106,15 @@ void add_em3f_mesh_path_fix(uint32_t key, int32_t comparison_index);
 // killing the game. Needed because install_builtin_crash_guards() is skipped on
 // this title (guarding the render path black-screens VR). Main user:
 // cModel::initJoint, which faults when the cut police NPC (em07/PL07) spawns.
+// WARNING — THIS IS INERT. It installs a callback-less hook so the original runs
+// under dispatch_full's sigsetjmp, but crash_handler.cpp DELIBERATELY REMOVED all
+// five siglongjmp recovery paths ("Crashes are meant to be seen and fixed, not
+// hidden"), so nothing ever jumps back and a fault inside the guarded original
+// still kills the process. Proven: a tombstone with thunk_4 -> dispatch_full ->
+// GetWepTargetPos -> fault 0x80 in it. Do NOT reach for this expecting protection
+// — fix the actual null (byte patch, or one DobbyInstrument that neutralises the
+// pointer, as install_em32_subobject_guard and install_laser_sight_fix do).
+// Kept only because its try/catch still guards C++ exceptions, a different thing.
 HookId install_safe_call_guard(void* addr, const char* name);
 // Cut villager ganados (em ids 6/7/8/0xA/0xB/0xD/0x33/0x37): they share em10.das
 // with id 9 but have no ArmEmCallProlog case, so EmInitFunc was left STALE and
@@ -158,6 +167,16 @@ bool install_minethrower_fast_reload(uintptr_t movereload, uintptr_t itemmgr,
                                      uintptr_t reload_fn, uint32_t inprog_off,
                                      uint32_t subflag_off);
 void set_minethrower_enabled(bool on);
+// Laser sight: GetWepTargetPos derefs cModel::getPartsPtr's NULL result
+//     5eef834  BL  cModel::getPartsPtr   ; NULL when the rig has no part 0
+//     5eef8c4  ADD X1, X0, #0x80         ; NULL + 0x80
+//     5eef8d0  BL  MTXMultVec            ; -> fault 0x80
+// so aiming at a crossover enemy kills the game, every frame. Pass the address of
+// the `ADD X1, X0, #0x80` (0x5EEF8C4); a NULL X0 is pointed at a zeroed buffer, so
+// the laser gets no lock-on instead of a SIGSEGV. Encoding is verified before
+// patching. NOT a crash guard — install_safe_call_guard is INERT (see below).
+bool install_laser_sight_fix(uintptr_t add_x1_site);
+
 // U3 "It" (emId 50 = 0x32 = cEm32) is INVULNERABLE outside its scripted level —
 // same root as the fault-0x180 crash. sub_5E49AA0 builds U3's parts model with
 // SetObj00 using the GLOBAL/stage archive at pG+0x68 for the skeleton param; away

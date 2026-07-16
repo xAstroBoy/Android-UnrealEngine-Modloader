@@ -2198,6 +2198,17 @@ namespace lua_bindings
             native_hooks::set_minethrower_enabled(on);
         });
 
+        // ── InstallLaserSightFix — aiming at a crossover enemy killed the game
+        // GetWepTargetPos derefs getPartsPtr's NULL result (ADD X1,X0,#0x80 ->
+        // MTXMultVec -> fault 0x80), every frame the laser is on that target.
+        // A crash guard CANNOT fix this: the handler's siglongjmp recovery was
+        // removed on purpose, so install_safe_call_guard is inert. This
+        // neutralises the pointer instead — no lock-on, no crash.
+        // Sig: InstallLaserSightFix(addrOfAddX1X0_0x80) -> bool
+        lua.set_function("InstallLaserSightFix", [](void* site) -> bool {
+            return native_hooks::install_laser_sight_fix(reinterpret_cast<uintptr_t>(site));
+        });
+
         // ── InstallDualFireArm — dual-fire WITHOUT a Lua hook on TryFire ─────
         // RE4 arms ONE weapon globally and TryFire only fires the gun that IS the
         // armed one, so dual-wielding fires only one gun. Arming each gun inside
