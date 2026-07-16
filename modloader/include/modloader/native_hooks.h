@@ -122,6 +122,18 @@ bool install_cut_villager_fix();
 // No-op whenever the pointer isn't null. The other 105 call sites take X0 from the
 // cEm's archive and never deref the model, so they were never at risk.
 bool install_em32_subobject_guard();
+// Dual-fire: arm the gun inside its OWN AVR4GamePlayerGun::TryFire so both guns
+// pass the "am I the armed weapon?" check and fire the same frame. MUST be pure
+// C++: TryFire is HOT (every trigger pull, per gun, continuously under
+// rapid-fire), and a Lua callback there races the shared lua_State against the
+// mod loop + bridge thread => heap/stack corruption surfacing later as
+// FMallocBinned2 dying in GC, or a RET into a smashed return address (pc=lr=1).
+// Addresses are passed in from Lua (Resolve() handles symbol+fallback there);
+// only the hot path lives in C++. Idempotent — a mod reload won't stack hooks.
+bool install_dualfire_arm(uintptr_t tryfire, uintptr_t itemmgr,
+                          uintptr_t armsearch, uintptr_t armfn, uint32_t wno_off);
+void set_dualfire_enabled(bool on);
+bool is_dualfire_enabled();
 // True if em `id` has a real init. cEmMgr::construct calls the EmInitFunc global
 // WITHOUT a null check, so an id with no ArmEmCallProlog case runs the previous
 // enemy's init over the wrong archive — or jumps to NULL (pc=0). Ask the jump

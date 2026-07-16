@@ -1344,6 +1344,101 @@ bool install_cut_villager_fix() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// DUAL-FIRE ARM — pure C++, because TryFire is a HOT function
+// ═══════════════════════════════════════════════════════════════════════
+// RE4 has ONE global "armed weapon". AVR4GamePlayerGun::TryFire only fires the
+// gun if it IS the armed one at that instant, so with two guns held only one
+// ever fires. The fix is to arm THIS gun inside its OWN TryFire, right before
+// the fire-check — TryFire(A) arms A then fires A, TryFire(B) arms B then fires
+// B, both in the same frame.
+//
+// That logic used to live in a LUA CALLBACK on TryFire. That is the one thing we
+// know we must never do: TryFire runs on the game thread on every trigger pull
+// (continuously with rapid-fire, and once per gun with dual-wield), so the
+// callback raced the shared lua_State against the mod loop and the bridge
+// thread. The result was heap and stack corruption that surfaced far away and
+// looked like innocent engine code -- observed as FMallocBinned2 dying in
+// IncrementalPurgeGarbage while freeing an FString, and as a RET into a smashed
+// return address (pc=lr=1). Same class of bug as the ScoreControl hot-hook.
+//
+// The work is trivially expressible in C, so it belongs in C: read the gun's
+// weapon-no, look up its cItem, arm it, call the original. No Lua, no lock, no
+// allocation, nothing that can race. This mirrors the game's OWN code at the tail
+// of TryFire (cItemMgr::ArmSearchWeaponNo(&ItemMgr, gun[3360]) -> cItemMgr::arm),
+// which is why it is safe to do from here.
+//
+// Addresses come from Lua (Resolve() already handles symbol + fallback there);
+// only the hot path lives here.
+static std::atomic<bool> s_dualfire_on{true};
+static uintptr_t         s_df_itemmgr = 0;
+static uint32_t          s_df_wno_off = 3360;
+
+using DfArmSearchFn = void*    (*)(void*, uint8_t);   // cItemMgr::ArmSearchWeaponNo
+using DfArmFn       = uint64_t (*)(void*, void*);     // cItemMgr::arm
+using DfTryFireFn   = uint64_t (*)(uint64_t);         // AVR4GamePlayerGun::TryFire
+
+static DfArmSearchFn s_df_search = nullptr;
+static DfArmFn       s_df_arm    = nullptr;
+static DfTryFireFn   s_df_orig   = nullptr;
+
+static uint64_t df_tryfire(uint64_t self) {
+    if (s_dualfire_on.load(std::memory_order_relaxed) && self &&
+        s_df_search && s_df_arm && s_df_itemmgr)
+    {
+        // Fresh lookup every call — a dropped/re-picked weapon must never leave a
+        // stale cItem to arm.
+        uint8_t wno = *reinterpret_cast<volatile uint8_t*>(self + s_df_wno_off);
+        if (wno) {
+            void* item = s_df_search(reinterpret_cast<void*>(s_df_itemmgr), wno);
+            if (item) s_df_arm(reinterpret_cast<void*>(s_df_itemmgr), item);
+        }
+    }
+    return s_df_orig(self);
+}
+
+bool install_dualfire_arm(uintptr_t tryfire, uintptr_t itemmgr,
+                          uintptr_t armsearch, uintptr_t armfn, uint32_t wno_off) {
+    if (!tryfire || !itemmgr || !armsearch || !armfn) {
+        logger::log_error("DUALFIRE", "install: null address (tryfire=0x%lX itemmgr=0x%lX "
+                                      "search=0x%lX arm=0x%lX) — not installed",
+                          (unsigned long)tryfire, (unsigned long)itemmgr,
+                          (unsigned long)armsearch, (unsigned long)armfn);
+        return false;
+    }
+    if (s_df_orig) {          // idempotent: a mod reload must not stack hooks
+        s_df_itemmgr = itemmgr;
+        s_df_wno_off = wno_off ? wno_off : 3360;
+        s_df_search  = reinterpret_cast<DfArmSearchFn>(armsearch);
+        s_df_arm     = reinterpret_cast<DfArmFn>(armfn);
+        logger::log_info("DUALFIRE", "already installed — refreshed addresses only");
+        return true;
+    }
+    s_df_itemmgr = itemmgr;
+    s_df_wno_off = wno_off ? wno_off : 3360;
+    s_df_search  = reinterpret_cast<DfArmSearchFn>(armsearch);
+    s_df_arm     = reinterpret_cast<DfArmFn>(armfn);
+
+    if (DobbyHook(reinterpret_cast<void*>(tryfire),
+                  reinterpret_cast<dobby_dummy_func_t>(df_tryfire),
+                  reinterpret_cast<dobby_dummy_func_t*>(&s_df_orig)) != RT_SUCCESS) {
+        s_df_orig = nullptr;
+        logger::log_error("DUALFIRE", "DobbyHook failed at 0x%lX", (unsigned long)tryfire);
+        return false;
+    }
+    logger::log_info("DUALFIRE", "pure-C++ TryFire arm installed @0x%lX (itemMgr=0x%lX wnoOff=%u) "
+                                 "— no Lua on the trigger path",
+                     (unsigned long)tryfire, (unsigned long)itemmgr, s_df_wno_off);
+    return true;
+}
+
+void set_dualfire_enabled(bool on) {
+    s_dualfire_on.store(on, std::memory_order_relaxed);
+    logger::log_info("DUALFIRE", "%s", on ? "enabled" : "disabled");
+}
+
+bool is_dualfire_enabled() { return s_dualfire_on.load(std::memory_order_relaxed); }
+
+// ═══════════════════════════════════════════════════════════════════════
 // em32 SUB-OBJECT NULL GUARD — the "cut enemy explodes on spawn" crash
 // ═══════════════════════════════════════════════════════════════════════
 // sub_5E49AA0 (em32's init, reached from cEm32::move) builds two sub-object

@@ -2137,6 +2137,34 @@ namespace lua_bindings
             return native_hooks::install_em32_subobject_guard();
         });
 
+        // ── InstallDualFireArm — dual-fire WITHOUT a Lua hook on TryFire ─────
+        // RE4 arms ONE weapon globally and TryFire only fires the gun that IS the
+        // armed one, so dual-wielding fires only one gun. Arming each gun inside
+        // its own TryFire fixes that — but TryFire is HOT (every trigger pull, per
+        // gun, non-stop under rapid-fire) and a Lua callback there races the shared
+        // lua_State against the mod loop and bridge thread. That corruption is what
+        // killed the game: FMallocBinned2 freeing an FString inside
+        // IncrementalPurgeGarbage, and a RET into a smashed return address
+        // (pc=lr=1) — both far from the real cause. Same class as the ScoreControl
+        // hot-hook crash. So the whole trigger path is pure C++ now; Lua only
+        // resolves the addresses once at load and flips the toggle.
+        // Sig: InstallDualFireArm(tryFireAddr, itemMgrAddr, armSearchAddr, armAddr, wnoOff) -> bool
+        lua.set_function("InstallDualFireArm", [](uint64_t tryfire, uint64_t itemmgr,
+                                                  uint64_t armsearch, uint64_t armfn,
+                                                  uint32_t wno_off) -> bool {
+            return native_hooks::install_dualfire_arm((uintptr_t)tryfire, (uintptr_t)itemmgr,
+                                                      (uintptr_t)armsearch, (uintptr_t)armfn,
+                                                      wno_off);
+        });
+        // Sig: SetDualFireEnabled(bool) — flips an atomic; no hook churn.
+        lua.set_function("SetDualFireEnabled", [](bool on) {
+            native_hooks::set_dualfire_enabled(on);
+        });
+        // Sig: IsDualFireEnabled() -> bool
+        lua.set_function("IsDualFireEnabled", []() -> bool {
+            return native_hooks::is_dualfire_enabled();
+        });
+
         // ── SetEnemyPoolMultiplier — lift the per-level enemy cap ────────────
         // EmSetEvent hands out cEm slots from a FIXED pool and returns the errEm
         // sentinel when they're gone — that's the "hard limit" (EnemySpawner
