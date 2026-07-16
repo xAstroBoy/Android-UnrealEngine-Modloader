@@ -164,6 +164,13 @@ namespace rebuilder
         std::vector<ue::UObject *> result;
         for (auto *obj : live_instances)
         {
+            // live_instances may hold FREED objects (object destruction isn't tracked here).
+            // is_valid_uobject() dereferences obj (reads its class ptr) after only a cheap range
+            // check, which SIGSEGVs on a freed object whose page has been unmapped/reused. Reject
+            // pointers that aren't in a mapped page BEFORE any dereference. (Tombstone: crash in
+            // get_all_instances+144 reading obj+0x10 during a FindAllOf mid-tick.)
+            if (!obj || !reflection::is_readable_ptr(obj))
+                continue;
             if (!ue::is_valid_uobject(obj))
                 continue;
             // Reject objects in unsafe lifecycle states

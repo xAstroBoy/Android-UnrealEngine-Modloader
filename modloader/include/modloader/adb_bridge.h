@@ -30,6 +30,9 @@ bool is_game_thread_command_active();
 // Register a custom command handler (from Lua mods via RegisterCommand)
 void register_command(const std::string& name, CommandHandler handler);
 
+// Remove a custom command (mod unload). Safe if the name is unknown.
+void unregister_command(const std::string& name);
+
 // Get names of all registered custom commands
 std::vector<std::string> get_registered_commands();
 

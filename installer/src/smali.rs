@@ -379,7 +379,9 @@ pub fn fix_manifest(decompiled: &Path) -> Result<()> {
         changes.push("added debuggable=\"true\"".into());
     }
 
-    // ── allowBackup="true" — enables ADB backup, data persistence ──
+    // ── allowBackup="true" — required on a patched app ──
+    // Keeps `adb backup`/restore usable so saves survive re-patching and APK
+    // swaps, which is the whole point of a modded install.
     if new_content.contains("android:allowBackup=\"false\"") {
         new_content = new_content.replace(
             "android:allowBackup=\"false\"",

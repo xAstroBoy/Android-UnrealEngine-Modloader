@@ -88,9 +88,18 @@ final class RootShell {
         }
         String scoped = "/data/media/0/Android/data/" + pkg + "/files/modloader";
         String pub = "/data/media/0/UnrealModloader/" + pkg;
+        // "Already bound?" CANNOT be answered with `mountpoint -q`: public and
+        // scoped are both on /data, and mountpoint reports "not a mountpoint" for a
+        // same-filesystem bind even when it is live and the contents are provably
+        // shared (verified on-device). That made this re-bind on EVERY launch,
+        // stacking a new mount each time, and the fast path never worked.
+        // A bind makes both paths resolve to the SAME inode — so compare
+        // device:inode, which is the only test that actually answers the question.
         boolean ok = run(
                 "mkdir -p '" + pub + "' '" + scoped + "'; "
-                        + "if ! mountpoint -q '" + scoped + "'; then "
+                        + "PI=$(stat -c '%d:%i' '" + pub + "' 2>/dev/null); "
+                        + "SI=$(stat -c '%d:%i' '" + scoped + "' 2>/dev/null); "
+                        + "if [ -z \"$PI\" ] || [ \"$PI\" != \"$SI\" ]; then "
                         // migrate anything written while unbound (e.g. su failed last launch,
                         // or the public store pre-existed with only a subset like mods/) into
                         // the public store. No-clobber: public is the source of truth.

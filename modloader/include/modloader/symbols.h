@@ -98,9 +98,14 @@ namespace symbols
     // Game-specific
     extern void *GetEtcModelClass;
 
-    // FName constructor — FName::Init(FName* out, const TCHAR* name, int32_t Number)
-    // ARM64 Android: TCHAR = char16_t (2 bytes), NOT wchar_t (4 bytes)
-    using FName_InitFn = void (*)(ue::FName *out, const char16_t *name, int32_t number);
+    // FName constructor — verified in IDA (libUE4.so RVA 0x68258CC):
+    //   FName::FName(FName* out, const ANSICHAR* name, EFindName FindType)
+    //   -> FNameHelper::MakeDetectNumber<FNameAnsiStringView>(name, strlen(name), FindType)
+    // The resolved overload takes a NARROW (char/ANSI) string — passing UTF-16 makes
+    // strlen() stop at the 2nd byte, truncating every name to its first character.
+    // The Number is auto-detected from a trailing "_N" in the name. The 3rd arg is
+    // EFindName: FNAME_Find = 0 (lookup only), FNAME_Add = 1 (intern if missing).
+    using FName_InitFn = void (*)(ue::FName *out, const char *name, int32_t find_type);
     extern FName_InitFn FName_Init;
 
     // FOutputDevice::Log — void FOutputDevice::Log(const TCHAR* msg)

@@ -143,6 +143,26 @@ do
         LogWarn(TAG .. ": InstallCutVillagerFix missing — rebuild the modloader")
     end
 
+    -- em32's init (sub_5E49AA0) asks SetObj00 for two sub-object models, CBZ-checks
+    -- each result, then dereferences it anyway 4 instructions later:
+    --   LDR X2,[X25,#0xA88] ; LDR X8,[X2,#0x180]   => SIGSEGV, fault addr 0x180
+    -- SetObj00 returns NULL when cModel::modelInit can't find the model in the
+    -- archive — routine for cut content, whose sub-object data never shipped.
+    -- Retail never spawns em32, so nobody hit it. The punchline: the callee
+    -- (VR4CreateEmSubObject) null-checks both pointers and returns, so the game
+    -- dies building an argument that would have been discarded. The guard makes the
+    -- two loads read a scratch buffer and zeroes the cEm arg so the callee opts out
+    -- at its first `if` — no-op when the pointer isn't null.
+    if InstallEm32SubObjectGuard then
+        pcall(function()
+            local ok = InstallEm32SubObjectGuard()
+            Log(TAG .. ": em32 sub-object null guard: " .. (ok and "installed" or "FAILED")
+                .. " — missing sub-object models skip instead of crashing")
+        end)
+    else
+        LogWarn(TAG .. ": InstallEm32SubObjectGuard missing — rebuild the modloader")
+    end
+
     if InstallModelRestore then
         for _, e in ipairs(MOVE_ADDRS) do
             local addr = nil

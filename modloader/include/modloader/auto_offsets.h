@@ -111,8 +111,10 @@ namespace auto_offsets
     // Find GUObjectArray pointer via string xrefs
     uintptr_t find_guobjectarray();
 
-    // Find UObject::ProcessEvent via string xrefs or vtable scan
-    uintptr_t find_process_event();
+    // Find UObject::ProcessEvent via string xrefs or (stripped builds) the
+    // ScriptCore.cpp-neighbourhood ∩ UObject-vtable structural finder. Pass the
+    // resolved GUObjectArray to enable the vtable fallback (0 = string strategies only).
+    uintptr_t find_process_event(uintptr_t guobjectarray = 0);
 
     // Find GEngine via string xrefs
     uintptr_t find_gengine();

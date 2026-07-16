@@ -12,7 +12,9 @@ namespace mod_loader
     {
         LOADED,
         ERRORED,
-        FAILED
+        FAILED,
+        DISABLED, // user-disabled — not executed; hooks/patches torn down
+        UNLOADED  // released at runtime but still enabled (transient)
     };
 
     struct ModInfo
@@ -22,16 +24,38 @@ namespace mod_loader
         ModStatus status = ModStatus::FAILED;
         std::string error;
         int error_count = 0;
+        bool enabled = true; // false = persisted in the disabled set
     };
 
-    // Scan mods/ directory and load all mods — returns number loaded
+    // Scan mods/ directory and load all mods — returns number loaded.
+    // Mods in the persisted disabled set are listed as DISABLED, not executed.
     int load_all();
 
     // Load a single mod by name
     bool load_mod(const std::string &name);
 
-    // Hot-reload a mod (re-execute main.lua)
+    // Hot-reload a mod (release its resources, then re-execute main.lua)
     bool reload_mod(const std::string &name);
+
+    // Release a mod's runtime resources (hooks, patches, timers, commands) via
+    // mod_tracker WITHOUT changing its enabled state. Marks it UNLOADED.
+    // MUST run on the game thread. Returns true if the mod was loaded.
+    bool unload_mod(const std::string &name);
+
+    // Disable a mod: unload it AND persist it to the disabled set so it stays
+    // off across restarts. Idempotent. MUST run on the game thread.
+    bool disable_mod(const std::string &name);
+
+    // Enable a previously disabled mod: remove from the disabled set and load
+    // it. Idempotent. MUST run on the game thread.
+    bool enable_mod(const std::string &name);
+
+    // Enable or disable EVERY scanned mod at once. Returns count affected.
+    // MUST run on the game thread.
+    int set_all_enabled(bool enabled);
+
+    // True if a mod name is in the persisted disabled set.
+    bool is_disabled(const std::string &name);
 
     // Get all mod info
     const std::vector<ModInfo> &get_all_mods();

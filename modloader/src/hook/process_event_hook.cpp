@@ -12,6 +12,7 @@
 #include "modloader/class_rebuilder.h"
 #include "modloader/lua_delayed_actions.h"
 #include "modloader/lua_ue4ss_globals.h"
+#include "modloader/mod_loader.h"
 #include "modloader/types.h"
 #include <dobby.h>
 #include <unordered_map>
@@ -23,16 +24,43 @@
 #include <cstring>
 #include <exception>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 namespace pe_hook
 {
 
-    static bool is_game_thread_name()
+    // Known names of the UE4 game-loop thread across platforms/ports. The thread
+    // that calls ProcessEvent (i.e. runs FEngineLoop::Tick → UWorld::Tick) is the
+    // game thread; only there is the Lua VM / hook side-effects safe to run.
+    //   • "GameThread"      — standard desktop/console UE4
+    //   • "MainThread-UE4"  — UE4 on Android (many ports)
+    //   • "OVRA Update #0"  — Oculus/Quest VR ports that drive FEngineLoop from
+    //                         the VrApi update thread (CONFIRMED on RE4 VR: the
+    //                         crash tombstone shows FEngineLoop::Tick →
+    //                         ProcessEvent running on "OVRA Update #0", while
+    //                         "MainThread-UE4" is just the idle Android looper).
+    static bool is_known_game_thread_name()
     {
         char tname[64] = {};
         if (prctl(PR_GET_NAME, reinterpret_cast<unsigned long>(tname), 0, 0, 0) != 0)
             return false;
-        return std::strcmp(tname, "GameThread") == 0;
+        return std::strcmp(tname, "GameThread") == 0 ||
+               std::strcmp(tname, "MainThread-UE4") == 0 ||
+               std::strcmp(tname, "OVRA Update #0") == 0;
+    }
+
+    // Threads we must NEVER treat as the game thread even via the dominance
+    // fallback below — running the game-thread Lua VM on these corrupts it.
+    static bool is_known_nongame_thread_name()
+    {
+        char tname[64] = {};
+        if (prctl(PR_GET_NAME, reinterpret_cast<unsigned long>(tname), 0, 0, 0) != 0)
+            return false;
+        return std::strstr(tname, "RenderThread") || std::strstr(tname, "RHIThread") ||
+               std::strstr(tname, "JobPool") || std::strstr(tname, "PoolThread") ||
+               std::strstr(tname, "AudioThread") || std::strstr(tname, "Worker") ||
+               std::strstr(tname, "RIPCNotif") || std::strstr(tname, "Jit ");
     }
 
     // ═══ Defense-in-depth path normalization ════════════════════════════════
@@ -224,14 +252,46 @@ namespace pe_hook
         // PE trace logger (atomic early-out if inactive — ~1 cycle cost when off)
         pe_trace::record(self, func);
 
-        // Capture game thread ID on first call (UE4 always calls ProcessEvent on game thread)
+        // Capture game thread ID on first call (UE4 always calls ProcessEvent on
+        // the game thread). Primary path: the calling thread has a known
+        // game-thread name. Fallback path: for UE builds whose game-loop thread
+        // has an UNRECOGNIZED name, capture whichever thread DOMINATES
+        // ProcessEvent — that is by definition the game thread — once it proves
+        // itself with a long run of consecutive PE calls (a worker's occasional
+        // PE call can't win the streak), and never a known render/worker thread.
+        // Without this, a game whose loop thread we don't know by name would
+        // never capture, and the whole game-thread queue would silently hang
+        // (exec_lua / LoopAsync / delayed actions / debug-menu injection dead).
         static std::atomic<bool> s_game_thread_captured{false};
-        bool named_game_thread = is_game_thread_name();
-        if (!s_game_thread_captured.load(std::memory_order_relaxed) && named_game_thread)
+        bool named_game_thread = is_known_game_thread_name();
+        if (!s_game_thread_captured.load(std::memory_order_relaxed))
         {
-            lua_ue4ss_globals::set_game_thread_id();
-            s_game_thread_captured.store(true, std::memory_order_relaxed);
-            logger::log_info("HOOK", "Captured Lua game thread from ProcessEvent thread name: GameThread");
+            bool do_capture = named_game_thread;
+            if (!do_capture && !is_known_nongame_thread_name())
+            {
+                static pid_t s_cand_tid = 0;
+                static int s_cand_streak = 0;
+                pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+                if (tid == s_cand_tid)
+                {
+                    if (++s_cand_streak >= 300)
+                        do_capture = true;
+                }
+                else
+                {
+                    s_cand_tid = tid;
+                    s_cand_streak = 1;
+                }
+            }
+            if (do_capture)
+            {
+                lua_ue4ss_globals::set_game_thread_id();
+                s_game_thread_captured.store(true, std::memory_order_relaxed);
+                char tname[64] = {};
+                prctl(PR_GET_NAME, reinterpret_cast<unsigned long>(tname), 0, 0, 0);
+                logger::log_info("HOOK", "Captured Lua game thread from ProcessEvent (thread '%s', %s)",
+                                 tname, named_game_thread ? "name-match" : "PE-dominance fallback");
+            }
         }
 
         // ProcessEvent can fire on non-game worker threads in some engine phases.
@@ -302,7 +362,15 @@ namespace pe_hook
         {
             static thread_local bool s_draining = false;
             static constexpr int MAX_PER_TICK = 16;
-            if (!s_draining)
+            // Do NOT drain the deferred-work queue while a mod's main.lua is still
+            // executing (initial batch load or hot-reload). Mod loading runs Lua on
+            // this same game thread; if a loading mod triggers a ProcessEvent, draining
+            // here would run UNRELATED delayed/LoopAsync/CallBg Lua callbacks RE-ENTRANTLY
+            // on top of the mod's half-finished chunk — same shared lua_State, mixed call
+            // stacks → corrupt L->ci → SIGSEGV deep in the VM (observed: tick_game_thread →
+            // luaG_typeerror → funcnamefromcall null-deref). The queued items simply wait
+            // until loading finishes, then drain normally on a clean top-level stack.
+            if (!s_draining && !mod_loader::is_any_mod_loading())
             {
                 s_draining = true;
                 std::vector<std::function<void()>> batch;

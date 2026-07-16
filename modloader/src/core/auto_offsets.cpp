@@ -144,8 +144,13 @@ namespace auto_offsets
     // Get register from ADD/LDR Rn field
     static int get_rn(uint32_t instr) { return (instr >> 5) & 0x1F; }
 
+    static constexpr uintptr_t PTR_TAG_MASK = 0x00FFFFFFFFFFFFFFULL; // strip MTE/top-byte tag
+
     static int count_valid_uobject_slots(uintptr_t chunk0, uint32_t stride, int count)
     {
+        const uintptr_t text_s = pattern::text_start();
+        const uintptr_t text_e = pattern::text_end();
+
         int valid = 0;
         for (int i = 0; i < count; i++)
         {
@@ -153,15 +158,26 @@ namespace auto_offsets
             if (!safe_call::probe_read(reinterpret_cast<void *>(item_addr), 8))
                 break;
 
-            uintptr_t obj_ptr = *reinterpret_cast<uintptr_t *>(item_addr);
+            uintptr_t obj_ptr = *reinterpret_cast<uintptr_t *>(item_addr) & PTR_TAG_MASK;
             if (obj_ptr == 0)
                 continue; // null slots are expected
 
             if (!safe_call::probe_read(reinterpret_cast<void *>(obj_ptr), 0x28))
                 continue;
 
-            uintptr_t class_ptr = *reinterpret_cast<uintptr_t *>(obj_ptr + 0x10);
-            uintptr_t outer_ptr = *reinterpret_cast<uintptr_t *>(obj_ptr + 0x20);
+            // STRONG discriminator: a UObject's first field is its C++ vtable pointer,
+            // and the vtable's first entry must be executable code inside libUnreal's
+            // .text. A struct that merely holds readable pointers (float configs, record
+            // arrays) fails this — which is exactly what let false positives score before.
+            uintptr_t vtable = *reinterpret_cast<uintptr_t *>(obj_ptr) & PTR_TAG_MASK;
+            if (!safe_call::probe_read(reinterpret_cast<void *>(vtable), 8))
+                continue;
+            uintptr_t vfunc0 = *reinterpret_cast<uintptr_t *>(vtable) & PTR_TAG_MASK;
+            if (text_s && text_e && (vfunc0 < text_s || vfunc0 >= text_e))
+                continue;
+
+            uintptr_t class_ptr = *reinterpret_cast<uintptr_t *>(obj_ptr + 0x10) & PTR_TAG_MASK;
+            uintptr_t outer_ptr = *reinterpret_cast<uintptr_t *>(obj_ptr + 0x20) & PTR_TAG_MASK;
             if (!safe_call::probe_read(reinterpret_cast<void *>(class_ptr), 0x28))
                 continue;
 
@@ -180,10 +196,43 @@ namespace auto_offsets
             !safe_call::probe_read(reinterpret_cast<void *>(guobjectarray), 0x40))
             return 0;
 
+        int best_score = 0;
+
+        // ── Decisive chunked-FUObjectArray shape check (UE4.20+/UE5) ────────────
+        // FUObjectArray { int32 ObjFirstGCIndex; int32 ObjLastNonGCIndex;
+        //   int32 MaxObjectsNotConsideredByGC; int32 OpenForDisregardForGC;
+        //   FChunkedFixedUObjectArray ObjObjects @ +0x10 { FUObjectItem** Objects;
+        //     FUObjectItem* PreAllocatedObjects; int32 MaxElements; int32 NumElements;
+        //     int32 MaxChunks; int32 NumChunks } ... }.
+        // A real array satisfies EXACT chunk arithmetic (NumElementsPerChunk = 64*1024)
+        // that random globals never do — verified live on Puzzling Places (Max=196608,
+        // Num=55327, MaxCh=3, NumCh=1). Matching this + a chunk that derefs to real
+        // UObjects (vtable in .text) is conclusive, so we award a dominating score.
+        {
+            uintptr_t objects = *reinterpret_cast<uintptr_t *>(guobjectarray + 0x10) & PTR_TAG_MASK;
+            uint32_t maxEl = *reinterpret_cast<uint32_t *>(guobjectarray + 0x20);
+            uint32_t numEl = *reinterpret_cast<uint32_t *>(guobjectarray + 0x24);
+            uint32_t maxCh = *reinterpret_cast<uint32_t *>(guobjectarray + 0x28);
+            uint32_t numCh = *reinterpret_cast<uint32_t *>(guobjectarray + 0x2C);
+            const uint32_t NPC = 64u * 1024u; // FChunkedFixedUObjectArray::NumElementsPerChunk
+            if (objects && (maxEl >= NPC) && (maxEl % NPC == 0) && (maxCh == maxEl / NPC) &&
+                (numEl > 0) && (numEl <= maxEl) &&
+                (numCh == (numEl + NPC - 1) / NPC) && (numCh >= 1) && (numCh <= maxCh) &&
+                safe_call::probe_read(reinterpret_cast<void *>(objects), 8))
+            {
+                uintptr_t chunk0 = *reinterpret_cast<uintptr_t *>(objects) & PTR_TAG_MASK;
+                if (safe_call::probe_read(reinterpret_cast<void *>(chunk0), 0x80))
+                {
+                    int v = count_valid_uobject_slots(chunk0, 0x18, 64);
+                    if (v >= 8)
+                        best_score = std::max(best_score, 1000 + v);
+                }
+            }
+        }
+
         std::array<uint32_t, 6> embedded_offsets = {
             ue::GUOBJECTARRAY_TO_OBJECTS, 0x0, 0x8, 0x10, 0x18, 0x20};
 
-        int best_score = 0;
         for (uint32_t embedded_off : embedded_offsets)
         {
             uintptr_t embedded = guobjectarray + embedded_off;
@@ -979,6 +1028,104 @@ namespace auto_offsets
 
     // ═══ FIND GNAMES ════════════════════════════════════════════════════════
 
+    // ROBUST, string/symbol-AGNOSTIC GNames discovery. GNames is the global FNamePool
+    // (UE4.23+/UE5). Its FNameEntryAllocator has an unmistakable runtime shape:
+    //   +0x00 FRWLock (== 0 at rest)
+    //   +0x08 uint32 CurrentBlock       (index of the block being filled)
+    //   +0x0C uint32 CurrentByteCursor  (< block size)
+    //   +0x10 uint8* Blocks[FNameMaxBlocks=8192]
+    // A live pool is a run of (CurrentBlock+1) PAGE-ALIGNED heap block pointers followed
+    // by a long NULL tail (the mostly-empty 8192-slot array), and Blocks[0] begins with
+    // the "None" FNameEntry (FNameEntry = uint16 header then chars; index 0 = NAME_None).
+    // Verified live on Puzzling Places (CurrentBlock=28, 29 blocks, Blocks[0]="None"...).
+    // Needs the .bss to be in [data_start,data_end) — see pattern_scanner .bss absorption.
+    static uintptr_t find_gnames_structural(std::vector<std::string> &log)
+    {
+        uintptr_t ds = pattern::data_start();
+        uintptr_t de = pattern::data_end();
+        if (ds == 0 || de == 0 || de <= ds)
+        {
+            log.push_back("GNames(structural): no .data/.bss bounds");
+            return 0;
+        }
+
+        auto page_heap = [](uintptr_t p) -> bool {
+            p &= PTR_TAG_MASK; // name blocks are page-aligned heap allocations
+            return p >= 0x1000000000ULL && p < 0x8000000000ULL && (p & 0xFFFULL) == 0;
+        };
+
+        uintptr_t best = 0;
+        int best_blocks = 0;
+        size_t scored = 0;
+
+        for (uintptr_t page = ds & ~0xFFFULL; page < de; page += 0x1000)
+        {
+            if (!safe_call::probe_read(reinterpret_cast<void *>(page), 0x1000))
+                continue;
+            uintptr_t win_end = page + 0x1000;
+            uintptr_t a = (page < ds) ? ((ds + 7) & ~7ULL) : page;
+            for (; a < win_end && a + 0x120 <= de; a += 8)
+            {
+                uintptr_t b0 = *reinterpret_cast<uintptr_t *>(a + 0x10);
+                if (!page_heap(b0))
+                    continue; // cheap prefilter on Blocks[0]
+
+                uint32_t cur_block = *reinterpret_cast<uint32_t *>(a + 0x08);
+                uint32_t byte_cursor = *reinterpret_cast<uint32_t *>(a + 0x0C);
+                if (cur_block < 1 || cur_block > 8192 || byte_cursor > 0x20000)
+                    continue;
+                // need Blocks[0..cur_block] + 32 tail slots inside our data window
+                if (a + 0x10 + 8ULL * (cur_block + 33) > de)
+                    continue;
+                scored++;
+
+                bool ok = true;
+                for (uint32_t k = 0; k <= cur_block; k++)
+                {
+                    if (!page_heap(*reinterpret_cast<uintptr_t *>(a + 0x10 + 8ULL * k)))
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok)
+                    continue;
+                for (uint32_t k = cur_block + 1; k <= cur_block + 32; k++)
+                {
+                    if (*reinterpret_cast<uintptr_t *>(a + 0x10 + 8ULL * k) != 0)
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok)
+                    continue;
+
+                // Blocks[0] must start with the "None" FNameEntry (header + "None").
+                uintptr_t blk0 = b0 & PTR_TAG_MASK;
+                if (!safe_call::probe_read(reinterpret_cast<void *>(blk0), 8))
+                    continue;
+                const char *s = reinterpret_cast<const char *>(blk0 + 2);
+                if (!(s[0] == 'N' && s[1] == 'o' && s[2] == 'n' && s[3] == 'e'))
+                    continue;
+
+                int blocks = static_cast<int>(cur_block) + 1;
+                if (blocks > best_blocks)
+                {
+                    best_blocks = blocks;
+                    best = a;
+                }
+            }
+        }
+
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "GNames(structural): swept 0x%lX-0x%lX, %zu probed, best 0x%lX blocks=%d",
+                 (unsigned long)ds, (unsigned long)de, scored, (unsigned long)best, best_blocks);
+        log.push_back(msg);
+        return best;
+    }
+
     uintptr_t find_gnames()
     {
         std::vector<std::string> log;
@@ -1004,6 +1151,13 @@ namespace auto_offsets
         if (result)
             goto done;
 
+        // ROBUST FALLBACK — string/symbol-agnostic structural FNamePool sweep. Catches
+        // stripped builds where every anchor string is gone (e.g. Puzzling Places' UE4
+        // build). Requires the .bss to be scannable (pattern_scanner .bss absorption).
+        result = find_gnames_structural(log);
+        if (result)
+            goto done;
+
     done:
         for (const auto &msg : log)
             logger::log_info("AUTOOFF", "  %s", msg.c_str());
@@ -1017,6 +1171,95 @@ namespace auto_offsets
     }
 
     // ═══ FIND GUOBJECTARRAY ═════════════════════════════════════════════════
+
+    // ROBUST, version/string/symbol-AGNOSTIC discovery: sweep the whole .data/.bss
+    // segment and run the structural validator on every 8-byte-aligned slot. GUObjectArray
+    // is a global FUObjectArray whose shape is unmistakable — a pointer to a chunk table
+    // whose chunks hold FUObjectItems pointing to UObjects whose vtables live in libUnreal's
+    // r-x — so we don't need any anchor string or exported symbol (which fail on stripped /
+    // differently-built UE games like this one). The data segment is our OWN mapped memory,
+    // so the sweep reads it directly (no per-address syscall); the validator's probe_reads
+    // only touch the heap for plausible candidates. This is the "never fails" safety net.
+    static uintptr_t find_guobjectarray_structural(std::vector<std::string> &log)
+    {
+        uintptr_t ds = pattern::data_start();
+        uintptr_t de = pattern::data_end();
+        if (ds == 0 || de == 0 || de <= ds)
+        {
+            log.push_back("GUObjectArray(structural): no .data/.bss bounds");
+            return 0;
+        }
+
+        auto plausible = [](uintptr_t p) -> bool {
+            p &= 0x00FFFFFFFFFFFFFFULL;                 // strip MTE/top-byte tag
+            return p >= 0x1000000000ULL && p < 0x8000000000ULL && (p & 7) == 0;
+        };
+
+        uintptr_t best = 0;
+        int best_score = 0;
+        size_t scored = 0;
+
+        // Walk page-by-page so a gap / guard page inside the merged rw range can't fault our
+        // direct pre-filter reads. Probe a 2-page window so a candidate whose fields spill
+        // past the page end is still fully readable; fall back to a single non-straddling
+        // page if the next page is a gap; skip the page entirely if unmapped.
+        for (uintptr_t p = ds & ~0xFFFULL; p < de; p += 0x1000)
+        {
+            uintptr_t win_end;
+            if (safe_call::probe_read(reinterpret_cast<void *>(p), 0x2000))
+                win_end = p + 0x1000;           // [a, a+0x40) may spill into p+1 (verified readable)
+            else if (safe_call::probe_read(reinterpret_cast<void *>(p), 0x1000))
+                win_end = (p + 0x1000 > 0x40) ? (p + 0x1000 - 0x40) : p;  // non-straddling only
+            else
+                continue;                        // gap / unmapped -> skip
+
+            uintptr_t a = (p < ds) ? ((ds + 7) & ~7ULL) : p;
+            for (; a < win_end && a + 0x40 <= de; a += 8)
+            {
+                // CHEAP, HIGHLY-SELECTIVE pre-gate: the chunked FUObjectArray shape
+                // (ObjObjects @ +0x10: Objects, PreAlloc, int32 Max@0x20, Num@0x24,
+                // MaxChunks@0x28, NumChunks@0x2C). Every read here is INSIDE the probed
+                // page window (anon .bss reads as zero-fill — never faults), so this costs
+                // no syscalls. Exact chunk arithmetic (NumElementsPerChunk = 64*1024) is
+                // satisfied by essentially only the real array, so the expensive deref
+                // scoring below runs a handful of times instead of on every .bss pointer.
+                // (This gate is what keeps the full-.bss sweep from grinding through
+                // millions of probe faults — see score_guobjectarray_candidate.)
+                uint32_t maxEl = *reinterpret_cast<uint32_t *>(a + 0x20);
+                uint32_t numEl = *reinterpret_cast<uint32_t *>(a + 0x24);
+                uint32_t maxCh = *reinterpret_cast<uint32_t *>(a + 0x28);
+                uint32_t numCh = *reinterpret_cast<uint32_t *>(a + 0x2C);
+                const uint32_t NPC = 64u * 1024u;
+                if (!(maxEl >= NPC && (maxEl % NPC) == 0 && maxCh == maxEl / NPC &&
+                      numEl > 0 && numEl <= maxEl &&
+                      numCh == (numEl + NPC - 1) / NPC && numCh >= 1 && numCh <= maxCh))
+                    continue;
+                uintptr_t objects = *reinterpret_cast<uintptr_t *>(a + 0x10);
+                if (!plausible(objects))
+                    continue;
+
+                int s = score_guobjectarray_candidate(a);
+                if (s > best_score)
+                {
+                    best_score = s;
+                    best = a;
+                }
+                scored++;
+            }
+        }
+
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "GUObjectArray(structural): swept .data/.bss 0x%lX-0x%lX, %zu scored, best 0x%lX score=%d",
+                 (unsigned long)ds, (unsigned long)de, scored, (unsigned long)best, best_score);
+        log.push_back(msg);
+
+        // A real object array has many valid UObject slots (each +10) plus sane counts;
+        // random globals never reach this. Require >= ~8 live UObjects.
+        if (best && best_score >= 100)
+            return best;
+        return 0;
+    }
 
     uintptr_t find_guobjectarray()
     {
@@ -1068,6 +1311,13 @@ namespace auto_offsets
         if (result)
             goto done;
 
+        // ROBUST FALLBACK — string/symbol-agnostic structural sweep. Catches every UE
+        // build where the anchor-string heuristics above find nothing (stripped strings,
+        // literal-pool refs, different code layout) — e.g. Puzzling Places' UE4 build.
+        result = find_guobjectarray_structural(log);
+        if (result)
+            goto done;
+
     done:
         for (const auto &msg : log)
             logger::log_info("AUTOOFF", "  %s", msg.c_str());
@@ -1082,7 +1332,107 @@ namespace auto_offsets
 
     // ═══ FIND PROCESSEVENT ══════════════════════════════════════════════════
 
-    uintptr_t find_process_event()
+    // ROBUST ProcessEvent finder for stripped builds (log/assert strings gone but
+    // __FILE__ source-path strings retained — e.g. Puzzling Places). Two facts pin it:
+    //   (a) UObject::ProcessEvent lives in ScriptCore.cpp, so its code sits in the .text
+    //       neighbourhood of the functions that reference the "ScriptCore.cpp" __FILE__
+    //       string (ProcessEvent itself doesn't log, but its siblings ProcessInternal /
+    //       CallFunction / etc. do — bracketing it).
+    //   (b) ProcessEvent is a UObject virtual → present in the UObject vtable.
+    // Intersect: the UObject vtable entry whose address falls inside that .text range is
+    // ProcessEvent. Needs GUObjectArray (resolved before this) for a live UObject vtable.
+    static uintptr_t find_process_event_via_vtable(uintptr_t guobjectarray, std::vector<std::string> &log)
+    {
+        if (!guobjectarray)
+        {
+            log.push_back("ProcessEvent(vtable): no GUObjectArray");
+            return 0;
+        }
+        uintptr_t ts = pattern::text_start(), te = pattern::text_end();
+
+        // 1. GUObjectArray -> ObjObjects.Objects -> chunk0 -> first non-null Object -> vtable.
+        uintptr_t vtable = 0;
+        if (safe_call::probe_read(reinterpret_cast<void *>(guobjectarray + 0x10), 8))
+        {
+            uintptr_t objects = *reinterpret_cast<uintptr_t *>(guobjectarray + 0x10) & PTR_TAG_MASK;
+            if (objects && safe_call::probe_read(reinterpret_cast<void *>(objects), 8))
+            {
+                uintptr_t chunk0 = *reinterpret_cast<uintptr_t *>(objects) & PTR_TAG_MASK;
+                if (chunk0 && safe_call::probe_read(reinterpret_cast<void *>(chunk0), 0x18 * 8))
+                {
+                    for (int i = 0; i < 8 && !vtable; i++)
+                    {
+                        uintptr_t obj = *reinterpret_cast<uintptr_t *>(chunk0 + (uintptr_t)i * 0x18) & PTR_TAG_MASK;
+                        if (!obj || !safe_call::probe_read(reinterpret_cast<void *>(obj), 8))
+                            continue;
+                        uintptr_t vt = *reinterpret_cast<uintptr_t *>(obj) & PTR_TAG_MASK;
+                        if (!safe_call::probe_read(reinterpret_cast<void *>(vt), 8))
+                            continue;
+                        uintptr_t f0 = *reinterpret_cast<uintptr_t *>(vt) & PTR_TAG_MASK;
+                        if (ts && f0 >= ts && f0 < te)
+                            vtable = vt;
+                    }
+                }
+            }
+        }
+        if (!vtable)
+        {
+            log.push_back("ProcessEvent(vtable): could not reach a UObject vtable");
+            return 0;
+        }
+
+        // 2. Find the "ScriptCore.cpp" __FILE__ string and back up to its start (byte
+        //    after the preceding NUL) — the compiler references the full path start.
+        const char *sc = reinterpret_cast<const char *>(pattern::find_string("ScriptCore.cpp"));
+        if (!sc)
+        {
+            log.push_back("ProcessEvent(vtable): 'ScriptCore.cpp' string absent");
+            return 0;
+        }
+        uintptr_t sstart = reinterpret_cast<uintptr_t>(sc);
+        while (sstart > reinterpret_cast<uintptr_t>(sc) - 256 &&
+               *reinterpret_cast<const char *>(sstart - 1) != '\0')
+            sstart--;
+
+        // 3. Functions referencing it bracket ProcessEvent -> [lo,hi] .text window.
+        std::vector<uintptr_t> refs = find_adrp_refs_to(sstart);
+        if (refs.empty())
+        {
+            log.push_back("ProcessEvent(vtable): no ADRP refs to ScriptCore.cpp path");
+            return 0;
+        }
+        uintptr_t lo = ~0ULL, hi = 0;
+        for (uintptr_t r : refs)
+        {
+            if (r < lo) lo = r;
+            if (r > hi) hi = r;
+        }
+        lo = (lo > 0x800) ? lo - 0x800 : 0; // small margin; ProcessEvent doesn't log itself
+        hi += 0x800;
+
+        // 4. The UObject vtable entry inside [lo,hi] is ProcessEvent.
+        uintptr_t found = 0;
+        int hits = 0;
+        for (int i = 0; i < 220; i++)
+        {
+            if (!safe_call::probe_read(reinterpret_cast<void *>(vtable + (uintptr_t)i * 8), 8))
+                break;
+            uintptr_t fn = *reinterpret_cast<uintptr_t *>(vtable + (uintptr_t)i * 8) & PTR_TAG_MASK;
+            if (fn >= lo && fn <= hi && fn >= ts && fn < te)
+            {
+                if (!found) found = fn;
+                hits++;
+            }
+        }
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "ProcessEvent(vtable): ScriptCore range [0x%lX-0x%lX], vtable hits=%d -> 0x%lX",
+                 (unsigned long)lo, (unsigned long)hi, hits, (unsigned long)found);
+        log.push_back(msg);
+        return found;
+    }
+
+    uintptr_t find_process_event(uintptr_t guobjectarray)
     {
         std::vector<std::string> log;
         uintptr_t result = 0;
@@ -1106,6 +1456,12 @@ namespace auto_offsets
         // Strategy 4: Look for EXACT token "ProcessEvent" (NUL-terminated)
         // to avoid false positives like processEvents/ProcessEventsN.
         result = find_func_near_exact_string("ProcessEvent", "ProcessEvent(literal-exact)", log);
+        if (result)
+            goto done;
+
+        // ROBUST FALLBACK — ScriptCore.cpp __FILE__ neighbourhood ∩ UObject vtable.
+        // Resolves ProcessEvent on stripped builds where the log strings above are gone.
+        result = find_process_event_via_vtable(guobjectarray, log);
         if (result)
             goto done;
 
@@ -1603,7 +1959,7 @@ namespace auto_offsets
 
         // 4. ProcessEvent
         log("--- Finding ProcessEvent ---");
-        result.process_event = find_process_event();
+        result.process_event = find_process_event(result.guobjectarray);
         if (result.process_event)
         {
             result.process_event_confidence = 0.7f;

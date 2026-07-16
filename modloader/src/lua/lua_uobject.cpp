@@ -2160,7 +2160,7 @@ namespace lua_uobject
                 {
                     ue::FName fname;
                     std::u16string u16name(s.begin(), s.end());
-                    symbols::FName_Init(&fname, u16name.c_str(), 0);
+                    symbols::FName_Init(&fname, s.c_str(), 1);
                     idx = fname.ComparisonIndex;
                 }
                 *reinterpret_cast<int32_t *>(ptr) = idx;
@@ -2523,7 +2523,7 @@ namespace lua_uobject
                     {
                         ue::FName fname;
                         std::u16string u16name(s.begin(), s.end());
-                        symbols::FName_Init(&fname, u16name.c_str(), 0);
+                        symbols::FName_Init(&fname, s.c_str(), 1);
                         idx = fname.ComparisonIndex;
                     }
                     *reinterpret_cast<int32_t *>(param_ptr) = idx;
@@ -3391,7 +3391,7 @@ namespace lua_uobject
                     {
                         ue::FName fname;
                         std::u16string u16name(s.begin(), s.end());
-                        symbols::FName_Init(&fname, u16name.c_str(), 0);
+                        symbols::FName_Init(&fname, s.c_str(), 1);
                         idx = fname.ComparisonIndex;
                     }
                     *reinterpret_cast<int32_t *>(param_ptr) = idx;
@@ -3501,11 +3501,11 @@ namespace lua_uobject
                             ue::FName asset_fname = {0, 0};
                             {
                                 std::u16string u16pkg(pkg_path.begin(), pkg_path.end());
-                                symbols::FName_Init(&pkg_fname, u16pkg.c_str(), 0);
+                                symbols::FName_Init(&pkg_fname, pkg_path.c_str(), 1);
                             }
                             {
                                 std::u16string u16asset(asset_name.begin(), asset_name.end());
-                                symbols::FName_Init(&asset_fname, u16asset.c_str(), 0);
+                                symbols::FName_Init(&asset_fname, asset_name.c_str(), 1);
                             }
                             // TPersistentObjectPtr: WeakPtr(8) + PackageName(8) + AssetName(8) + SubPath(16)
                             int32_t obj_index_bg = ue::uobj_get_internal_index(obj_arg);

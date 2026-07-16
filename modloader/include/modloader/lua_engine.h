@@ -44,6 +44,16 @@ namespace lua_engine
     // Create a sandboxed environment for a mod
     sol::environment create_mod_environment(const std::string &mod_name);
 
+    // Recover the main Lua thread after a native fault (SIGSEGV/SIGBUS) escaped
+    // the Lua VM via siglongjmp — e.g. a mod's native call faulted mid-load and
+    // was recovered by the mod-load crash guard, which unwinds the C++ stack but
+    // NOT the Lua call stack, leaving L->ci / L->top dangling. Left uncleaned, the
+    // next GC cycle traverses the corrupt thread and crashes (traversethread).
+    // This calls lua_closethread() to unwind the CallInfo list back to base and
+    // reset the stack, WITHOUT touching globals/registry (loaded mods survive).
+    // Safe/no-op if not initialized. Returns true if a reset was performed.
+    bool reset_after_crash();
+
     // Shutdown — closes the Lua state
     void shutdown();
 

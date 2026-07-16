@@ -17,6 +17,7 @@
 #include "modloader/lua_yup.h"
 #include "modloader/logger.h"
 #include "modloader/paths.h"
+#include "modloader/safe_call.h"
 
 #include <cstring>
 #include <atomic>
@@ -224,6 +225,26 @@ SharedAPI = {}
     bool is_initialized()
     {
         return s_lua != nullptr;
+    }
+
+    bool reset_after_crash()
+    {
+        if (!s_lua)
+            return false;
+        lua_State *L = s_lua->lua_state();
+        if (!L)
+            return false;
+        // lua_closethread() may run pending __close metamethods; if the crash
+        // smashed the Lua stack itself those could fault, so guard it. Even if
+        // the reset partially fails, unwinding L->ci back to base_ci (which
+        // luaE_resetthread does first) is what stops the GC from traversing the
+        // dangling CallInfo — the primary corruption source.
+        bool ok = safe_call::execute([&]()
+                                     { lua_closethread(L, nullptr); },
+                                     "lua_reset_after_crash")
+                      .ok;
+        logger::log_info("LUA", "Main Lua thread reset after native fault (closethread ok=%d)", ok ? 1 : 0);
+        return ok;
     }
 
     ExecResult exec_string(const std::string &code, const std::string &chunk_name, int max_instructions)
