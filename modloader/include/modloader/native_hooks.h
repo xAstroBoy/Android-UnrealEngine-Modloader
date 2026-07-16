@@ -177,6 +177,12 @@ void set_minethrower_enabled(bool on);
 // patching. NOT a crash guard — install_safe_call_guard is INERT (see below).
 bool install_laser_sight_fix(uintptr_t add_x1_site);
 
+// CArmSoundBlock::ExtractTrackIndex (0x61AF06C) calls strtol on its cursor BEFORE
+// applying the end-of-name-table bound it then checks four instructions later. An
+// enemy whose room .xsb has fewer tracks than its .das expects walks the cursor off
+// the buffer => SEGV_ACCERR in StrToI. This applies the game's own bound first.
+bool install_xsb_track_bounds_guard(uintptr_t extract_track_index);
+
 // cEmMark (shooting-gallery target) spawned outside the gallery: its move() reads
 // the minigame manager global, which only R22cInit ever sets, then derefs the NULL
 // at +0x181. Pass the address of `LDRB W8,[X8,#0x181]` in armIsShootingGamePaused

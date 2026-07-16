@@ -229,6 +229,30 @@ do
         LogWarn(TAG .. ": InstallLaserSightFix missing — rebuild the modloader")
     end
 
+    -- ── Enemy sound bank over-run — SEGV_ACCERR in StrToI ───────────────────
+    -- tombstone_30: StrToI <- ExtractTrackIndex <- ExtractTracksFromXSB <-
+    -- TryLoadGenericFromDas <- ArmLoadSoundBlockEnemy <- cEmMgr::construct.
+    -- This is a REAL GAME BUG in ExtractTrackIndex, not a missing null check:
+    --     result = strtol(*a2, &endptr, 10);           <== reads the cursor FIRST
+    --     if (v7 < *(u64*)(this+192) + hdr[42] + hdr[30])   <== bounds-checks AFTER
+    -- The bound is right and the walk loop honours it; only the first read escapes
+    -- it. Authored rooms always ship an .xsb with as many tracks as the .das wants,
+    -- so the cursor never starts past the end and the bug never fires. Crossover
+    -- enemies get a room whose .xsb is short => cursor off the buffer => ACCERR.
+    -- (ACCERR not MAPERR = just past a live allocation, i.e. an over-run.)
+    -- The guard applies the game's own bound before the read. Skipping a track is
+    -- safe: ArmLoadSoundBlockEnemy already falls back to LoadGeneric ("em"/"pl")
+    -- whenever the .das sound load fails, so worst case is generic sounds.
+    if InstallXsbTrackBoundsGuard then
+        pcall(function()
+            local site = Offset(GetLibBase(), 0x61AF06C)   -- CArmSoundBlock::ExtractTrackIndex
+            local ok = InstallXsbTrackBoundsGuard(site)
+            Log(TAG .. ": XSB track-bounds guard: " .. (ok and "installed" or "FAILED"))
+        end)
+    else
+        LogWarn(TAG .. ": InstallXsbTrackBoundsGuard missing — rebuild the modloader")
+    end
+
     -- ── cEmMark (shooting-gallery target) in a normal room — fault 0x181 ─────
     -- tombstone_29: armIsShootingGamePaused()+24 <- cEmMark::move()+20 <- cEmMgr::move.
     --     60d1b10  ADRP X8, #qword_A597D28@PAGE

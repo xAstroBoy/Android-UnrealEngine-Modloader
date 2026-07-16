@@ -2209,6 +2209,18 @@ namespace lua_bindings
             return native_hooks::install_laser_sight_fix(reinterpret_cast<uintptr_t>(site));
         });
 
+        // ── InstallXsbTrackBoundsGuard — the enemy sound-bank over-run ────────
+        // CArmSoundBlock::ExtractTrackIndex strtol()s its cursor BEFORE applying
+        // the end-of-name-table bound it checks four instructions later. A room
+        // whose .xsb has fewer tracks than the enemy's .das expects walks the
+        // cursor off the malloc'd buffer => SEGV_ACCERR inside StrToI. We apply
+        // the game's own bound first. Skipping is safe: ArmLoadSoundBlockEnemy
+        // already falls back to LoadGeneric when the .das sound load fails.
+        // Sig: InstallXsbTrackBoundsGuard(addrOfExtractTrackIndex) -> bool
+        lua.set_function("InstallXsbTrackBoundsGuard", [](void* site) -> bool {
+            return native_hooks::install_xsb_track_bounds_guard(reinterpret_cast<uintptr_t>(site));
+        });
+
         // ── InstallShootGamePausedGuard — a gallery target in a normal room ──
         // cEmMark::move -> armIsShootingGamePaused reads the shooting-minigame
         // manager global (qword_A597D28) and derefs it at +0x181. That global has

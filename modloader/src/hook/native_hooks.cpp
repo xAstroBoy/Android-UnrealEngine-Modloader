@@ -1577,6 +1577,91 @@ static void laser_null_parts_to_zero(void* addr, DobbyRegisterContext* ctx) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// XSB TRACK PARSER OVER-RUN — ArmLoadSoundBlockEnemy, SEGV_ACCERR
+// ═══════════════════════════════════════════════════════════════════════
+// tombstone_30:
+//     StrToI<long>+64                       <- SEGV_ACCERR
+//     CArmSoundBlock::ExtractTrackIndex+60
+//     CArmSoundBlock::ExtractTracksFromXSB+124
+//     CArmSoundBlock::TryLoadGenericFromDas+320
+//     ArmLoadSoundBlockEnemy(int)+296
+//     cEmMgr::construct+756 <- EmSetFromList
+//
+// This one is a REAL GAME BUG, not a missing null check. ExtractTrackIndex does:
+//     if (*a2) {
+//         endptr = *a2;
+//         result = strtol(*a2, &endptr, 10);            // <== READS FIRST
+//         v8 = *(u32*)(hdr + 42);  v9 = *(u32*)(hdr + 30);
+//         if (v7 < *(u64*)(this+192) + v8 + v9)         // <== CHECKS AFTER
+//             while (...) { ...; if (v7 >= end) break; ... }   // walk IS bounded
+//     }
+// The game computes the correct end-of-name-table bound and the walk loop honours
+// it — but strtol runs on the cursor BEFORE anything validates it. In an authored
+// room the .xsb always has as many tracks as the .das asks for, so the cursor never
+// starts past the end and the ordering bug is invisible. Give an enemy a room whose
+// .xsb has fewer tracks (exactly what "any enemy anywhere" does) and the cursor
+// walks off the malloc'd buffer; strtol then reads into the guard page => ACCERR.
+// Note it is ACCERR, not MAPERR: the pointer is just past a real allocation.
+//
+// So: apply the game's OWN bound, computed from its OWN header fields, before the
+// read instead of after it. Nothing invented — this is the same expression at
+// 0x61af0d4, evaluated one step earlier.
+//
+// Bailing is safe and does NOT mute the enemy: ArmLoadSoundBlockEnemy already has
+// a fallback for exactly this case —
+//     if (a1 > 0x4F || (TryLoadGenericFromDas(...) & 1) == 0)
+//         LoadGeneric(block, a1 >= 16 ? "em" : "pl", v3);
+// TryLoadGenericFromDas returns `*((u64*)this + 2) != 0`, so a skipped track just
+// means fewer tracks; if the block ends up empty the game loads generic sounds by
+// itself. Worst case is a crossover enemy with generic sounds instead of a crash.
+using XsbTrackFn = uint64_t (*)(uint64_t, char**, uint64_t, uint64_t);
+static XsbTrackFn s_xsb_track_orig = nullptr;
+static std::atomic<uint64_t> s_xsb_skips{0};
+
+static uint64_t xsb_track_guarded(uint64_t self, char** cursor, uint64_t a3, uint64_t a4) {
+    if (!self || !cursor || !*cursor) return 0;
+    // this+192 = the XSB buffer, this+200 = its header. Both are set by
+    // ExtractTracksFromXSB straight from LoadXSBFile, which returns NULL when the
+    // file is missing — so a null here means "nothing to parse", not "corrupt".
+    uint64_t xsb = *reinterpret_cast<volatile uint64_t*>(self + 192);
+    uint64_t hdr = *reinterpret_cast<volatile uint64_t*>(self + 200);
+    if (!xsb || !hdr) return 0;
+    uint64_t end = xsb + *reinterpret_cast<volatile uint32_t*>(hdr + 42)
+                       + *reinterpret_cast<volatile uint32_t*>(hdr + 30);
+    uint64_t p = reinterpret_cast<uint64_t>(*cursor);
+    if (p < xsb || p >= end) {           // cursor already off the name table
+        uint64_t n = s_xsb_skips.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 3 || (n % 250) == 0)
+            logger::log_info("XSB", "track cursor out of the name table "
+                                    "(p=0x%lX not in [0x%lX,0x%lX)) — skipped, generic sound "
+                                    "fallback takes over (%lu so far)",
+                             (unsigned long)p, (unsigned long)xsb, (unsigned long)end,
+                             (unsigned long)n);
+        return 0;
+    }
+    return s_xsb_track_orig(self, cursor, a3, a4);
+}
+
+bool install_xsb_track_bounds_guard(uintptr_t extract_track_index) {
+    if (!extract_track_index) return false;
+    if (s_xsb_track_orig) {
+        logger::log_info("XSB", "already installed");
+        return true;
+    }
+    if (DobbyHook(reinterpret_cast<void*>(extract_track_index),
+                  reinterpret_cast<dobby_dummy_func_t>(xsb_track_guarded),
+                  reinterpret_cast<dobby_dummy_func_t*>(&s_xsb_track_orig)) != RT_SUCCESS) {
+        s_xsb_track_orig = nullptr;
+        logger::log_error("XSB", "DobbyHook failed at 0x%lX", (unsigned long)extract_track_index);
+        return false;
+    }
+    logger::log_info("XSB", "ExtractTrackIndex bounds guard installed @0x%lX — the game's own "
+                            "end-of-name-table bound is now applied BEFORE strtol, not after",
+                     (unsigned long)extract_track_index);
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // cEmMark OUTSIDE THE SHOOTING GALLERY — fault addr 0x181
 // ═══════════════════════════════════════════════════════════════════════
 // cEmMark is the shooting-gallery target. Its move() asks whether the minigame

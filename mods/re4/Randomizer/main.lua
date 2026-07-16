@@ -163,7 +163,7 @@ local function makeHP(lo, hi) return lo + (hi * 256) end
 -- Format: { name, bytes[9], hpType, group, removeInvincible }
 -- ═══════════════════════════════════════════════════════════════════════
 local POOL = {
-    -- Villagers
+    -- Villagers  (EnemySpawner: Villagers)
     {"Villager 1500", {21,0,0,0,24,64,0,232,3}, nil, "Villagers"},
     {"Villager 1501", {21,0,0,0,8,20,1,232,3}, nil, "Villagers"},
     {"Villager 1502", {21,0,0,0,2,32,1,232,3}, nil, "Villagers"},
@@ -179,7 +179,7 @@ local POOL = {
     {"Villager 1600", {22,2,0,0,0,160,129,232,3}, nil, "Villagers"},
     {"Villager 1601", {22,2,0,0,0,32,32,232,3}, nil, "Villagers"},
     {"Villager 1602", {22,2,0,0,0,120,137,232,3}, nil, "Villagers"},
-    -- Salvadors
+    -- Salvadors  (EnemySpawner: Dr. Salvador + Bella Sisters)
     {"Dr. Salvador 150", {21,0,0,0,96,16,16,232,3}, nil, "Salvadors"},
     {"Dr. Salvador 151", {21,0,0,0,1,0,16,232,3}, nil, "Salvadors"},
     {"Dr. Salvador 152", {21,0,48,0,2,48,16,232,3}, nil, "Salvadors"},
@@ -198,7 +198,7 @@ local POOL = {
     {"Bella Sister 06", {22,11,0,0,0,32,16,232,3}, nil, "Salvadors"},
     {"Bella Sister 07", {22,11,0,0,1,124,16,232,3}, nil, "Salvadors"},
     {"Bella Sister 08", {22,11,0,0,2,0,16,232,3}, nil, "Salvadors"},
-    -- Zealots
+    -- Zealots  (EnemySpawner: Zealots (1C))
     {"Zealot 1C00", {28,7,0,0,0,20,0,232,3}, nil, "Zealots"},
     {"Zealot 1C01", {28,7,0,0,16,18,1,232,3}, nil, "Zealots"},
     {"Zealot 1C02", {28,7,0,0,2,2,1,232,3}, nil, "Zealots"},
@@ -215,6 +215,7 @@ local POOL = {
     {"Zealot 1C13", {28,9,0,0,64,20,132,232,3}, nil, "Zealots"},
     {"Zealot 1C14", {28,9,0,0,64,4,33,232,3}, nil, "Zealots"},
     {"Zealot 1C15", {28,9,0,0,64,132,160,232,3}, nil, "Zealots"},
+    -- Zealots  (EnemySpawner: Zealots (1A))
     {"Zealot 1A00", {26,7,0,2,0,16,0,232,3}, nil, "Zealots"},
     {"Zealot 1A01", {26,7,0,2,16,2,1,232,3}, nil, "Zealots"},
     {"Zealot 1A02", {26,7,0,2,2,3,1,232,3}, nil, "Zealots"},
@@ -231,6 +232,7 @@ local POOL = {
     {"Zealot 1A13", {26,9,0,2,64,20,132,232,3}, nil, "Zealots"},
     {"Zealot 1A14", {26,9,0,2,64,4,33,232,3}, nil, "Zealots"},
     {"Zealot 1A15", {26,9,0,2,64,132,160,232,3}, nil, "Zealots"},
+    -- Zealots  (EnemySpawner: Zealots (11/14))
     {"Zealot 110", {17,8,0,96,2,72,0,232,3}, nil, "Zealots"},
     {"Zealot 111", {17,7,0,160,128,8,0,232,3}, nil, "Zealots"},
     {"Zealot 112", {17,8,0,96,128,8,0,232,3}, nil, "Zealots"},
@@ -243,18 +245,19 @@ local POOL = {
     {"Zealot 144", {20,8,0,0,208,64,160,232,3}, nil, "Zealots"},
     {"Zealot 145", {20,9,0,2,0,64,4,232,3}, nil, "Zealots"},
     {"Zealot 146", {20,9,0,0,0,32,4,232,3}, nil, "Zealots"},
+    -- Zealots  (EnemySpawner: Zealots (1B))
     {"Zealot 1B1", {27,7,37,32,32,7,0,232,3}, nil, "Zealots"},
     {"Zealot 1B2", {27,7,0,32,144,0,0,232,3}, nil, "Zealots"},
     {"Zealot 1B3", {27,7,0,0,64,128,32,232,3}, nil, "Zealots"},
     {"Zealot 1B4", {27,7,0,0,0,68,128,232,3}, nil, "Zealots"},
     {"Zealot 1B5", {27,7,0,48,66,64,32,232,3}, nil, "Zealots"},
     {"Zealot 1B6", {27,7,0,0,0,48,0,232,3}, nil, "Zealots"},
-    -- Bosses
-    {"Garrador", {28,10,0,0,0,0,0,160,15}, "garrador", "Bosses"},
-    {"Armored Garrador", {28,13,0,0,0,0,0,124,21}, "garrador", "Bosses"},
-    {"Armored Garrador Plaga", {28,10,48,0,0,0,0,160,15}, "garrador", "Bosses"},
-    {"Garrador 1B", {27,10,0,0,0,0,0,232,3}, "garrador", "Bosses"},
-    -- Mace Ganados
+    -- Garradors  (EnemySpawner: Garradors)
+    {"Garrador", {28,10,0,0,0,0,0,160,15}, "garrador", "Garradors"},
+    {"Armored Garrador", {28,13,0,0,0,0,0,124,21}, "garrador", "Garradors"},
+    {"Armored Garrador Plaga", {28,10,48,0,0,0,0,160,15}, "garrador", "Garradors"},
+    {"Garrador 1B", {27,10,0,0,0,0,0,232,3}, "garrador", "Garradors"},
+    -- Mace Ganados  (EnemySpawner: Big Mace Ganados)
     {"Mace Soldier 00", {31,24,0,0,24,0,1,232,3}, nil, "Mace Ganados"},
     {"Mace Soldier 01", {31,24,0,0,72,4,1,232,3}, nil, "Mace Ganados"},
     {"Mace Soldier 02", {31,24,0,0,89,16,1,232,3}, nil, "Mace Ganados"},
@@ -267,7 +270,7 @@ local POOL = {
     {"Mace Soldier 09", {31,24,0,0,193,16,1,232,3}, nil, "Mace Ganados"},
     {"Mace Soldier 10", {31,24,0,0,16,16,64,232,3}, nil, "Mace Ganados"},
     {"Mace Soldier 11", {31,24,0,0,0,4,1,232,3}, nil, "Mace Ganados"},
-    -- Soldiers
+    -- Soldiers  (EnemySpawner: Island Soldiers)
     {"Soldier 1D00", {29,14,0,8,72,1,0,232,3}, nil, "Soldiers"},
     {"Soldier 1D01", {29,14,0,0,2,2,129,232,3}, nil, "Soldiers"},
     {"Soldier 1D02", {29,16,0,0,17,3,129,232,3}, nil, "Soldiers"},
@@ -298,24 +301,25 @@ local POOL = {
     {"Soldier 1F00", {31,14,0,10,0,80,33,232,3}, nil, "Soldiers"},
     {"Soldier 1F01", {31,15,0,0,33,9,9,232,3}, nil, "Soldiers"},
     {"Soldier 1F02", {31,16,0,10,17,16,32,232,3}, nil, "Soldiers"},
-    -- Bosses
-    {"JJ", {29,2,0,0,0,0,0,136,19}, "boss", "Bosses"},
-    {"JJ Plaga", {29,2,48,0,0,0,0,136,19}, "boss", "Bosses"},
-    {"Super Salvador", {32,22,0,0,0,0,0,172,13}, "boss", "Bosses"},
-    {"Super Salvador Plaga", {32,22,0,8,8,176,16,172,13}, "boss", "Bosses"},
-    {"Super Salvador Dynamite", {32,22,0,8,8,176,16,172,13}, "boss", "Bosses"},
-    -- Dogs
+    -- JJs  (EnemySpawner: JJs)
+    {"JJ", {29,2,0,0,0,0,0,136,19}, "boss", "JJs"},
+    {"JJ Plaga", {29,2,48,0,0,0,0,136,19}, "boss", "JJs"},
+    -- Super Salvadors  (EnemySpawner: Super Salvadors)
+    {"Super Salvador", {32,22,0,0,0,0,0,172,13}, "boss", "Super Salvadors"},
+    {"Super Salvador Plaga", {32,22,0,8,8,176,16,172,13}, "boss", "Super Salvadors"},
+    {"Super Salvador Dynamite", {32,22,0,8,8,176,16,172,13}, "boss", "Super Salvadors"},
+    -- Dogs  (EnemySpawner: Dogs (Colmillos))
     {"Wolf (Friendly)", {33,0,0,0,0,0,0,232,3}, nil, "Dogs"},
     {"Colmillos (EmDog)", {34,0,0,0,0,0,0,232,3}, nil, "Dogs"},
-    -- Armaduras
+    -- Armaduras  (EnemySpawner: Armaduras)
     {"Armadura 00", {60,0,0,0,0,0,0,232,3}, nil, "Armaduras"},
     {"Armadura 01", {60,1,0,0,0,0,0,232,3}, nil, "Armaduras"},
     {"Armadura 02", {60,2,0,0,0,0,0,232,3}, nil, "Armaduras"},
     {"Armadura 03", {60,3,0,0,0,0,0,232,3}, nil, "Armaduras"},
-    -- Drones
+    -- Drones  (EnemySpawner: Drones + Robots)
     {"Drone", {58,0,0,0,0,0,0,232,3}, nil, "Drones"},
     {"Ground Robot", {58,2,0,0,0,0,0,232,3}, nil, "Drones"},
-    -- Animals
+    -- Animals  (EnemySpawner: Animals)
     {"Chicken 00", {40,0,0,0,0,0,0,232,3}, nil, "Animals"},
     {"Chicken 01", {40,1,0,0,0,0,0,232,3}, nil, "Animals"},
     {"Crow", {35,0,0,0,0,0,0,232,3}, nil, "Animals"},
@@ -325,21 +329,23 @@ local POOL = {
     {"Bat", {41,0,0,0,0,0,0,232,3}, nil, "Animals"},
     {"Black Bass", {39,0,0,0,0,0,0,232,3}, nil, "Animals"},
     {"Spider", {46,0,0,0,0,0,0,232,3}, nil, "Animals"},
-    -- Traps
+    -- Traps  (EnemySpawner: Parasites + Traps)
     {"Walking Parasite", {37,0,0,0,0,0,0,232,3}, nil, "Traps"},
     {"Bear Trap", {42,0,0,0,0,0,0,232,3}, nil, "Traps"},
     {"Wire Trap", {42,2,0,0,0,0,0,232,3}, nil, "Traps"},
-    -- Novistadores
+    -- Novistadores  (EnemySpawner: Novistadores)
     {"Novistador", {45,0,0,0,0,0,0,232,3}, nil, "Novistadores"},
     {"Novistador Boss", {44,0,0,0,0,0,0,232,3}, "boss", "Novistadores"},
     {"Novistador Boss Event", {51,0,0,0,0,0,0,232,3}, "boss", "Novistadores"},
-    -- Regenerators
+    -- Regenerators  (EnemySpawner: Regenerators + Iron Maidens)
     {"Regenerator", {54,0,0,0,0,0,0,232,3}, nil, "Regenerators"},
     {"Iron Maiden", {54,2,0,0,0,0,0,232,3}, nil, "Regenerators"},
-    -- Bosses
-    {"El Gigante", {43,0,0,0,0,0,0,232,3}, "boss", "Bosses"},
-    {"Verdugo (No2)", {55,0,0,0,0,0,0,232,3}, "boss", "Bosses"},
-    {"Verdugo After (No2)", {56,0,0,0,0,0,0,232,3}, "boss", "Bosses"},
+    -- Gigantes  (EnemySpawner: El Gigante)
+    {"El Gigante", {43,0,0,0,0,0,0,232,3}, "boss", "Gigantes"},
+    -- Verdugos  (EnemySpawner: Verdugos (No2))
+    {"Verdugo (No2)", {55,0,0,0,0,0,0,232,3}, "boss", "Verdugos"},
+    {"Verdugo After (No2)", {56,0,0,0,0,0,0,232,3}, "boss", "Verdugos"},
+    -- Bosses  (EnemySpawner: Bosses)
     {"Mendez Phase 1", {53,0,0,0,0,0,0,232,3}, "boss", "Bosses"},
     {"Mendez Phase 2", {53,1,0,0,0,0,0,232,3}, "boss", "Bosses"},
     {"Krauser Knife (No3)", {57,1,0,0,0,0,0,232,3}, "boss", "Bosses"},
@@ -349,42 +355,40 @@ local POOL = {
     {"Saddler (Ada)", {63,0,0,0,0,0,0,232,3}, "boss", "Bosses"},
     {"Salamander", {47,0,0,0,0,0,0,232,3}, "boss", "Bosses"},
     {"Tyrant (em09)", {9,0,0,0,0,0,0,232,3}, "boss", "Bosses"},
-    -- Characters / NPCs
-    {"Merchant", {24,6,0,0,0,0,0,232,3}, "npc", "Characters / NPCs"},
-    {"Saddler NPC 0", {48,0,0,0,0,0,0,232,3}, "npc", "Characters / NPCs"},
-    {"Saddler NPC 1", {48,1,0,0,0,0,0,232,3}, "npc", "Characters / NPCs"},
-    {"Mendez NPC", {52,0,0,0,0,0,0,232,3}, "npc", "Characters / NPCs"},
-    {"Salazar NPC", {52,1,0,0,0,0,0,232,3}, "npc", "Characters / NPCs"},
-    -- Bosses
-    {"Red Cloak Verdugo", {52,2,0,0,0,0,0,232,3}, "boss", "Bosses"},
-    {"Black Cloak Verdugo", {52,3,0,0,0,0,0,232,3}, "boss", "Bosses"},
-    -- Characters / NPCs
-    {"Ashley", {3,0,0,0,0,0,0,232,3}, "npc", "Characters / NPCs"},
-    {"Ashley 2", {5,0,0,0,0,0,0,232,3}, "npc", "Characters / NPCs"},
-    {"Ashley 3", {12,0,0,0,0,0,0,232,3}, "npc", "Characters / NPCs"},
-    {"Luis Sera", {4,0,0,0,0,0,0,232,3}, "npc", "Characters / NPCs"},
-    {"HUNK", {6,0,0,0,0,0,0,232,3}, "npc", "Characters / NPCs"},
-    {"Wesker", {13,0,0,0,0,0,0,232,3}, "npc", "Characters / NPCs"},
-    {"Krauser (NPC)", {10,0,0,0,0,0,0,232,3}, "npc", "Characters / NPCs"},
-    {"Police", {7,0,0,0,0,0,0,232,3}, "npc", "Characters / NPCs"},
-    -- Ada Enemies (em4x)
-    {"SW Zombie Ganado (em40)", {64,0,0,0,0,0,0,232,3}, nil, "Ada Enemies (em4x)"},
-    {"SW Zombie Ganado B (em41)", {65,0,0,0,0,0,0,232,3}, nil, "Ada Enemies (em4x)"},
-    {"SW Villager Ganado (em42)", {66,0,0,0,0,0,0,232,3}, nil, "Ada Enemies (em4x)"},
-    {"SW Soldier Ganado (em43)", {67,0,0,0,0,0,0,232,3}, nil, "Ada Enemies (em4x)"},
-    {"SW Ganado (em44)", {68,0,0,0,0,0,0,232,3}, nil, "Ada Enemies (em4x)"},
-    {"SW Ganado (em45)", {69,0,0,0,0,0,0,232,3}, nil, "Ada Enemies (em4x)"},
-    {"SW Ganado (em46)", {70,0,0,0,0,0,0,232,3}, nil, "Ada Enemies (em4x)"},
-    {"SW Ganado (em47)", {71,0,0,0,0,0,0,232,3}, nil, "Ada Enemies (em4x)"},
-    {"SW Ganado (em48)", {72,0,0,0,0,0,0,232,3}, nil, "Ada Enemies (em4x)"},
-    {"SW Ganado (em49)", {73,0,0,0,0,0,0,232,3}, nil, "Ada Enemies (em4x)"},
-    {"SW Ganado (em4a)", {74,0,0,0,0,0,0,232,3}, nil, "Ada Enemies (em4x)"},
-    {"SW Ganado (em4c)", {76,0,0,0,0,0,0,232,3}, nil, "Ada Enemies (em4x)"},
-    {"SW Ganado (em4d)", {77,0,0,0,0,0,0,232,3}, nil, "Ada Enemies (em4x)"},
-    {"SW Ganado (em4f)", {79,0,0,0,0,0,0,232,3}, nil, "Ada Enemies (em4x)"},
-    -- Bosses
-    {"Truck", {59,0,0,0,0,0,0,232,3}, "boss", "Bosses"},
-    {"Helicopter", {61,0,0,0,0,0,0,232,3}, "boss", "Bosses"},
+    -- NPCs  (EnemySpawner: NPCs)
+    {"Merchant", {24,6,0,0,0,0,0,232,3}, "npc", "NPCs"},
+    {"Saddler NPC 0", {48,0,0,0,0,0,0,232,3}, "npc", "NPCs"},
+    {"Saddler NPC 1", {48,1,0,0,0,0,0,232,3}, "npc", "NPCs"},
+    {"Mendez NPC", {52,0,0,0,0,0,0,232,3}, "npc", "NPCs"},
+    {"Salazar NPC", {52,1,0,0,0,0,0,232,3}, "npc", "NPCs"},
+    {"Red Cloak Verdugo", {52,2,0,0,0,0,0,232,3}, "boss", "NPCs"},
+    {"Black Cloak Verdugo", {52,3,0,0,0,0,0,232,3}, "boss", "NPCs"},
+    {"Ashley", {3,0,0,0,0,0,0,232,3}, "npc", "NPCs"},
+    {"Ashley 2", {5,0,0,0,0,0,0,232,3}, "npc", "NPCs"},
+    {"Ashley 3", {12,0,0,0,0,0,0,232,3}, "npc", "NPCs"},
+    {"Luis Sera", {4,0,0,0,0,0,0,232,3}, "npc", "NPCs"},
+    {"HUNK", {6,0,0,0,0,0,0,232,3}, "npc", "NPCs"},
+    {"Wesker", {13,0,0,0,0,0,0,232,3}, "npc", "NPCs"},
+    {"Krauser (NPC)", {10,0,0,0,0,0,0,232,3}, "npc", "NPCs"},
+    {"Police", {7,0,0,0,0,0,0,232,3}, "npc", "NPCs"},
+    -- Ada Enemies  (EnemySpawner: Ada Assignment Ganados)
+    {"SW Zombie Ganado (em40)", {64,0,0,0,0,0,0,232,3}, nil, "Ada Enemies"},
+    {"SW Zombie Ganado B (em41)", {65,0,0,0,0,0,0,232,3}, nil, "Ada Enemies"},
+    {"SW Villager Ganado (em42)", {66,0,0,0,0,0,0,232,3}, nil, "Ada Enemies"},
+    {"SW Soldier Ganado (em43)", {67,0,0,0,0,0,0,232,3}, nil, "Ada Enemies"},
+    {"SW Ganado (em44)", {68,0,0,0,0,0,0,232,3}, nil, "Ada Enemies"},
+    {"SW Ganado (em45)", {69,0,0,0,0,0,0,232,3}, nil, "Ada Enemies"},
+    {"SW Ganado (em46)", {70,0,0,0,0,0,0,232,3}, nil, "Ada Enemies"},
+    {"SW Ganado (em47)", {71,0,0,0,0,0,0,232,3}, nil, "Ada Enemies"},
+    {"SW Ganado (em48)", {72,0,0,0,0,0,0,232,3}, nil, "Ada Enemies"},
+    {"SW Ganado (em49)", {73,0,0,0,0,0,0,232,3}, nil, "Ada Enemies"},
+    {"SW Ganado (em4a)", {74,0,0,0,0,0,0,232,3}, nil, "Ada Enemies"},
+    {"SW Ganado (em4c)", {76,0,0,0,0,0,0,232,3}, nil, "Ada Enemies"},
+    {"SW Ganado (em4d)", {77,0,0,0,0,0,0,232,3}, nil, "Ada Enemies"},
+    {"SW Ganado (em4f)", {79,0,0,0,0,0,0,232,3}, nil, "Ada Enemies"},
+    -- Vehicles  (EnemySpawner: Vehicles + Turrets)
+    {"Truck", {59,0,0,0,0,0,0,232,3}, "boss", "Vehicles"},
+    {"Helicopter", {61,0,0,0,0,0,0,232,3}, "boss", "Vehicles"},
 }
 
 -- Build processed pool
@@ -628,6 +632,9 @@ local function pickFromCandidatesAvoidName(candidates, avoidName)
 end
 
 local DIRECT_LIST_COMPAT_GROUPS = {
+    ["NPCs"] = {"NPCs"},
+    ["Ada Enemies"] = {"Ada Enemies", "Villagers", "Salvadors"},
+    ["Vehicles"] = {"Vehicles"},
     ["Villagers"] = {"Villagers", "Salvadors"},
     ["Salvadors"] = {"Villagers", "Salvadors"},
     ["Zealots"] = {"Zealots"},
@@ -666,7 +673,14 @@ local function buildCompatibleCandidates(origEntry, origEmId)
             or e.group == "Gigantes"
             or e.group == "Verdugos"
             or e.group == "Regenerators"
-            or e.group == "Drones")
+            or e.group == "Drones"
+            -- EnemySpawner's own warning on the NPCS table: "NPCs are EXPERIMENTAL
+            -- — they require specific level context and initialization that
+            -- EmSetEvent alone may not provide. Spawning NPCs outside their
+            -- intended levels can crash the game." Vehicles (Truck/Helicopter) are
+            -- set pieces, not enemies. Neither belongs on the direct-list path.
+            or e.group == "NPCs"
+            or e.group == "Vehicles")
         if inCompatGroup and safeDirect and not sameEmId then
             compatible[#compatible + 1] = e
         end
