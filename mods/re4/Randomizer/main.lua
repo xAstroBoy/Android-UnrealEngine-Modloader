@@ -267,56 +267,56 @@ local POOL = {
     -- spawner are guesses and I'm not adding more fiction.
     -- bytes = { emId, +2, +3, +4..7 dword, hpLo, hpHi }; zeros = engine defaults,
     -- 1000 HP. Grouped so you can bulk-toggle them in the menu.
-    {"em03  [em/pl11.das]", {3,0,0,0,0,0,0,232,3}, nil, "NPC / Player models"},
-    {"em04  [em/pl14.das]", {4,0,0,0,0,0,0,232,3}, nil, "NPC / Player models"},
-    {"em05  [em/pl15.das]", {5,0,0,0,0,0,0,232,3}, nil, "NPC / Player models"},
-    {"em09  [em/em10.das]", {9,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)"},
-    {"em0c  [em/pl18.das]", {12,0,0,0,0,0,0,232,3}, nil, "NPC / Player models"},
-    {"em0e  [em/pl0e.das]", {14,0,0,0,0,0,0,232,3}, nil, "NPC / Player models"},
-    {"em0f  [em/pl0f.das]", {15,0,0,0,0,0,0,232,3}, nil, "NPC / Player models"},
-    {"em10  [em/em10.das]", {16,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)"},
-    {"em12  [em/em12.das]", {18,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em13  [em/em13.das]", {19,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em16  [em/em16.das]", {22,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em17  [em/em17.das]", {23,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em18  [em/em18.das]", {24,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em19  [em/em19.das]", {25,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em21  [em/em21.das]", {33,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em26  [em/em26.das]", {38,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em27  [em/em27.das]", {39,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em29  [em/em29.das]", {41,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em2c  [em/em2c.das]", {44,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em2e  [em/em2e.das]", {46,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em2f  [em/em2f.das]", {47,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em30  [em/em30.das]", {48,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em31  [em/em31.das]", {49,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em34  [em/em34.das]", {52,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em3b  [em/em3b.das]", {59,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em3d  [em/em3d.das]", {61,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em3e  [em/em3e.das]", {62,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em3f  [em/em3f.das]", {63,0,0,0,0,0,0,232,3}, nil, "More Enemies"},
-    {"em40  [em/em40.das]", {64,0,0,0,0,0,0,232,3}, nil, "em4x Ganados"},
-    {"em41  [em/em41.das]", {65,0,0,0,0,0,0,232,3}, nil, "em4x Ganados"},
-    {"em42  [em/em42.das]", {66,0,0,0,0,0,0,232,3}, nil, "em4x Ganados"},
-    {"em43  [em/em43.das]", {67,0,0,0,0,0,0,232,3}, nil, "em4x Ganados"},
-    {"em44  [em/em44.das]", {68,0,0,0,0,0,0,232,3}, nil, "em4x Ganados"},
-    {"em45  [em/em45.das]", {69,0,0,0,0,0,0,232,3}, nil, "em4x Ganados"},
-    {"em46  [em/em46a.das]", {70,0,0,0,0,0,0,232,3}, nil, "em4x Ganados"},
-    {"em47  [em/em47.das]", {71,0,0,0,0,0,0,232,3}, nil, "em4x Ganados"},
-    {"em48  [em/em48.das]", {72,0,0,0,0,0,0,232,3}, nil, "em4x Ganados"},
-    {"em49  [em/em49.das]", {73,0,0,0,0,0,0,232,3}, nil, "em4x Ganados"},
-    {"em4a  [em/em4a.das]", {74,0,0,0,0,0,0,232,3}, nil, "em4x Ganados"},
-    {"em4c  [em/em4ca.das]", {76,0,0,0,0,0,0,232,3}, nil, "em4x Ganados"},
-    {"em4d  [em/em4da.das]", {77,0,0,0,0,0,0,232,3}, nil, "em4x Ganados"},
-    {"em4f  [em/em4fa.das]", {79,0,0,0,0,0,0,232,3}, nil, "em4x Ganados"},
-    {"em06  [em/em10.das] (cut villager -> id-9 ganado AI)", {6,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)"},
-    {"em07  [em/em10.das] (cut villager -> id-9 ganado AI)", {7,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)"},
-    {"em08  [em/em10.das] (cut villager -> id-9 ganado AI)", {8,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)"},
-    {"em0a  [em/em10.das] (cut villager -> id-9 ganado AI)", {10,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)"},
-    {"em0b  [em/em10.das] (cut villager -> id-9 ganado AI)", {11,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)"},
-    {"em0d  [em/em10.das] (cut villager -> id-9 ganado AI)", {13,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)"},
-    {"em33  [em/em10.das] (cut villager -> id-9 ganado AI)", {51,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)"},
-    {"em37  [em/em10.das] (cut villager -> id-9 ganado AI)", {55,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)"},
+    {"em03  [em/pl11.das]", {3,0,0,0,0,0,0,232,3}, nil, "NPC / Player models", false, true},
+    {"em04  [em/pl14.das]", {4,0,0,0,0,0,0,232,3}, nil, "NPC / Player models", false, true},
+    {"em05  [em/pl15.das]", {5,0,0,0,0,0,0,232,3}, nil, "NPC / Player models", false, true},
+    {"em09  [em/em10.das]", {9,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)", false, true},
+    {"em0c  [em/pl18.das]", {12,0,0,0,0,0,0,232,3}, nil, "NPC / Player models", false, true},
+    {"em0e  [em/pl0e.das]", {14,0,0,0,0,0,0,232,3}, nil, "NPC / Player models", false, true},
+    {"em0f  [em/pl0f.das]", {15,0,0,0,0,0,0,232,3}, nil, "NPC / Player models", false, true},
+    {"em10  [em/em10.das]", {16,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)", false, true},
+    {"em12  [em/em12.das]", {18,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em13  [em/em13.das]", {19,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em16  [em/em16.das]", {22,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em17  [em/em17.das]", {23,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em18  [em/em18.das]", {24,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em19  [em/em19.das]", {25,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em21  [em/em21.das]", {33,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em26  [em/em26.das]", {38,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em27  [em/em27.das]", {39,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em29  [em/em29.das]", {41,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em2c  [em/em2c.das]", {44,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em2e  [em/em2e.das]", {46,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em2f  [em/em2f.das]", {47,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em30  [em/em30.das]", {48,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em31  [em/em31.das]", {49,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em34  [em/em34.das]", {52,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em3b  [em/em3b.das]", {59,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em3d  [em/em3d.das]", {61,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em3e  [em/em3e.das]", {62,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em3f  [em/em3f.das]", {63,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    {"em40  [em/em40.das]", {64,0,0,0,0,0,0,232,3}, nil, "em4x Ganados", false, true},
+    {"em41  [em/em41.das]", {65,0,0,0,0,0,0,232,3}, nil, "em4x Ganados", false, true},
+    {"em42  [em/em42.das]", {66,0,0,0,0,0,0,232,3}, nil, "em4x Ganados", false, true},
+    {"em43  [em/em43.das]", {67,0,0,0,0,0,0,232,3}, nil, "em4x Ganados", false, true},
+    {"em44  [em/em44.das]", {68,0,0,0,0,0,0,232,3}, nil, "em4x Ganados", false, true},
+    {"em45  [em/em45.das]", {69,0,0,0,0,0,0,232,3}, nil, "em4x Ganados", false, true},
+    {"em46  [em/em46a.das]", {70,0,0,0,0,0,0,232,3}, nil, "em4x Ganados", false, true},
+    {"em47  [em/em47.das]", {71,0,0,0,0,0,0,232,3}, nil, "em4x Ganados", false, true},
+    {"em48  [em/em48.das]", {72,0,0,0,0,0,0,232,3}, nil, "em4x Ganados", false, true},
+    {"em49  [em/em49.das]", {73,0,0,0,0,0,0,232,3}, nil, "em4x Ganados", false, true},
+    {"em4a  [em/em4a.das]", {74,0,0,0,0,0,0,232,3}, nil, "em4x Ganados", false, true},
+    {"em4c  [em/em4ca.das]", {76,0,0,0,0,0,0,232,3}, nil, "em4x Ganados", false, true},
+    {"em4d  [em/em4da.das]", {77,0,0,0,0,0,0,232,3}, nil, "em4x Ganados", false, true},
+    {"em4f  [em/em4fa.das]", {79,0,0,0,0,0,0,232,3}, nil, "em4x Ganados", false, true},
+    {"em06  [em/em10.das] (cut villager -> id-9 ganado AI)", {6,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)", false, true},
+    {"em07  [em/em10.das] (cut villager -> id-9 ganado AI)", {7,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)", false, true},
+    {"em08  [em/em10.das] (cut villager -> id-9 ganado AI)", {8,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)", false, true},
+    {"em0a  [em/em10.das] (cut villager -> id-9 ganado AI)", {10,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)", false, true},
+    {"em0b  [em/em10.das] (cut villager -> id-9 ganado AI)", {11,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)", false, true},
+    {"em0d  [em/em10.das] (cut villager -> id-9 ganado AI)", {13,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)", false, true},
+    {"em33  [em/em10.das] (cut villager -> id-9 ganado AI)", {51,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)", false, true},
+    {"em37  [em/em10.das] (cut villager -> id-9 ganado AI)", {55,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)", false, true},
 }
 
 -- Build processed pool
@@ -367,6 +367,10 @@ for _, raw in ipairs(POOL) do
         hpType = raw[3] or "normal",
         group  = raw[4] or "Other",
         removeInvincible = raw[5] or false,
+        -- keepTail: swap the emId only, never the slot's authored +2..+7
+        -- params. Set on the auto-added coverage entries, whose byte tail is
+        -- a zeroed template I generated rather than a real capture.
+        keepTail = raw[6] or false,
     }
     ENEMIES[#ENEMIES + 1] = e
     local sig = buildEnemySignature(e.bytes)
@@ -1144,12 +1148,28 @@ local function applyReplacementToEmListRow(emListPtr, pick, hp, nativePlan)
             targetEmId = nativePlan and orig.emId or pick.bytes[1]
         end
         WriteU8(Offset(emListPtr, 0x01), targetEmId)
-        WriteU8(Offset(emListPtr, 0x02), pick.bytes[2])
-        WriteU8(Offset(emListPtr, 0x03), pick.bytes[3])
-        WriteU8(Offset(emListPtr, 0x04), pick.bytes[4])
-        WriteU8(Offset(emListPtr, 0x05), pick.bytes[5] or 0)
-        WriteU8(Offset(emListPtr, 0x06), pick.bytes[6] or 0)
-        WriteU8(Offset(emListPtr, 0x07), pick.bytes[7] or 0)
+        -- Row +2..+7 are the SLOT's authored spawn params, not the enemy's
+        -- identity. EmSetFromList copies them straight into the live cEm:
+        --     *(_BYTE  *)(cEm + 281)  = row[+2]
+        --     *(_BYTE  *)(cEm + 1149) = row[+3]
+        --     *(_DWORD *)(cEm + 1220) = row[+4..7]
+        -- The 70 hand-captured entries carry REAL values here (e.g.
+        -- {21,0,0,0,24,64,0,...}), so copying their tail is meaningful. The 50
+        -- entries auto-added for full emId coverage do NOT — I generated them with
+        -- a zeroed template, and writing those zeros CLOBBERS the room's authored
+        -- params. That produced a garbage pool walk at room init:
+        --     fault 0x00000f96b9b81924
+        --     EmSetFromList()+232 <- ScenarioRoomInit <- gameRoomInit
+        -- keepTail entries swap the IDENTITY only and leave the slot's own params
+        -- alone — which is what they should have done from the start.
+        if not pick.keepTail then
+            WriteU8(Offset(emListPtr, 0x02), pick.bytes[2])
+            WriteU8(Offset(emListPtr, 0x03), pick.bytes[3])
+            WriteU8(Offset(emListPtr, 0x04), pick.bytes[4])
+            WriteU8(Offset(emListPtr, 0x05), pick.bytes[5] or 0)
+            WriteU8(Offset(emListPtr, 0x06), pick.bytes[6] or 0)
+            WriteU8(Offset(emListPtr, 0x07), pick.bytes[7] or 0)
+        end
     end
 
     WriteU8(Offset(emListPtr, 0x08), hp[1])
