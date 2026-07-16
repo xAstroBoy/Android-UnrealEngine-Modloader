@@ -135,6 +135,19 @@ bool install_em32_subobject_guard();
 // ENTRY hooks only — two inline hooks <16 bytes apart shred each other (see the
 // em32 note above). Max 8 guards; forwards x0-x7, leaves v0-v7 alone.
 bool install_null_this_guard(uintptr_t addr, const char* name);
+// U3 "It" (emId 50 = 0x32 = cEm32) is INVULNERABLE outside its scripted level —
+// same root as the fault-0x180 crash. sub_5E49AA0 builds U3's parts model with
+// SetObj00 using the GLOBAL/stage archive at pG+0x68 for the skeleton param; away
+// from U3's level that archive doesn't hold it, modelInit fails, SetObj00 returns
+// 0, and the game derefs the NULL it just checked (*(v50+384) = NULL+0x180).
+// Everything AFTER that line is YarareInit/YarareAdd — U3's ~28 DAMAGE REGIONS —
+// so a crash guard that siglongjmps out is precisely what leaves U3 unkillable.
+// Fix: when SetObj00 fails inside U3's init, retry with U3's OWN archive for that
+// param (what modelInit uses for U3's main model). The model builds, the NULL
+// never happens, the init reaches YarareAdd, and U3 is killable anywhere.
+// Two ENTRY hooks (em32 init + SetObj00); the retry is scoped to U3's init only.
+bool install_u3_killable_fix(uintptr_t em32_init, uintptr_t setobj00);
+uint32_t u3_rescued_count();
 // Dual-fire: arm the gun inside its OWN AVR4GamePlayerGun::TryFire so both guns
 // pass the "am I the armed weapon?" check and fire the same frame. MUST be pure
 // C++: TryFire is HOT (every trigger pull, per gun, continuously under

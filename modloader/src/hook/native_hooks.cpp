@@ -1402,6 +1402,117 @@ bool install_cut_villager_fix() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// U3 (em32) — make it KILLABLE outside its own level
+// ═══════════════════════════════════════════════════════════════════════
+// U3 "It" is emId 50 = 0x32 = cEm32. Spawn it anywhere but its scripted level
+// and it is invulnerable. Same root as the fault-0x180 crash — one bug, two
+// symptoms. From sub_5E49AA0 (U3's init):
+//
+//     v49 = *(_QWORD *)(a1 + 3965);          // the parts model from SetObj00
+//     if (v49) { ...; v50 = *(cModel **)(a1 + 3965); }
+//     else     { v50 = nullptr; }            // checked...
+//     VR4CreateEmSubObject(*(int **)(*((_QWORD *)v50 + 48) + 24LL), a1, v50);
+//                                   // ...then *(v50 + 384) => NULL + 0x180. Boom.
+//
+// And crucially, EVERYTHING BELOW that line is U3's combat setup:
+//     YarareInit(a1, ...); YarareAdd(a1, a1+1349, 3, 5, ...);   // ~28 of them
+// YarareAdd registers the DAMAGE REGIONS. A crash guard "fixes" the crash by
+// siglongjmp-ing out BEFORE those ever run, so U3 spawns with no hitboxes at all
+// — which is exactly why it stopped crashing and became unkillable. Guarding was
+// never going to make it killable; the init has to actually COMPLETE.
+//
+// Why the parts model is NULL:
+//     SetObj00(U3_archive + [U3_archive+596],        // its own archive — fine
+//              [pG+0x68] + [[pG+0x68]+20], ...)      // a DIFFERENT global archive
+// The parts pull their skeleton from the global/stage archive at pG+0x68, which
+// outside U3's level is not the one holding them, so cModel::modelInit fails and
+// SetObj00 returns 0. Compare U3's MAIN model, which the same function builds from
+// its OWN archive:
+//     cModel::modelInit(a1, arch + [arch+16], arch + [arch+20]);
+//
+// So: when SetObj00 fails while we are inside U3's init, retry it with U3's own
+// archive for that second parameter — the same source the main model uses. If the
+// retry builds the model, v49 is non-NULL, the deref never happens, the init runs
+// to completion, YarareAdd registers the hitboxes, and U3 is killable anywhere.
+// Two ENTRY hooks, no mid-function patching.
+static thread_local uint64_t s_u3_cEm = 0;      // non-zero <=> inside em32's init
+static std::atomic<uint32_t> s_u3_rescued{0};
+static std::atomic<bool>     s_u3_enabled{true};
+
+using U3InitFn    = uint64_t (*)(uint64_t);
+using U3SetObj00Fn = uint64_t (*)(uint64_t, uint64_t, void*, void*);
+static U3InitFn     s_u3_init_orig  = nullptr;
+static U3SetObj00Fn s_u3_setobj_orig = nullptr;
+
+static uint64_t u3_init_thunk(uint64_t cEm) {
+    // Scope the SetObj00 rescue to U3's init only — SetObj00 is shared by many
+    // enemies and a global retry could paper over a legitimate failure elsewhere.
+    uint64_t prev = s_u3_cEm;
+    s_u3_cEm = cEm;
+    uint64_t r = s_u3_init_orig(cEm);
+    s_u3_cEm = prev;
+    return r;
+}
+
+static uint64_t u3_setobj00_thunk(uint64_t a1, uint64_t a2, void* a3, void* a4) {
+    uint64_t r = s_u3_setobj_orig(a1, a2, a3, a4);
+    if (r || !s_u3_cEm || !s_u3_enabled.load(std::memory_order_relaxed))
+        return r;
+
+    // Failed, and we're inside U3's init. Retry with U3's OWN archive for the
+    // skeleton param, mirroring what modelInit does for U3's main model.
+    uint64_t arch = 0;
+    __builtin_memcpy(&arch, reinterpret_cast<void*>(s_u3_cEm + 1120), sizeof(arch));
+    if (!arch) return r;
+    uint32_t off20 = *reinterpret_cast<volatile uint32_t*>(arch + 20);
+    uint64_t a2_own = arch + off20;
+    if (a2_own == a2) return r;          // already what we'd try — nothing to gain
+
+    r = s_u3_setobj_orig(a1, a2_own, a3, a4);
+    if (r) {
+        uint32_t n = s_u3_rescued.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 4) {
+            logger::log_info("U3", "parts model rebuilt from U3's own archive "
+                                   "(stage archive at pG+0x68 doesn't have it here) — "
+                                   "init can now reach YarareAdd, so U3 is killable [%u]", n);
+        }
+    }
+    return r;
+}
+
+bool install_u3_killable_fix(uintptr_t em32_init, uintptr_t setobj00) {
+    if (!em32_init || !setobj00) {
+        logger::log_error("U3", "null address (init=0x%lX setobj00=0x%lX)",
+                          (unsigned long)em32_init, (unsigned long)setobj00);
+        return false;
+    }
+    if (s_u3_init_orig && s_u3_setobj_orig) return true;   // idempotent
+    if (!s_u3_init_orig &&
+        DobbyHook(reinterpret_cast<void*>(em32_init),
+                  reinterpret_cast<dobby_dummy_func_t>(u3_init_thunk),
+                  reinterpret_cast<dobby_dummy_func_t*>(&s_u3_init_orig)) != RT_SUCCESS) {
+        s_u3_init_orig = nullptr;
+        logger::log_error("U3", "DobbyHook failed on em32 init @0x%lX", (unsigned long)em32_init);
+        return false;
+    }
+    if (!s_u3_setobj_orig &&
+        DobbyHook(reinterpret_cast<void*>(setobj00),
+                  reinterpret_cast<dobby_dummy_func_t>(u3_setobj00_thunk),
+                  reinterpret_cast<dobby_dummy_func_t*>(&s_u3_setobj_orig)) != RT_SUCCESS) {
+        s_u3_setobj_orig = nullptr;
+        logger::log_error("U3", "DobbyHook failed on SetObj00 @0x%lX", (unsigned long)setobj00);
+        return false;
+    }
+    logger::log_info("U3", "killable-anywhere fix installed (em32 init @0x%lX + SetObj00 @0x%lX): "
+                           "a failed parts build now retries from U3's own archive so the init "
+                           "reaches YarareAdd (its damage regions) instead of dying at NULL+0x180",
+                     (unsigned long)em32_init, (unsigned long)setobj00);
+    return true;
+}
+
+uint32_t u3_rescued_count() { return s_u3_rescued.load(std::memory_order_relaxed); }
+
+// ═══════════════════════════════════════════════════════════════════════
 // NULL-`this` GUARD — the null check the game forgot
 // ═══════════════════════════════════════════════════════════════════════
 // A whole family of RE4 crashes is one bug repeated per enemy: an enemy's

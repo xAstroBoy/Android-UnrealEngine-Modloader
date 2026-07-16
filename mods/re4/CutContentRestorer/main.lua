@@ -200,6 +200,40 @@ do
         end)
     end
 
+    -- U3 "It" (emId 50 = 0x32 = cEm32) — killable OUTSIDE its scripted level.
+    --
+    -- This is the same bug as the fault-0x180 crash, wearing a different hat.
+    -- sub_5E49AA0 (U3's init) builds its parts model with:
+    --     SetObj00(U3_archive + [U3_archive+596],       -- its own archive: fine
+    --              [pG+0x68] + [[pG+0x68]+20], ...)     -- a GLOBAL/stage archive
+    -- Away from U3's level that global archive doesn't hold the parts, modelInit
+    -- fails, SetObj00 returns 0, and the game dereferences the NULL it JUST
+    -- null-checked:  *((_QWORD*)v50 + 48)  ->  NULL + 384  ->  fault 0x180.
+    --
+    -- Everything after that line is U3's combat setup — YarareInit + ~28
+    -- YarareAdd calls, which ARE its damage regions. So the crash guard "fixing"
+    -- the crash by siglongjmp-ing out is EXACTLY what made U3 invulnerable: the
+    -- init never reaches its hitboxes. No guard can make U3 killable; the init has
+    -- to complete.
+    --
+    -- Fix: when SetObj00 fails inside U3's init, retry with U3's OWN archive for
+    -- the skeleton param — the same source modelInit uses for U3's MAIN model
+    -- (modelInit(a1, arch+[arch+16], arch+[arch+20])). Model builds -> no NULL ->
+    -- init runs to the end -> YarareAdd registers the hitboxes -> U3 is killable.
+    -- Installed BEFORE the em32 guard on purpose: the guard is only a backstop for
+    -- the case where the retry can't build it either.
+    if InstallU3KillableFix then
+        pcall(function()
+            -- sub_5E49AA0 has no symbol (it's a sub_), so use the RVA directly.
+            local init = Offset(GetLibBase(), 0x5E49AA0)
+            local so   = Resolve("_Z8SetObj00mmP3VecS0_", 0x5F8AEB4)
+            local ok = InstallU3KillableFix(init, so)
+            Log(TAG .. ": U3 (em32) killable-anywhere fix: " .. (ok and "installed" or "FAILED"))
+        end)
+    else
+        LogWarn(TAG .. ": InstallU3KillableFix missing — rebuild the modloader")
+    end
+
     if InstallEm32SubObjectGuard then
         pcall(function()
             local ok = InstallEm32SubObjectGuard()

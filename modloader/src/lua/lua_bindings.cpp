@@ -2152,6 +2152,26 @@ namespace lua_bindings
             return native_hooks::install_null_this_guard(reinterpret_cast<uintptr_t>(addr), name.c_str());
         });
 
+        // ── InstallU3KillableFix — U3 (em32) killable outside its level ─────
+        // U3 "It" = emId 50 = 0x32 = cEm32. Away from its scripted level it is
+        // invulnerable, and it is the SAME bug as the fault-0x180 crash. Its init
+        // (sub_5E49AA0) builds U3's parts via SetObj00 using the global/stage
+        // archive at pG+0x68; elsewhere that archive lacks the data, modelInit
+        // fails, SetObj00 returns 0, and the game derefs the NULL it just checked
+        // (*(v50+384) => NULL+0x180). Everything after that line is
+        // YarareInit/YarareAdd — U3's damage regions — so guarding the crash is
+        // exactly what made it unkillable: the init never reaches its hitboxes.
+        // Retrying SetObj00 with U3's OWN archive lets the init COMPLETE.
+        // Sig: InstallU3KillableFix(em32InitAddr, setObj00Addr) -> bool
+        lua.set_function("InstallU3KillableFix", [](void* em32_init, void* setobj00) -> bool {
+            return native_hooks::install_u3_killable_fix(
+                reinterpret_cast<uintptr_t>(em32_init), reinterpret_cast<uintptr_t>(setobj00));
+        });
+        // Sig: U3RescuedCount() -> int  (how many parts models we rebuilt)
+        lua.set_function("U3RescuedCount", []() -> uint32_t {
+            return native_hooks::u3_rescued_count();
+        });
+
         // ── InstallDualFireArm — dual-fire WITHOUT a Lua hook on TryFire ─────
         // RE4 arms ONE weapon globally and TryFire only fires the gun that IS the
         // armed one, so dual-wielding fires only one gun. Arming each gun inside
