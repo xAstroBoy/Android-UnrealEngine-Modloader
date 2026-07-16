@@ -1539,6 +1539,85 @@ bool install_u3_killable_fix(uintptr_t em32_init, uintptr_t setobj00) {
 uint32_t u3_rescued_count() { return s_u3_rescued.load(std::memory_order_relaxed); }
 
 // ═══════════════════════════════════════════════════════════════════════
+// MINE THROWER fast reload — pure C++, because moveReload is a VTABLE entry
+// ═══════════════════════════════════════════════════════════════════════
+// The Mine Thrower has no ::InstantReload, so after each shot cObjMine::moveReload
+// plays a full animated reload. It is a per-frame state machine on this+1067:
+//   1st call (flag==0): let the ORIGINAL run — it re-chambers the next mine.
+//                       Blocking it outright leaves the weapon stuck after one shot.
+//   2nd call (flag==1): refill (cItemMgr::reload), clear the flags, and skip the
+//                       rest of the animation => reload done in ~2 frames.
+//
+// This logic used to live in a LUA CALLBACK, and moveReload is NOT cold — IDA says
+// it is a vtable slot:
+//     9d46a40 -> cObjMine::moveFire
+//     9d46a48 -> cObjMine::moveDown
+//     9d46a50 -> cObjMine::moveReload   <- here
+//     9d46a58 -> cObjWep::moveDrop
+// i.e. dispatched from cObjWep::move, on the game thread, every frame the weapon
+// is reloading — and with the reload cut to ~2 frames you are firing constantly,
+// so it fires constantly. That callback raced the shared lua_State and the
+// corruption surfaced far away as pc=0x24cc / FMallocBinned2 / atan2f. Same class
+// as ScoreControl, DualFire, the Tyrant monitor and NoVignette.
+//
+// The work is four memory ops and one call, so it belongs in C. Identical
+// behaviour, no lua_State, nothing to race.
+static std::atomic<bool> s_mt_enabled{true};
+static uintptr_t s_mt_itemmgr  = 0;
+static uint32_t  s_mt_inprog   = 1067;   // cObjMine: "reload started"
+static uint32_t  s_mt_subflag  = 1066;
+
+using MtReloadFn    = uint64_t (*)(void*);     // cItemMgr::reload()
+using MtMoveReload  = uint64_t (*)(uint64_t);  // cObjMine::moveReload()
+static MtReloadFn   s_mt_reload = nullptr;
+static MtMoveReload s_mt_orig   = nullptr;
+
+static uint64_t mt_movereload_thunk(uint64_t self) {
+    if (s_mt_enabled.load(std::memory_order_relaxed) && self && s_mt_reload && s_mt_itemmgr) {
+        if (*reinterpret_cast<volatile uint8_t*>(self + s_mt_inprog) == 1) {
+            // 2nd frame: finish the reload now and skip the animation.
+            s_mt_reload(reinterpret_cast<void*>(s_mt_itemmgr));
+            *reinterpret_cast<volatile uint8_t*>(self + s_mt_inprog)  = 0;
+            *reinterpret_cast<volatile uint8_t*>(self + s_mt_subflag) = 0;
+            return 0;   // block the original — this is what the Lua `return true` did
+        }
+        // 1st frame: fall through so the original re-chambers the next mine.
+    }
+    return s_mt_orig(self);
+}
+
+bool install_minethrower_fast_reload(uintptr_t movereload, uintptr_t itemmgr,
+                                     uintptr_t reload_fn, uint32_t inprog_off,
+                                     uint32_t subflag_off) {
+    if (!movereload || !itemmgr || !reload_fn) {
+        logger::log_error("MINETHR", "null address (moveReload=0x%lX itemMgr=0x%lX reload=0x%lX)",
+                          (unsigned long)movereload, (unsigned long)itemmgr, (unsigned long)reload_fn);
+        return false;
+    }
+    s_mt_itemmgr = itemmgr;
+    s_mt_reload  = reinterpret_cast<MtReloadFn>(reload_fn);
+    s_mt_inprog  = inprog_off  ? inprog_off  : 1067;
+    s_mt_subflag = subflag_off ? subflag_off : 1066;
+    if (s_mt_orig) {                       // idempotent across mod reloads
+        logger::log_info("MINETHR", "already installed — refreshed addresses only");
+        return true;
+    }
+    if (DobbyHook(reinterpret_cast<void*>(movereload),
+                  reinterpret_cast<dobby_dummy_func_t>(mt_movereload_thunk),
+                  reinterpret_cast<dobby_dummy_func_t*>(&s_mt_orig)) != RT_SUCCESS) {
+        s_mt_orig = nullptr;
+        logger::log_error("MINETHR", "DobbyHook failed at 0x%lX", (unsigned long)movereload);
+        return false;
+    }
+    logger::log_info("MINETHR", "pure-C++ fast reload installed @0x%lX (inProg=+%u subFlag=+%u) "
+                                "— no Lua on cObjMine::moveReload (a vtable slot off cObjWep::move)",
+                     (unsigned long)movereload, s_mt_inprog, s_mt_subflag);
+    return true;
+}
+
+void set_minethrower_enabled(bool on) { s_mt_enabled.store(on, std::memory_order_relaxed); }
+
+// ═══════════════════════════════════════════════════════════════════════
 // NULL-`this` GUARD — the null check the game forgot
 // ═══════════════════════════════════════════════════════════════════════
 // A whole family of RE4 crashes is one bug repeated per enemy: an enemy's

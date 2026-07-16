@@ -2177,6 +2177,27 @@ namespace lua_bindings
             return native_hooks::u3_rescued_count();
         });
 
+        // ── InstallMineThrowerFastReload — no Lua on a vtable move() slot ────
+        // cObjMine::moveReload is a VTABLE entry (next to moveFire/moveDown),
+        // dispatched from cObjWep::move every frame the weapon is reloading — and
+        // the whole point of this mod is to reload constantly, so it runs
+        // constantly. A Lua callback there races the shared lua_State; that is the
+        // pc=0x24cc / FMallocBinned2 / atan2f corruption. The logic is four memory
+        // ops and one call, so it lives in C++ now. Identical behaviour.
+        // Sig: InstallMineThrowerFastReload(moveReloadAddr, itemMgrAddr, reloadAddr, inProgOff, subFlagOff) -> bool
+        lua.set_function("InstallMineThrowerFastReload", [](void* movereload, void* itemmgr,
+                                                            void* reload_fn,
+                                                            sol::optional<uint32_t> inprog,
+                                                            sol::optional<uint32_t> subflag) -> bool {
+            return native_hooks::install_minethrower_fast_reload(
+                reinterpret_cast<uintptr_t>(movereload), reinterpret_cast<uintptr_t>(itemmgr),
+                reinterpret_cast<uintptr_t>(reload_fn),
+                inprog.value_or(1067), subflag.value_or(1066));
+        });
+        lua.set_function("SetMineThrowerEnabled", [](bool on) {
+            native_hooks::set_minethrower_enabled(on);
+        });
+
         // ── InstallDualFireArm — dual-fire WITHOUT a Lua hook on TryFire ─────
         // RE4 arms ONE weapon globally and TryFire only fires the gun that IS the
         // armed one, so dual-wielding fires only one gun. Arming each gun inside

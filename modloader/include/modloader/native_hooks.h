@@ -146,6 +146,18 @@ bool install_em32_subobject_guard();
 // x0+field_off, for functions where `this` is valid but an inner pointer is
 // NULL (cModel::setParent: LDR X8,[X0,#0x108] / STR X1,[X8,#0x78] -> 0x78).
 bool install_null_this_guard(uintptr_t addr, const char* name, int64_t field_off = -1);
+// Mine Thrower fast reload. MUST be pure C++: cObjMine::moveReload is a VTABLE
+// slot (next to moveFire/moveDown), dispatched from cObjWep::move on the game
+// thread — and with the reload cut to ~2 frames you fire constantly, so it runs
+// constantly. A Lua callback there raced the shared lua_State and surfaced as
+// pc=0x24cc / FMallocBinned2 / atan2f. Same class as the DualFire hot hook.
+// State machine on this+inprog: 1st call (==0) falls through so the original
+// re-chambers; 2nd (==1) calls cItemMgr::reload, clears the flags and blocks the
+// animation. Addresses come from Lua; only the hot path lives in C++.
+bool install_minethrower_fast_reload(uintptr_t movereload, uintptr_t itemmgr,
+                                     uintptr_t reload_fn, uint32_t inprog_off,
+                                     uint32_t subflag_off);
+void set_minethrower_enabled(bool on);
 // U3 "It" (emId 50 = 0x32 = cEm32) is INVULNERABLE outside its scripted level —
 // same root as the fault-0x180 crash. sub_5E49AA0 builds U3's parts model with
 // SetObj00 using the GLOBAL/stage archive at pG+0x68 for the skeleton param; away
