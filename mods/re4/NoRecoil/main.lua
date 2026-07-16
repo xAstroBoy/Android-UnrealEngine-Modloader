@@ -14,7 +14,7 @@
 -- v1.0: Original with native hooks
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "NoRecoil"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = { enabled = true }
@@ -32,54 +32,52 @@ end
 -- returns 0 (hook not installed). Either way, mod keeps loading.
 -- ═══════════════════════════════════════════════════════════════════════
 
-local hookCount = 0
+-- ═══════════════════════════════════════════════════════════════════════
+-- BYTE PATCHES (v3.0) — replace the Lua-callback hooks
+-- ═══════════════════════════════════════════════════════════════════════
+-- v2.x used RegisterNativeHook with Lua callbacks on UpdateRecoil /
+-- GetShotSpreadMM — both are PER-FRAME during firing. A Lua callback on a hot
+-- function is (a) unreliable ("didn't work on all weapons") and (b) the exact
+-- luaV_execute cross-thread crash risk. Verified in IDA that UpdateRecoil and
+-- GetShotSpreadMM exist ONLY on the base AVR4GamePlayerGun (no per-weapon
+-- overrides), so patching the base covers EVERY weapon. Pure byte-patches: no
+-- Lua on the hot path, works for all guns.
+local ARM64_RET       = 0xD65F03C0   -- ret
+local ARM64_FMOV_S0_0 = 0x1E2703E0   -- fmov s0, wzr  (return 0.0f)
+local patchCount = 0
 
--- UpdateRecoil(self, dt) — block the recoil update entirely
--- sig: "pf" = self(ptr/X0), dt(float/D0)
-local ok = RegisterNativeHook("UpdateRecoil", function(self, dt)
-    if state.enabled then
-        V("Native UpdateRecoil BLOCK, self=%s", tostring(self))
-        return "BLOCK"
+-- {mangled, fallbackOffset, name, {word0[, word1]}}
+local RECOIL_PATCHES = {
+    {"_ZN17AVR4GamePlayerGun12UpdateRecoilEf",       0x062D9EB0, "UpdateRecoil → ret (no recoil)",        {ARM64_RET}},
+    {"_ZNK17AVR4GamePlayerGun15GetShotSpreadMMEv",   0x062DD8DC, "GetShotSpreadMM → 0.0 (no spread)",     {ARM64_FMOV_S0_0, ARM64_RET}},
+    {"_Z20Filter00SetAddSpreadhihhhhhfffj",          0x05F3B724, "Filter00SetAddSpread → ret",            {ARM64_RET}},
+}
+local recoilOrig = {}
+
+local function applyRecoilPatches()
+    for _, p in ipairs(RECOIL_PATCHES) do
+        pcall(function()
+            local addr = Resolve(p[1], p[2])
+            if not addr or IsNull(addr) then Log(TAG .. ": [WARN] " .. p[3] .. " not resolved"); return end
+            local words = p[4]
+            recoilOrig[p[1]] = recoilOrig[p[1]] or { ReadU32(addr), ReadU32(Offset(addr, 4)) }
+            for i, w in ipairs(words) do WriteU32(Offset(addr, (i - 1) * 4), w) end
+            patchCount = patchCount + 1
+            p.addr = addr
+            Log(TAG .. ": PATCHED " .. p[3] .. " @ " .. ToHex(addr))
+        end)
     end
-end, nil, "pf")
-if ok then
-    hookCount = hookCount + 1
-    Log(TAG .. ": Hooked UpdateRecoil (BLOCK when enabled)")
-else
-    Log(TAG .. ": UpdateRecoil hook skipped (symbol not found or install failed)")
 end
 
--- GetShotSpreadMM(self) — return 0.0 spread via post-hook
--- sig: "fp" = float return, self(ptr/X0)
-ok = RegisterNativeHook("GetShotSpreadMM", nil, function(ret_d0, self)
-    if state.enabled then
-        V("Native GetShotSpreadMM -> 0.0")
-        return 0.0
+local function restoreRecoilPatches()
+    for _, p in ipairs(RECOIL_PATCHES) do
+        local o = recoilOrig[p[1]]
+        if p.addr and o then pcall(function() WriteU32(p.addr, o[1]); WriteU32(Offset(p.addr, 4), o[2]) end) end
     end
-end, "fp")
-if ok then
-    hookCount = hookCount + 1
-    Log(TAG .. ": Hooked GetShotSpreadMM (force 0.0 spread when enabled)")
-else
-    Log(TAG .. ": GetShotSpreadMM hook skipped (symbol not found or install failed)")
 end
 
--- Filter00SetAddSpread(self, spread) — block spread addition
--- sig: "pf" = self(ptr/X0), spread(float/D0)
-ok = RegisterNativeHook("Filter00SetAddSpread", function(self, spread)
-    if state.enabled then
-        V("Native Filter00SetAddSpread BLOCK")
-        return "BLOCK"
-    end
-end, nil, "pf")
-if ok then
-    hookCount = hookCount + 1
-    Log(TAG .. ": Hooked Filter00SetAddSpread (BLOCK when enabled)")
-else
-    Log(TAG .. ": Filter00SetAddSpread hook skipped (symbol not found or install failed)")
-end
-
-Log(TAG .. ": " .. hookCount .. "/3 native hooks installed")
+if state.enabled then applyRecoilPatches() end
+Log(TAG .. ": " .. patchCount .. "/3 byte patches applied")
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- COMMAND
@@ -88,6 +86,7 @@ Log(TAG .. ": " .. hookCount .. "/3 native hooks installed")
 RegisterCommand("norecoil", function()
     state.enabled = not state.enabled
     V("toggle: enabled=%s", tostring(state.enabled))
+    if state.enabled then applyRecoilPatches() else restoreRecoilPatches() end
     ModConfig.Save("NoRecoil", state)
     Log(TAG .. ": " .. (state.enabled and "ON" or "OFF"))
     Notify(TAG, state.enabled and "ON" or "OFF")
@@ -100,7 +99,11 @@ end)
 if SharedAPI and SharedAPI.DebugMenu then
     SharedAPI.DebugMenu.RegisterToggle("NoRecoil", "No Recoil",
         function() return state.enabled end,
-        function(v) state.enabled = v; ModConfig.Save("NoRecoil", state) end)
+        function(v)
+            state.enabled = v
+            if v then applyRecoilPatches() else restoreRecoilPatches() end
+            ModConfig.Save("NoRecoil", state)
+        end)
 end
 
-Log(TAG .. ": v2.1 loaded — IsRecoiling hook removed; recoil/spread native hooks active")
+Log(TAG .. ": v3.0 loaded — byte-patches (UpdateRecoil/GetShotSpreadMM/Filter00SetAddSpread), all weapons")

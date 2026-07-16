@@ -11,7 +11,7 @@
 --   Native hooks on cEmWrap::setHp for death trigger
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "BossFixes"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local function isDefaultObject(obj)
@@ -56,8 +56,8 @@ local OFF_EM_TYPE    = 0x119
 local OFF_HP         = 0x3F0
 
 -- ── Function addresses ─────────────────────────────────────────────────
-local sym_EmSetDie    = Resolve("EmSetDie",    0x062EA2AC)
-local sym_EmSetDieCnt = Resolve("EmSetDieCnt", 0x062EA310)
+local sym_EmSetDie    = Resolve("EmSetDie",    0x05EEA2AC)
+local sym_EmSetDieCnt = Resolve("EmSetDieCnt", 0x05EEA310)
 
 -- ── Statistics ──────────────────────────────────────────────────────────
 local bossKills = {}

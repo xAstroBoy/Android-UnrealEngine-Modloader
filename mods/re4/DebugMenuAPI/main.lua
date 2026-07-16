@@ -86,6 +86,7 @@ local initialised    = false
 local _build_page    = nil
 local _refreshing    = false
 local _submenu_name  = nil
+local _building      = false   -- true while an explicit build runs → NewMenu PostHook stands down
 local RegisterBridgeCommand = rawget(_G, "RegisterBridgeCommand")
 
 -- Root page — always exists, items are persistent (static)
@@ -112,7 +113,7 @@ local function Err(msg)
 end
 
 local TAG = "[DebugMenuAPI]"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then print(TAG .. " [V] " .. string.format(...)) end end
 
 local function isDefaultObject(obj)
@@ -207,15 +208,23 @@ end
 -- VIEWPORT HELPERS
 -- ═══════════════════════════════════════════════════════════════════════
 
---- Ensure the WidgetComponent's render target is large enough.
---- The PAK mod increases SizeBox_90 HeightOverride from 1200 to 2000,
---- and bDrawAtDesiredSize causes the render target to auto-adjust.
---- This function forces a redraw after dynamic content changes.
+--- Ensure the WidgetComponent's render surface fits the (taller) mod list so
+--- the bottom buttons aren't clipped "outside their place". We do this fully at
+--- runtime (no PAK dependency): bDrawAtDesiredSize lets the render target grow
+--- to the widget's desired size, and we raise the SizeBox height cap that the
+--- list lives inside (default 1200 clips ~16 rows; the mod list needs more).
+-- The WidgetComponent render target defaults to a small 500x500 (rows clip off
+-- the bottom). The SizeBox_* names the old code tried don't exist on this build,
+-- so we grow the render target directly. Keep it SQUARE (1:1, same aspect as the
+-- 500x500 default) to avoid the horizontal squ/stretch a non-square DrawSize causes.
+local MENU_DRAW = { X = 2000, Y = 2000 }
 local function ensure_viewport(dm)
     pcall(function()
         local widget_comp = dm:Get("Widget")
         if widget_comp and widget_comp:IsValid() then
-            widget_comp:Call("RequestRedraw")
+            pcall(function() widget_comp:Set("bDrawAtDesiredSize", false) end)
+            pcall(function() widget_comp:Call("SetDrawSize", MENU_DRAW) end)
+            pcall(function() widget_comp:Call("RequestRedraw") end)
         end
     end)
 end
@@ -376,57 +385,62 @@ local function build_page(dm, page)
     ensure_viewport(dm)
 end
 
---- Soft-refresh: clear and re-render the current custom page without
---- navigating away.  Preserves the selection cursor.
+--- Idempotent build of a custom page.
+---
+--- CRITICAL (from decompiled DebugMenu.cpp): ClearWidgets() does NOT empty the
+--- ActiveOptionsWidgets array — it only RemoveFromParent()'s each widget, so the
+--- array keeps growing (that was the 42-widget / double-"Back" / off-by-one bug).
+--- The ONLY reliable reset is NewMenu(byte), which synchronously leaves exactly
+--- [Back]. So we never ClearWidgets-to-reset: we reach a clean [Back] via NewMenu,
+--- then APPEND items with build_page. Guarded on widget count so it never doubles.
+local function rebuild_custom_page(dm, page_byte)
+    local page = pages[page_byte]
+    if not page then return end
+
+    local wc = get_widget_count(get_widgets(dm))
+
+    -- Static page already built correctly → just refresh the highlight. Dynamic
+    -- pages (populate_fn) MUST always re-run populate — their item list is empty
+    -- until build_page runs it — so never take this count shortcut for them.
+    if not page.populate_fn then
+        local target = #page.items + 1      -- Back + items
+        if wc == target and wc > 1 then
+            pcall(function() dm:Call("UpdateOptionHighlight") end)
+            return
+        end
+    end
+
+    _building = true
+    -- Reach a clean [Back]. NewMenu is the only thing that empties the array.
+    -- If we're already at exactly [Back] (wc==1, e.g. right after our own NewMenu),
+    -- skip the reset so we don't re-navigate needlessly.
+    if wc ~= 1 then
+        pcall(function() dm:Call("NewMenu", page_byte) end)
+    end
+
+    build_page(dm, page)                    -- append items onto [Back]
+    pcall(function() dm:Set("CurrentIndex", 0) end)         -- Back highlighted red
+    pcall(function() dm:Call("UpdateOptionHighlight") end)
+    _building = false
+end
+
+--- Soft-refresh preserving the cursor (used by api.Refresh). Same reset rule:
+--- go through NewMenu (never ClearWidgets), then restore the cursor.
 local function refresh_page(dm, page_byte, cursor)
     if _refreshing then return end
     _refreshing = true
-    V("refresh_page: byte=%d, cursor=%s", page_byte, tostring(cursor))
 
     local page = pages[page_byte]
     if not page then _refreshing = false; return end
 
-    -- Wipe widgets (including the auto-added "Back")
-    V("refresh_page: ClearWidgets")
-    pcall(function() dm:Call("ClearWidgets") end)
-
-    -- Re-add "Back" at index 0 (Blueprint recognises it by name)
-    pcall(function() dm:Call("CreateActiveOption", "Back") end)
-
-    -- Rebuild + render items
-    build_page(dm, page)
-
-    -- Restore cursor
+    _building = true
+    pcall(function() dm:Call("NewMenu", page_byte) end)     -- reset to [Back]
+    build_page(dm, page)                                   -- append items
     pcall(function() dm:Set("CurrentIndex", cursor or 0) end)
     pcall(function() dm:Call("UpdateOptionHighlight") end)
-
-    -- Force render target update
-    ensure_viewport(dm)
+    _building = false
 
     _refreshing = false
-end
-
---- Full rebuild of a custom page from scratch.
---- Used when Blueprint's internal NewMenu call didn't trigger our PostHook
---- (e.g. PreviousMenu back-navigation to a custom page).
-local function rebuild_custom_page(dm, page_byte)
-    V("rebuild_custom_page: byte=%d", page_byte)
-    local page = pages[page_byte]
-    if not page then V("rebuild_custom_page: no page for byte %d", page_byte); return end
-
-    -- Wipe whatever Blueprint left (might be empty or just "Back")
-    V("rebuild_custom_page: ClearWidgets")
-    pcall(function() dm:Call("ClearWidgets") end)
-
-    -- Re-add "Back" at index 0 (Blueprint recognises it by name)
-    pcall(function() dm:Call("CreateActiveOption", "Back") end)
-
-    -- Build items + cosmetics
-    build_page(dm, page)
-
-    -- Reset cursor to "Back" and update highlight
-    pcall(function() dm:Set("CurrentIndex", 0) end)
-    pcall(function() dm:Call("UpdateOptionHighlight") end)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -553,22 +567,25 @@ local function setup_hooks()
     -- │ do NOT trigger this hook.                                      │
     -- │ We APPEND our items after Blueprint has finished its work.      │
     -- └─────────────────────────────────────────────────────────────────┘
+    -- NOTE: this hook is unreliable (dm:Call("NewMenu") doesn't consistently route
+    -- NewMenu through ProcessEvent, and internal NewMenu calls never do), so it is
+    -- NOT our builder. We build every custom page explicitly (rebuild_custom_page)
+    -- at each entry point. We keep the hook only as a guarded safety net: build ONLY
+    -- if NewMenu left a fresh [Back] (wc==1) and nothing has built yet — that way it
+    -- can never double the widgets against an explicit build.
     RegisterPostHook(DM_PATH .. ":NewMenu", function(self, func, parms)
-        V("PostHook NewMenu fired")
+        if _building then return end   -- an explicit build owns this transition
         pcall(function()
             local dm = get_dm()
-            if not dm then V("PostHook NewMenu: get_dm() returned nil"); return end
-
+            if not dm then return end
             local am = get_active_menu(dm)
-            V("PostHook NewMenu: AM=%s, is_custom=%s", tostring(am), tostring(am and pages[am] ~= nil))
             if not am or not pages[am] then return end
-
-            local page = pages[am]
-            build_page(dm, page)
-
-            Log("Page " .. am .. " (" .. (page.name or "?") .. ") — "
-                .. #page.items .. " items"
-                .. (page.populate_fn and " [dynamic]" or ""))
+            local wc = get_widget_count(get_widgets(dm))
+            if wc == 1 then
+                build_page(dm, pages[am])
+                pcall(function() dm:Set("CurrentIndex", 0) end)
+                pcall(function() dm:Call("UpdateOptionHighlight") end)
+            end
         end)
     end)
 
@@ -648,9 +665,13 @@ local function setup_hooks()
                 V("BndEvt Confirm: Main page, selected=%s", tostring(opt))
                 if opt == "Mods" then
                     Log("'Mods' selected on Main → page " .. MODS_ROOT_BYTE)
-                    ExecuteAsync(function()
-                        pcall(function() dm:Call("NewMenu", MODS_ROOT_BYTE) end)
-                    end)
+                    -- NewMenu resets the option array synchronously to exactly [Back]
+                    -- and sets ActiveMenu, so we can build immediately — no ExecuteAsync,
+                    -- no timed retries, no PostHook dependency. rebuild_custom_page is
+                    -- idempotent: if the (unreliable) NewMenu PostHook already built, it
+                    -- no-ops; otherwise it appends the items onto [Back].
+                    pcall(function() dm:Call("NewMenu", MODS_ROOT_BYTE) end)
+                    rebuild_custom_page(dm, MODS_ROOT_BYTE)
                 end
                 return
             end
@@ -663,12 +684,20 @@ local function setup_hooks()
                     -- Normal item confirm → dispatch action
                     dispatch_item(dm, am)
                 else
-                    V("BndEvt Confirm: ci=0 on custom page, rebuilding")
-                    -- ci=0: user confirmed "Back" and Blueprint navigated
-                    -- us to this custom page via PreviousMenu → NewMenu.
-                    -- Since NewMenu was called internally (no ProcessEvent),
-                    -- our PostHook didn't fire. Rebuild the page now.
-                    rebuild_custom_page(dm, am)
+                    -- ci==0 on a custom page has two causes, told apart by widget count:
+                    --  (a) We just ARRIVED here via native Back from a sub-page — the
+                    --      engine's internal NewMenu left only [Back] (wc<=1), so this
+                    --      page needs (re)building (otherwise it looks empty).
+                    --  (b) The user confirmed the "Back" option and native Back did NOT
+                    --      navigate away (page still fully built, wc>1) → go back ourselves.
+                    local wc = get_widget_count(get_widgets(dm))
+                    if wc <= 1 then
+                        V("BndEvt Confirm: arrived on custom page %d via Back → rebuild", am)
+                        rebuild_custom_page(dm, am)
+                    else
+                        V("BndEvt Confirm: ci=0 (Back) on built page %d → PreviousMenu", am)
+                        pcall(function() dm:Call("PreviousMenu") end)
+                    end
                 end
             end
         end)
@@ -725,6 +754,17 @@ local function setup_shared_api()
     local api = {}
     api.VERSION = VERSION
 
+    -- De-duplicate: a mod that re-registers (hot-reload) should REPLACE its
+    -- prior entry, not stack a duplicate onto the Mods page.
+    local function add_root_item(item)
+        local list = pages[MODS_ROOT_BYTE].items
+        for i = #list, 1, -1 do
+            if list[i].mod == item.mod and list[i].name == item.name then table.remove(list, i) end
+        end
+        table.insert(list, item)
+        return item
+    end
+
     -- ── Simple API ──────────────────────────────────────────────────
 
     --- Register a boolean toggle on the root Mods page.
@@ -741,7 +781,7 @@ local function setup_shared_api()
             getter = getter,   -- fn() → bool
             setter = setter,   -- fn(bool)
         }
-        table.insert(pages[MODS_ROOT_BYTE].items, item)
+        add_root_item(item)
         Log("  + toggle  [" .. mod_name .. "] " .. name)
         return item
     end
@@ -758,7 +798,7 @@ local function setup_shared_api()
             type     = "action",
             callback = callback,
         }
-        table.insert(pages[MODS_ROOT_BYTE].items, item)
+        add_root_item(item)
         Log("  + action  [" .. mod_name .. "] " .. name)
         return item
     end
@@ -778,7 +818,7 @@ local function setup_shared_api()
             sel_index = 0,
             callback  = callback,
         }
-        table.insert(pages[MODS_ROOT_BYTE].items, item)
+        add_root_item(item)
         Log("  + select  [" .. mod_name .. "] " .. name)
         return item
     end
@@ -798,7 +838,7 @@ local function setup_shared_api()
             type     = "submenu",
             callback = onEnter,
         }
-        table.insert(pages[MODS_ROOT_BYTE].items, item)
+        add_root_item(item)
         Log("  + submenu [" .. mod_name .. "] " .. name)
         return item
     end
@@ -825,9 +865,12 @@ local function setup_shared_api()
 
         local dm = get_dm()
         if dm then
-            ExecuteAsync(function()
-                pcall(function() dm:Call("NewMenu", byte) end)
-            end)
+            -- Synchronous: NewMenu resets the array to [Back]; rebuild_custom_page then
+            -- runs populate_fn and appends the items. The old ExecuteAsync + timed-retry
+            -- path mis-guarded on the PRE-populate item count (0) → the sub-page never
+            -- built → "sub-pages are empty".
+            pcall(function() dm:Call("NewMenu", byte) end)
+            rebuild_custom_page(dm, byte)
         end
     end
 
@@ -937,9 +980,8 @@ local function setup_shared_api()
             callback = function()
                 local dm = get_dm()
                 if dm then
-                    ExecuteAsync(function()
-                        pcall(function() dm:Call("NewMenu", byte) end)
-                    end)
+                    pcall(function() dm:Call("NewMenu", byte) end)
+                    rebuild_custom_page(dm, byte)
                 end
             end,
         })

@@ -1,167 +1,69 @@
--- mods/StackableItems/main.lua v3.3
+-- mods/re4/StackableItems/main.lua v4.0
 -- ═══════════════════════════════════════════════════════════════════════
--- UE4SS-enhanced Stackable Items — removes stack limits for all
--- non-weapon items (ammo, health, grenades, eggs, etc.)
+-- Stackable items — NATIVE single-instruction patch. NO per-call hook.
 --
--- v3.3 — Uses modloader IsNull() for null pointer detection.
---   C++ modloader safe-call guard protects against crashes in
---   original itemInfo when outInfo is NULL or dangling.
---   RegisterNativeHook on itemInfo for capacity override
---   FindAllOf("VR4ItemPickup") for item discovery
---   ModConfig for persistence
+-- v4.0 — THE LAG FIX. v3 hooked cItemMgr::itemInfo (the item-DB lookup) with a
+-- PRE + POST Lua callback to override each item's maxCapacity field. itemInfo is
+-- a HOT function (HUD/inventory query it constantly), so that per-call Lua
+-- dispatch ×2 was the frame-rate killer the player traced to this mod.
 --
--- ITEM_INFO struct at return:
---   +0x0  uint16_t  unknown
---   +0x2  uint8_t   type (1=weapon, 2=ammo, 3=healing, 5=egg, 8=grenade, 9=treasure)
---   +0x3  uint8_t   defaultBatchCount
---   +0x4  uint16_t  maxCapacity ← WE OVERRIDE THIS
+-- v4 drops the hook entirely and patches the ONE place the cap is actually READ
+-- and enforced. In cItemMgr::combine, a stacked item's count is clamped to its
+-- maxCapacity:
+--     0x5F61BB0  LDRH W8,[SP,#4]   ; W8 = itemInfo.maxCapacity
+--                SUBS W9,W8,W10     ; space = max - current
+--                ... STRH W8,[X21,#2]  ; clamp count to max
+-- Overwriting that load with `MOV W8,#<max>` makes the clamp use <max> for every
+-- non-weapon stack (ammo/health) with ZERO per-frame cost. Verified live: the
+-- original bytes are 0x79400BE8 (LDRH W8,[SP,#4]).
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "StackableItems"
-local VERBOSE = true
-local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
-local function isDefaultObject(obj)
-    if not obj then return false end
-    local ok, name = pcall(function() return obj:GetName() end)
-    return ok and type(name) == "string" and name:sub(1, 9) == "Default__"
-end
+local RVA  = 0x5F61BB0        -- cItemMgr::combine: the maxCapacity load / clamp
+local ORIG = 0x79400BE8       -- LDRH W8,[SP,#4]
+local function movw8(imm) return 0x52800000 | ((imm & 0xFFFF) << 5) | 8 end   -- MOVZ W8,#imm
 
-local function findFirstNonDefault(className)
-    local first = nil
-    pcall(function() first = FindFirstOf(className) end)
-    if first and first:IsValid() and not isDefaultObject(first) then
-        return first
-    end
-    local all = nil
-    pcall(function() all = FindAllOf(className) end)
-    if all then
-        for _, obj in ipairs(all) do
-            if obj and obj:IsValid() and not isDefaultObject(obj) then
-                return obj
-            end
-        end
-    end
-    return nil
-end
-
-local state = {
-    enabled = true,
-    maxStack = 9999,
-    overrideCount = 0,
-    uniqueItems = {},
-}
-
+local state = { enabled = true, maxStack = 999 }
 local saved = ModConfig.Load("StackableItems")
 if saved then
-    if saved.enabled ~= nil then state.enabled = saved.enabled end
-    if saved.maxStack then state.maxStack = saved.maxStack end
+  if saved.enabled ~= nil then state.enabled = saved.enabled end
+  if saved.maxStack then state.maxStack = saved.maxStack end
 end
 
--- ═══════════════════════════════════════════════════════════════════════
--- NATIVE HOOK — itemInfo post-hook: override maxCapacity
--- NOTE: C++ safe-call guard protects original from null/dangling crashes
--- ═══════════════════════════════════════════════════════════════════════
-local sym_itemInfo = Resolve("itemInfo", 0x0635F714)
+local function apply()
+  pcall(function() WriteU32(Offset(GetLibBase(), RVA), movw8(state.maxStack)) end)
+  Log(TAG .. ": ON — combine stack-cap clamp -> " .. state.maxStack .. " (native, no hook, no lag)")
+end
+local function restore()
+  pcall(function() WriteU32(Offset(GetLibBase(), RVA), ORIG) end)
+  Log(TAG .. ": OFF — stack cap restored")
+end
 
--- Dobby hook for capacity override (post-hook reads filled ITEM_INFO)
-pcall(function()
-    RegisterNativeHook("itemInfo",
-        function(itemId, outInfoPtr)
-            V("itemInfo pre-hook itemId=0x%X outInfoPtr=%s", itemId, tostring(outInfoPtr))
-            -- BLOCK if outInfo is null — prevent write to NULL
-            if IsNull(outInfoPtr) then
-                return "BLOCK"
-            end
-            return itemId, outInfoPtr
-        end,
-        function(retval, itemId, outInfoPtr)
-            V("itemInfo post-hook itemId=0x%X", itemId)
-            if not state.enabled then return retval end
-            if IsNull(outInfoPtr) then return retval end
-
-            pcall(function()
-                local itemType = ReadU8(Offset(outInfoPtr, 2))
-                local maxCap = ReadU16(Offset(outInfoPtr, 4))
-
-                -- Skip weapons (type 1) and invalid types (type 0)
-                if itemType == 0 or itemType == 1 then return end
-
-                -- Skip items with max <= 1 (key items, single-count)
-                if maxCap <= 1 then return end
-
-                -- Skip if already at our target
-                if maxCap >= state.maxStack then return end
-
-                -- Override max capacity
-                WriteU16(Offset(outInfoPtr, 4), state.maxStack)
-                V("Patched itemId=0x%X type=%d oldMax=%d → %d", itemId & 0xFFFF, itemType, maxCap, state.maxStack)
-
-                -- Track unique items overridden
-                local id = itemId & 0xFFFF
-                if not state.uniqueItems[id] then
-                    state.uniqueItems[id] = true
-                    state.overrideCount = state.overrideCount + 1
-                    Log(TAG .. ": Unlocked stack: itemId=0x"
-                        .. string.format("%X", id)
-                        .. " type=" .. itemType
-                        .. " oldMax=" .. maxCap
-                        .. " → " .. state.maxStack)
-                end
-            end)
-
-            return retval
-        end)
-    Log(TAG .. ": RegisterNativeHook — itemInfo (Dobby, capacity override)")
-end)
-
--- ═══════════════════════════════════════════════════════════════════════
--- COMMANDS
--- ═══════════════════════════════════════════════════════════════════════
+if state.enabled then apply() end
 
 RegisterCommand("stackable", function()
-    V("stackable command — toggling enabled from %s", tostring(state.enabled))
-    state.enabled = not state.enabled
-    ModConfig.Save("StackableItems", state)
-    Log(TAG .. ": " .. (state.enabled and "ON" or "OFF"))
-    Notify(TAG, state.enabled and "ON" or "OFF")
+  state.enabled = not state.enabled
+  if state.enabled then apply() else restore() end
+  ModConfig.Save("StackableItems", state)
+  Notify(TAG, state.enabled and "Stackable ON" or "Stackable OFF")
+  return state.enabled and "ON" or "OFF"
 end)
 
 RegisterCommand("stackable_max", function(args)
-    V("stackable_max command args=%s", tostring(args))
-    local n = tonumber(args)
-    if n and n >= 1 and n <= 99999 then
-        state.maxStack = n
-        ModConfig.Save("StackableItems", state)
-        Log(TAG .. ": Max stack → " .. n)
-        Notify(TAG, "Max: " .. n)
-    else
-        Log(TAG .. ": Usage: stackable_max <1-99999> (current: " .. state.maxStack .. ")")
-    end
-end)
-
-RegisterCommand("stackable_status", function()
-    local info = TAG .. ": enabled=" .. tostring(state.enabled)
-        .. " maxStack=" .. state.maxStack
-        .. " uniqueItems=" .. state.overrideCount
-
-    -- Check inventory via UE4SS
-    local attachCase = findFirstNonDefault("AttacheCase")
-    if attachCase and attachCase:IsValid() then
-        pcall(function()
-            local items = attachCase:GetItems()
-            if items then info = info .. " | caseItems=" .. tostring(#items) end
-        end)
-    end
-
-    Log(info)
+  local n = tonumber(args)
+  if n and n >= 1 and n <= 65535 then
+    state.maxStack = n
+    if state.enabled then apply() end
+    ModConfig.Save("StackableItems", state)
+    return "max stack = " .. n
+  end
+  return "usage: stackable_max <1-65535> (current " .. state.maxStack .. ")"
 end)
 
 if SharedAPI and SharedAPI.DebugMenu then
-    SharedAPI.DebugMenu.RegisterToggle("StackableItems", "Stackable Items",
-        function() return state.enabled end,
-        function(v) state.enabled = v; ModConfig.Save("StackableItems", state) end)
+  SharedAPI.DebugMenu.RegisterToggle("StackableItems", "Stackable Items",
+    function() return state.enabled end,
+    function(v) state.enabled = v; if v then apply() else restore() end; ModConfig.Save("StackableItems", state) end)
 end
 
-Log(TAG .. ": v3.3 loaded — null-safe ToHex | maxStack=" .. state.maxStack
-    .. " | Weapons (type 1) + key items (max<=1) untouched"
-    .. " | UE4SS RegisterNativeHook + FindFirstOf")
+Log(TAG .. ": v4.0 loaded — NATIVE combine stack-cap patch (no itemInfo hook, no lag) | max=" .. state.maxStack)

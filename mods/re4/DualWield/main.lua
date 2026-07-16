@@ -1,222 +1,124 @@
--- mods/DualWield/main.lua v6.0
+-- mods/DualWield/main.lua v8.0
 -- =====================================================================
--- Dual Wield -- Grab the same weapon in both hands.
+-- Dual Wield — hold a gun in BOTH hands.
 --
--- v6.0 -- Complete rewrite: Uses EnableDualWielding game setting + PostHooks.
---   1. VR4GamePlayerSettings.EnableDualWielding = true (game's built-in setting!)
---   2. PostHook IsPresentOnBody -> true (allows grabbing duplicate from holster)
---   3. PostHook IsPropGrabbable -> true (ensures all holster props stay grabbable)
---   Removed: Broken native hooks (CanGrab/IsGrabAllowed/IsPropGrabbable resolve failures)
---   The game has a NATIVE EnableDualWielding bool in VR4GamePlayerSettings.
---   We just need to flip it on via the settings function library.
+-- v8.0 — ALL-NATIVE rewrite (fixes the crash/hang from v6-7).
+--   The old version mixed byte-patches with (a) per-call Lua PostHooks on
+--   IsPresentOnBody / IsPropGrabbable — HOT functions polled during weapon
+--   interaction, so the Lua callback fired constantly and could stall the
+--   game thread into an ANR/kill — and (b) reflection Set()/Call() of the
+--   VR4GamePlayerSettings STRUCT (SetGamePlayerSettings / pawn:Set), a
+--   fragile struct-marshalling path. Neither is needed: every dual-wield
+--   gate is a single native check we can flip with a byte-patch. So v8 is
+--   PURE byte-patch — no runtime Lua, no reflection — which is both safer
+--   and faster. Verified against libUE4.so (UE4.27) in IDA:
+--
+--   [1] AVR4GamePlayerGun::PrimaryGripGrabbed+0x30
+--         ldrb w8,[x0,#0x30]   (EnableDualWielding byte) → mov w8,#1
+--       → grabbing a gun never force-holsters the other. Also makes the
+--         EnableDualWielding check pass everywhere, so we DON'T need to
+--         write the setting.
+--   [2] AVR4GamePlayerPropHolster::HolsterGripGrabAttempted+0x13C
+--         ldr w8,[x8,#0x334]   (per-hand "occupied" flag) → mov w8,#0
+--       → the holster stops refusing a 2nd gun while a hand is full.
+--   [3] AVR4GamePlayerPropHolster::execIsPropGrabbable+0x10
+--         ldrb w8,[x0,#0x3F6]  (grabbable member byte) → mov w8,#1
+--       → holster props always report grabbable (ProcessEvent path only —
+--         the FFrame advance above it is preserved).
+--   [4] AVR4GamePlayerProp::execIsPresentOnBody+0x2C
+--         and w8,w0,#1  (result of the virtual) → mov w8,#1
+--       → IsPresentOnBody returns true on the ProcessEvent path only, so a
+--         duplicate can be pulled from the holster. The hot C++ virtual is
+--         left untouched (patching the impl would force ALL props present).
 -- =====================================================================
 local TAG = "DualWield"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
-local function isDefaultObject(obj)
-    if not obj then return false end
-    local ok, name = pcall(function() return obj:GetName() end)
-    return ok and type(name) == "string" and name:sub(1, 9) == "Default__"
-end
-
-local function findFirstNonDefault(className)
-    local first = nil
-    pcall(function() first = FindFirstOf(className) end)
-    if first and first:IsValid() and not isDefaultObject(first) then
-        return first
-    end
-    local all = nil
-    pcall(function() all = FindAllOf(className) end)
-    if all then
-        for _, obj in ipairs(all) do
-            if obj and obj:IsValid() and not isDefaultObject(obj) then
-                return obj
-            end
-        end
-    end
-    return nil
-end
-
-local state = {
-    enabled = true,
-}
+local state = { enabled = true }
 
 local saved = ModConfig.Load("DualWield")
-if saved then
-    if saved.enabled ~= nil then state.enabled = saved.enabled end
+if saved and saved.enabled ~= nil then state.enabled = saved.enabled end
+
+local ARM64_MOV_W8_1 = 0x52800028   -- mov w8, #1
+local ARM64_MOV_W8_0 = 0x52800008   -- mov w8, #0
+
+-- All four gates, each a single verified instruction. insn_off is the byte
+-- offset of the instruction to overwrite from the function start.
+local DW_PATCHES = {
+    { name = "PrimaryGripGrabbed (no auto-holster)",
+      mangled = "_ZN17AVR4GamePlayerGun18PrimaryGripGrabbedEP18AVR4GamePlayerHand",
+      fb = 0x062DF8DC, insn_off = 0x30, word = ARM64_MOV_W8_1 },
+    { name = "HolsterGripGrabAttempted (allow 2nd gun)",
+      mangled = "_ZN25AVR4GamePlayerPropHolster24HolsterGripGrabAttemptedEP18UVR4GamePlayerGripP18AVR4GamePlayerHandR31EVR4GamePlayerGripTryGrabResult",
+      fb = 0x0631287C, insn_off = 0x13C, word = ARM64_MOV_W8_0 },
+    { name = "IsPropGrabbable exec (holster grabbable)",
+      mangled = "_ZN25AVR4GamePlayerPropHolster19execIsPropGrabbableEP7UObjectR6FFramePv",
+      fb = 0x064915DC, insn_off = 0x10, word = ARM64_MOV_W8_1 },
+    { name = "IsPresentOnBody exec (present on body)",
+      mangled = "_ZN18AVR4GamePlayerProp19execIsPresentOnBodyEP7UObjectR6FFramePv",
+      fb = 0x0648F9D4, insn_off = 0x2C, word = ARM64_MOV_W8_1 },
+    -- [5] UVR4GamePlayerGrip::IsExternallyAllowed+0x24
+    --       ldrsw x8,[x0,#0x2F0]  (grab-vote allower count) → mov w8,#0
+    --     → the per-grip "external allower" vote is skipped (count forced 0 =
+    --       "allowed"). THIS is the gate that actually blocked pulling a 2nd
+    --       gun from a holster while already holding one — verified live: with
+    --       it, holding a 2-handed + a 1-handed gun works. IsFreeToGrab calls
+    --       this inside the hand's grip-selection, so the holster grab-icon
+    --       inflates for the 2nd gun even with a weapon in hand.
+    { name = "IsExternallyAllowed (grab-vote bypass, enables 2nd-gun grab)",
+      mangled = "_ZNK18UVR4GamePlayerGrip19IsExternallyAllowedE11EHandedness",
+      fb = 0x062CE5D8, insn_off = 0x24, word = ARM64_MOV_W8_0 },
+}
+
+local patchesApplied = false
+
+local function applyDualWieldPatch()
+    for _, p in ipairs(DW_PATCHES) do
+        pcall(function()
+            local sym = Resolve(p.mangled, p.fb)
+            if not sym or IsNull(sym) then Log(TAG .. ": [WARN] " .. p.name .. " not resolved"); return end
+            p.addr = Offset(sym, p.insn_off)
+            if not p.orig then p.orig = ReadU32(p.addr) end
+            WriteU32(p.addr, p.word)
+            Log(TAG .. ": PATCHED " .. p.name .. " @ " .. ToHex(p.addr))
+        end)
+    end
+    patchesApplied = true
 end
 
--- =====================================================================
--- CORE: Apply EnableDualWielding via VR4GamePlayerSettingsFunctionLibrary
--- The game natively supports dual wielding -- it's just a settings toggle!
--- VR4GamePlayerSettings struct (0xB8 bytes), EnableDualWielding @ offset 0x0030
--- =====================================================================
-
-local settingApplied = false
-
-local function applyDualWieldSetting(enable)
-    -- Method 1: Via function library CDO (static functions)
-    local ok1 = pcall(function()
-        local lib = GetCDO("VR4GamePlayerSettingsFunctionLibrary")
-        if not lib then
-            V("CDO VR4GamePlayerSettingsFunctionLibrary not found")
-            return
-        end
-        local settings = lib:Call("GetGamePlayerSettings")
-        if not settings then
-            V("GetGamePlayerSettings returned nil")
-            return
-        end
-        settings.EnableDualWielding = enable
-        lib:Call("SetGamePlayerSettings", settings)
-        settingApplied = true
-        V("SetGamePlayerSettings: EnableDualWielding=%s (CDO path)", tostring(enable))
-    end)
-
-    -- Method 2: Via pawn's player settings (runtime property)
-    local ok2 = pcall(function()
-        local pawn = findFirstNonDefault("VR4Bio4PlayerPawn")
-        if not pawn then pawn = findFirstNonDefault("VR4GamePlayerPawn") end
-        if not pawn then
-            V("No player pawn found")
-            return
-        end
-        -- Try to get settings via the pawn's Get method
-        local settingsObj = pawn:Get("PlayerSettings")
-        if settingsObj then
-            settingsObj.EnableDualWielding = enable
-            pawn:Set("PlayerSettings", settingsObj)
-            settingApplied = true
-            V("Pawn PlayerSettings.EnableDualWielding=%s", tostring(enable))
-        end
-    end)
-
-    -- Method 3: Via save game settings
-    local ok3 = pcall(function()
-        local sg = findFirstNonDefault("VR4Bio4SaveGame")
-        if not sg then
-            V("No save game found")
-            return
-        end
-        local settings = sg:Get("Settings")
-        if settings then
-            settings.EnableDualWielding = enable
-            sg:Set("Settings", settings)
-            V("SaveGame Settings.EnableDualWielding=%s", tostring(enable))
-        end
-    end)
-
-    return settingApplied
+local function restoreDualWieldPatch()
+    for _, p in ipairs(DW_PATCHES) do
+        if p.addr and p.orig then pcall(function() WriteU32(p.addr, p.orig) end) end
+    end
+    patchesApplied = false
+    Log(TAG .. ": dual-wield patches restored")
 end
 
--- =====================================================================
--- Apply setting immediately + delayed retry + periodic enforcement
--- =====================================================================
-
--- Try immediately
-if state.enabled then
-    applyDualWieldSetting(true)
-    if settingApplied then
-        Log(TAG .. ": EnableDualWielding=true set immediately")
-    else
-        Log(TAG .. ": Initial apply deferred (game not ready yet)")
-    end
-end
-
--- Delayed retry after 3 seconds (game objects need time to initialize)
-ExecuteWithDelay(3000, function()
-    if state.enabled and not settingApplied then
-        applyDualWieldSetting(true)
-        if settingApplied then
-            Log(TAG .. ": EnableDualWielding=true set (delayed 3s)")
-        else
-            Log(TAG .. ": [WARN] EnableDualWielding still not applied after 3s")
-        end
-    end
-end)
-
--- Do one later retry after content settles, but avoid perpetual background churn.
-local enforceCount = 0
-ExecuteWithDelay(15000, function()
-    if state.enabled then
-        pcall(function() applyDualWieldSetting(true) end)
-        enforceCount = enforceCount + 1
-        V("Late enforcement #%d: EnableDualWielding=true", enforceCount)
-    end
-end)
-
--- =====================================================================
--- POST-HOOKS: Override grab/present checks via ProcessEvent
--- These are BACKUP mechanisms in case the settings approach doesn't
--- fully enable dual wielding (some code paths might check these directly)
--- =====================================================================
-
-local hookCount = 0
-local postHookFires = 0
-
--- IsPresentOnBody -> true (weapon is "present on body" = can grab another copy)
--- Parms layout: {bool ReturnValue @ 0x0}
-pcall(function()
-    RegisterPostHook("/Script/Game.VR4GamePlayerProp:IsPresentOnBody", function(self, func, parms)
-        if not state.enabled then return end
-        pcall(function() WriteU8(parms, 1) end)  -- true = present on body
-        postHookFires = postHookFires + 1
-        if postHookFires <= 3 then
-            Log(TAG .. ": PostHook IsPresentOnBody -> true (fire #" .. postHookFires .. ")")
-        end
-    end)
-    hookCount = hookCount + 1
-    Log(TAG .. ": PostHook IsPresentOnBody -> true registered")
-end)
-
--- IsPropGrabbable -> true (all holster props stay grabbable even with duplicate)
--- Parms layout: {bool ReturnValue @ 0x0}
-pcall(function()
-    RegisterPostHook("/Script/Game.VR4GamePlayerPropHolster:IsPropGrabbable", function(self, func, parms)
-        if not state.enabled then return end
-        pcall(function() WriteU8(parms, 1) end)  -- true = grabbable
-    end)
-    hookCount = hookCount + 1
-    Log(TAG .. ": PostHook IsPropGrabbable -> true registered")
-end)
-
-Log(TAG .. ": " .. hookCount .. "/2 PostHooks registered")
+if state.enabled then applyDualWieldPatch() end
 
 -- =====================================================================
 -- COMMANDS
 -- =====================================================================
 
 RegisterCommand("dualwield", function()
-    V("dualwield command — toggling from %s", tostring(state.enabled))
     state.enabled = not state.enabled
-    if state.enabled then
-        applyDualWieldSetting(true)
-    else
-        applyDualWieldSetting(false)
-    end
+    if state.enabled then applyDualWieldPatch() else restoreDualWieldPatch() end
     ModConfig.Save("DualWield", state)
     Log(TAG .. ": " .. (state.enabled and "ON" or "OFF"))
-    Notify(TAG, state.enabled and "ON" or "OFF")
+    Notify(TAG, state.enabled and "Dual Wield ON" or "Dual Wield OFF")
     return state.enabled and "ON" or "OFF"
 end)
 
 RegisterCommand("dualwield_status", function()
-    local info = TAG .. ": enabled=" .. tostring(state.enabled) .. " applied=" .. tostring(settingApplied)
-    -- Check current setting value
-    pcall(function()
-        local lib = GetCDO("VR4GamePlayerSettingsFunctionLibrary")
-        if lib then
-            local settings = lib:Call("GetGamePlayerSettings")
-            if settings then
-                info = info .. " | EnableDualWielding=" .. tostring(settings.EnableDualWielding)
-            end
-        end
-    end)
-    -- Check active guns
+    local info = TAG .. ": enabled=" .. tostring(state.enabled)
+        .. " patchesApplied=" .. tostring(patchesApplied)
+    for _, p in ipairs(DW_PATCHES) do
+        info = info .. "\n  " .. p.name .. ": " .. (p.addr and ("@" .. ToHex(p.addr)) or "unresolved")
+    end
     pcall(function()
         local guns = FindAllOf("VR4GamePlayerGun")
-        if guns then info = info .. " | guns=" .. #guns end
+        if guns then info = info .. "\n  live guns=" .. #guns end
     end)
     Log(info)
     return info
@@ -226,17 +128,14 @@ end)
 -- DEBUG MENU
 -- =====================================================================
 if SharedAPI and SharedAPI.DebugMenu then
-    SharedAPI.DebugMenu.RegisterToggle("DualWield", "Dual Wield (Same Gun)",
+    SharedAPI.DebugMenu.RegisterToggle("DualWield", "Dual Wield (Two Guns)",
         function() return state.enabled end,
         function(v)
             state.enabled = v
-            if v then
-                applyDualWieldSetting(true)
-            else
-                applyDualWieldSetting(false)
-            end
+            if v then applyDualWieldPatch() else restoreDualWieldPatch() end
             ModConfig.Save("DualWield", state)
         end)
 end
 
-Log(TAG .. ": v6.0 loaded -- EnableDualWielding setting + " .. hookCount .. " PostHooks + DebugMenu")
+Log(TAG .. ": v8.0 loaded — 4 native byte-patches (no runtime Lua, no reflection)"
+    .. " | applied=" .. tostring(patchesApplied))
