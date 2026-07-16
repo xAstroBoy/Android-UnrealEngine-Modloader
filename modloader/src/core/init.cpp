@@ -509,20 +509,33 @@ namespace init
         logger::log_info("DEFER", "Deferred init complete — %zu classes (PAK mount via hooks)",
                          classes.size());
 
-        // ── Final signal handler re-install + periodic watchdog ─────────────
-        // Re-install one more time after all deferred work is done, then
-        // keep re-installing every 5 seconds for the first 60 seconds of
-        // runtime to ensure the Oculus VR runtime can't permanently replace us.
+        // ── Final signal handler re-install + PERMANENT watchdog ────────────
+        // The Oculus VR runtime (libvrapi.so) installs its own SIGSEGV handler
+        // and will happily do it long after boot, replacing ours. While ours is
+        // replaced, EVERY safe-call guard is silently a no-op: the sigsetjmp in
+        // dispatch_full is armed, but nothing ever siglongjmps back, so a fault
+        // inside a guarded original kills the process exactly as if unguarded.
+        //
+        // This loop used to run 12 x 5s and then STOP — 60 seconds of protection,
+        // and the thread exited. Every guard died at the 1:00 mark. That is how
+        // em32's guard was in the backtrace (thunk_3 -> dispatch_full) and the game
+        // still died on the very fault it exists to swallow (0x180), minutes in.
+        // The cModel::modelInit guard for the cut-NPC/police spawn had the same
+        // hole and nobody noticed, because you have to survive a minute to see it.
+        //
+        // So: run FOREVER. It is four sigaction() calls every 5s on a detached
+        // thread, and reinstall() is silent unless something actually replaced us.
+        // That cost is nothing next to a guard that only works for the first
+        // minute of play.
         crash_handler::reinstall();
-        for (int i = 0; i < 12; i++)
+        for (;;)
         {
             struct timespec ts = {5, 0};
             nanosleep(&ts, nullptr);
             crash_handler::reinstall();
         }
-        logger::log_info("DEFER", "Signal handler watchdog complete (60s of protection)");
 
-        return nullptr;
+        return nullptr;   // not reached — the watchdog is for the process lifetime
     }
 
     // ═══ Main boot sequence ═════════════════════════════════════════════════
