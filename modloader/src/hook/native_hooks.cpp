@@ -1323,6 +1323,32 @@ static const int      kJptIdx_id9   = 6;          // id 9 -> _prologEm09 (byte 0
 // id 0x10 = _prologEm10set already work — deliberately not touched.)
 static const uint8_t  kCutVillagerIds[] = { 0x06, 0x07, 0x08, 0x0A, 0x0B, 0x0D, 0x33, 0x37 };
 
+// Patch EXECUTABLE code (.text). Distinct from patch_ro on purpose: patch_ro
+// mprotects READ|WRITE, which DROPS PROT_EXEC — do that to a code page and the
+// next call into it kills the process. Code needs RWX and, on ARM64, an explicit
+// icache flush: the CPU can happily keep executing the stale instruction out of
+// the instruction cache after the data write lands.
+static bool patch_code(void* addr, const void* src, size_t n) {
+    if (!addr || !n) return false;
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = 4096;
+    uintptr_t a     = reinterpret_cast<uintptr_t>(addr);
+    uintptr_t first = a & ~(uintptr_t)(ps - 1);
+    uintptr_t last  = (a + n - 1) & ~(uintptr_t)(ps - 1);
+    size_t    len   = (size_t)(last - first + ps);
+    if (mprotect(reinterpret_cast<void*>(first), len,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        logger::log_error("PATCH", "mprotect RWX failed at %p", addr);
+        return false;
+    }
+    __builtin_memcpy(addr, src, n);
+    __builtin___clear_cache(reinterpret_cast<char*>(addr),
+                            reinterpret_cast<char*>(a + n));
+    // Leave it RX — never leave game code writable behind us.
+    mprotect(reinterpret_cast<void*>(first), len, PROT_READ | PROT_EXEC);
+    return true;
+}
+
 // Write through a possibly read-only page (.rodata / .data.rel.ro). Leaves it RW.
 static void patch_ro(void* addr, const void* src, size_t n) {
     if (!addr || !n) return;
@@ -1775,7 +1801,21 @@ bool is_dualfire_enabled() { return s_dualfire_on.load(std::memory_order_relaxed
 // cModel, so a NULL model is already harmless there. sub_5E49AA0 is the only
 // function that sources X0 from the model itself — hence the only one that can
 // fault. Two sites, four instruments, whole class of cut-content AI covered.
-static const uintptr_t kEm32InitRva = 0x5E49AA0;   // sub_5E49AA0 — em32's init
+static const uintptr_t kEm32InitRva    = 0x5E49AA0;   // sub_5E49AA0 — em32's init
+static const uintptr_t kEm32MovX2Zr    = 0x5E4A354;   // `MOV X2, XZR` on the NULL path
+static const uintptr_t kEm32Site2Setup = 0x5E4A36C;   // `LDR X2,[X25,#0xA88]` — site 2's setup
+static const uint32_t  kInsnMovX2Xzr   = 0xAA1F03E2;  // MOV X2, XZR (ORR X2,XZR,XZR)
+// +0x180 must land inside and point back at the buffer; +0x18 must read 0.
+alignas(16) static uint8_t g_em32_null_model[0x400];
+
+// Only fires on a pointer that is ALREADY guaranteed to fault one insn later.
+static void em32_sub_null_to_dummy(void* addr, DobbyRegisterContext* ctx) {
+    (void)addr;
+    if (ctx->general.x[2] == 0) {
+        ctx->general.x[2] = reinterpret_cast<uint64_t>(g_em32_null_model);
+        ctx->general.x[1] = 0;   // VR4CreateEmSubObject returns at its first `if (a2)`
+    }
+}
 static const uintptr_t kEm32Guard[][2] = {   // fingerprint only — NOT hook sites
     { 0x5E4A358, 0x5E4A364 },                // sub-object 1 (cEm+0xA80)
     { 0x5E4A374, 0x5E4A378 },                // sub-object 2 (cEm+0xA88) — observed crash
@@ -1816,37 +1856,73 @@ static bool em32_guard_is_ldr_x_imm(uint32_t w, int* rt, int* rn, uint32_t* off)
 bool install_em32_subobject_guard() {
     uintptr_t base = symbols::lib_base();
     if (!base) {
-        logger::log_error("EM32", "lib_base unavailable — sub-object guard skipped");
+        logger::log_error("EM32", "lib_base unavailable — guard skipped");
         return false;
     }
-    // Sanity-check that this really is em32's init before guarding it: the two
-    // unchecked `LDR Xd,[X2,#0x180]` loads are its fingerprint. If a game update
-    // moved the code, guard nothing rather than the wrong function.
-    int ok_sites = 0;
-    for (size_t i = 0; i < sizeof(kEm32Guard) / sizeof(kEm32Guard[0]); ++i) {
-        int rt, rn; uint32_t off;
-        uint32_t w = *reinterpret_cast<const uint32_t*>(base + kEm32Guard[i][0]);
-        if (em32_guard_is_ldr_x_imm(w, &rt, &rn, &off) && off == 0x180 && rn == 2)
-            ++ok_sites;
-    }
-    if (ok_sites != 2) {
-        logger::log_warn("EM32", "sub_5E49AA0 does not match the expected em32 init "
-                                 "(%d/2 `LDR Xd,[X2,#0x180]` sites) — guard skipped",
-                         ok_sites);
+    // Verify BOTH `LDR Xd,[X2,#0x180]` sites are where we think before touching
+    // anything. If a game update moved this code, do nothing.
+    int rt1, rn1, rt2, rn2; uint32_t off1, off2;
+    uint32_t w1 = *reinterpret_cast<const uint32_t*>(base + kEm32Guard[0][0]);
+    uint32_t w2 = *reinterpret_cast<const uint32_t*>(base + kEm32Guard[1][0]);
+    if (!em32_guard_is_ldr_x_imm(w1, &rt1, &rn1, &off1) || off1 != 0x180 || rn1 != 2 ||
+        !em32_guard_is_ldr_x_imm(w2, &rt2, &rn2, &off2) || off2 != 0x180 || rn2 != 2) {
+        logger::log_warn("EM32", "sub_5E49AA0 doesn't match the expected em32 init — guard skipped");
         return false;
+    }
+    *reinterpret_cast<void**>(g_em32_null_model + 0x180) = g_em32_null_model;
+
+    int done = 0;
+
+    // ── SITE 1 (cEm+0xA80): a ONE-INSTRUCTION byte patch ──────────────────
+    //   5e4a340  CBZ X8, loc_5E4A354      ; model is NULL ->
+    //   5e4a354  MOV X2, XZR              ; ...v50 = nullptr...
+    //   5e4a358  LDR X8, [X2,#0x180]      ; ...and deref it. fault 0x180.
+    // The NULL path is a dead end that only exists to crash, so branch straight
+    // over the whole call to site 2's setup at 0x5e4a36c. One instruction, no
+    // hook, no trampoline, nothing to overlap — permanent and free.
+    uintptr_t movzr = base + kEm32MovX2Zr;
+    if (*reinterpret_cast<const uint32_t*>(movzr) == kInsnMovX2Xzr) {
+        int64_t delta = (int64_t)(base + kEm32Site2Setup) - (int64_t)movzr;   // +0x18
+        uint32_t br = 0x14000000u | (uint32_t)((delta >> 2) & 0x03FFFFFFu);   // B imm26
+        patch_code(reinterpret_cast<void*>(movzr), &br, sizeof(br));
+        logger::log_info("EM32", "site 1: `MOV X2,XZR` @0x%lX -> `B +0x%lX` — the NULL path now "
+                                 "skips its VR4CreateEmSubObject instead of faulting",
+                         (unsigned long)kEm32MovX2Zr, (unsigned long)delta);
+        ++done;
+    } else {
+        logger::log_warn("EM32", "site 1: 0x%lX is not `MOV X2,XZR` (0x%08X) — left alone",
+                         (unsigned long)kEm32MovX2Zr, *reinterpret_cast<const uint32_t*>(movzr));
     }
 
-    HookId id = install_safe_call_guard(reinterpret_cast<void*>(base + kEm32InitRva),
-                                        "cEm32_init_subobjects");
-    if (!id) {
-        logger::log_error("EM32", "safe-call guard FAILED on em32 init @0x%lX",
-                          (unsigned long)kEm32InitRva);
-        return false;
+    // ── SITE 2 (cEm+0xA88): ONE DobbyInstrument ───────────────────────────
+    // No CBZ to hijack here — the game reloads the pointer and derefs it with no
+    // check at all, and a byte patch can't fit (it needs 4 ops in 3 slots).
+    // ONE instrument is safe: Dobby relocates the instructions it overwrites into
+    // its own trampoline. The earlier disaster was FOUR instruments with two of
+    // them 4 BYTES APART, shredding each other — nothing else is hooked within 16
+    // bytes of this one.
+    //
+    // When X2 is NULL we point it at a scratch buffer that points to itself, so
+    // the two loads read harmless zeros, AND zero X1 — VR4CreateEmSubObject's
+    // FIRST statement is `if (a2)`, so it returns instantly without touching a
+    // thing. Nothing writes X1 between here and the BL, so it sticks.
+    //
+    // Critically this lets the init CONTINUE, which is the whole point: every
+    // line below is YarareInit/YarareAdd — U3's damage regions. A crash guard
+    // siglongjmp'd out before them, which is exactly what left U3 unkillable.
+    if (DobbyInstrument(reinterpret_cast<void*>(base + kEm32Guard[1][0]),
+                        em32_sub_null_to_dummy) == RT_SUCCESS) {
+        logger::log_info("EM32", "site 2: 0x%lX instrumented — a NULL sub-object now no-ops the "
+                                 "call and the init runs on to YarareAdd (U3 keeps its hitboxes)",
+                         (unsigned long)kEm32Guard[1][0]);
+        ++done;
+    } else {
+        logger::log_error("EM32", "site 2: DobbyInstrument FAILED at 0x%lX",
+                          (unsigned long)kEm32Guard[1][0]);
     }
-    logger::log_info("EM32", "em32 init guarded @0x%lX (safe-call): the game's own unchecked "
-                             "deref of SetObj00's NULL result now recovers instead of SIGSEGV",
-                     (unsigned long)kEm32InitRva);
-    return true;
+
+    logger::log_info("EM32", "em32/U3 sub-object fix: %d/2 sites", done);
+    return done > 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -113,18 +113,26 @@ HookId install_safe_call_guard(void* addr, const char* name);
 // Patches the switch's jump table to give each the id-9 case (_prologEm09), so
 // they spawn with the real ganado init + AI. Pure data patch, no hook.
 bool install_cut_villager_fix();
-// em32's init (sub_5E49AA0) null-checks SetObj00's result and then dereferences
-// it anyway 4 instructions later — SIGSEGV, fault addr 0x180 — whenever a
-// sub-object model is missing from the archive, i.e. for cut content that retail
-// never spawns. Installs a callback-less safe-call guard on that init: the fault
-// is caught and the init returns 0 instead of killing the game.
+// em32 = U3. Its init (sub_5E49AA0) null-checks SetObj00's result and then
+// dereferences it anyway — fault addr 0x180 — whenever a sub-object model is
+// missing, which is normal outside U3's own level.
 //
-// Do NOT "improve" this back into mid-function DobbyInstruments that patch the
-// registers. That was tried and made it WORSE — two of the sites were 4 bytes
-// apart, and with libmodloader ~251MB from libUE4 (past ARM64's +/-128MB branch
-// range) Dobby must write a 16-byte absolute sequence, so the patches overlapped
-// and shredded the code: the clean `fault addr 0x180` became `pc = 0x512c662204`,
-// a BR into garbage. Never place two inline hooks within 16 bytes.
+// Fixed WITHOUT a crash guard, on purpose: every line after the faulting call is
+// YarareInit/YarareAdd — U3's damage regions — so a guard that siglongjmps out is
+// exactly what left U3 unkillable. Both sites let the init CONTINUE instead:
+//   site 1 (cEm+0xA80): the NULL path's `MOV X2,XZR` (0x5E4A354) is byte-patched
+//                       to `B 0x5E4A36C`, branching over its call. One
+//                       instruction, no hook, nothing to overlap.
+//   site 2 (cEm+0xA88): ONE DobbyInstrument at 0x5E4A374 — no CBZ exists to
+//                       hijack and a byte patch needs 4 ops in 3 slots. It points
+//                       a NULL X2 at a self-referencing scratch buffer and zeroes
+//                       X1, so VR4CreateEmSubObject returns at its first `if (a2)`.
+//
+// A SINGLE instrument is safe — Dobby relocates what it overwrites. The earlier
+// disaster was FOUR instruments with two 4 BYTES APART, shredding each other and
+// turning a clean `fault 0x180` into `pc = 0x512c662204`. Never place two inline
+// hooks within 16 bytes, and never hook this function twice (install_u3_killable_fix
+// already owns its entry — a second DobbyHook there fails with status=-1).
 bool install_em32_subobject_guard();
 // Add the null-`this` check the game forgot. A whole family of RE4 crashes is one
 // bug per enemy: a NULL sub-object/model (routine for cut/unsupported content the
