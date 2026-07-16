@@ -144,7 +144,8 @@ bool install_null_this_guard(uintptr_t addr, const char* name);
 // Addresses are passed in from Lua (Resolve() handles symbol+fallback there);
 // only the hot path lives in C++. Idempotent — a mod reload won't stack hooks.
 bool install_dualfire_arm(uintptr_t tryfire, uintptr_t itemmgr,
-                          uintptr_t armsearch, uintptr_t armfn, uint32_t wno_off);
+                          uintptr_t armsearch, uintptr_t armfn, uint32_t wno_off,
+                          uintptr_t pg_addr, uint32_t armed_off);
 void set_dualfire_enabled(bool on);
 bool is_dualfire_enabled();
 // True if em `id` has a real init. cEmMgr::construct calls the EmInitFunc global

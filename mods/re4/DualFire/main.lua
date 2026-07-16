@@ -42,6 +42,13 @@ R("ArmSearchWeaponNo", "_ZN8cItemMgr17ArmSearchWeaponNoEh", 0x5F60264)
 R("Arm",              "_ZN8cItemMgr3armEP5cItem",           0x5F561C8)
 local ItemMgr = Offset(GetLibBase(), 0xA561810)
 local WNO_OFF = 3360
+-- &pG, and the GLOBAL armed weapon-no's offset from pG's VALUE. Straight out of
+-- TryFire: LDR X8,[X24] / MOV W9,#0x504C / LDRB W8,[X8,X9] / CMP W8, gun[0xD20].
+-- We only arm when they DIFFER — same as the engine. Arming an already-armed gun
+-- every trigger poll resets its weapon state, which is what stopped the MINIGUN
+-- from firing (its spin-up was thrown away 60x/sec).
+local pG        = Offset(GetLibBase(), 0x0A456E48)
+local ARMED_OFF = 0x504C
 
 local state = { enabled = true }
 local saved = ModConfig.Load("DualFire")
@@ -51,7 +58,8 @@ if saved and saved.enabled ~= nil then state.enabled = saved.enabled end
 -- stale — do NOT fall back to a Lua hook on TryFire, that is the crash.
 local hookOK = false
 if InstallDualFireArm then
-  local ok, res = pcall(InstallDualFireArm, A.TryFire, ItemMgr, A.ArmSearchWeaponNo, A.Arm, WNO_OFF)
+  local ok, res = pcall(InstallDualFireArm, A.TryFire, ItemMgr, A.ArmSearchWeaponNo, A.Arm,
+                        WNO_OFF, pG, ARMED_OFF)
   hookOK = ok and res or false
   -- Say WHY on failure. A bare pcall hid a type error here once and the mod
   -- happily reported "loaded" with the hook silently absent (nativeHook=false).

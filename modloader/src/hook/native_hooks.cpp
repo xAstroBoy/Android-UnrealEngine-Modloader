@@ -56,6 +56,12 @@ thread_local sigjmp_buf g_hook_install_jmp;
 
 namespace native_hooks {
 
+// Circuit-breaker thresholds for the safe-call guard (see HookRecord::tripped).
+// A handful of recoveries is a transient; dozens per second is a permanently
+// broken function, and recovering it forever costs more than it saves.
+static const uint32_t kGuardTripLimit = 8;   // faults before we stop calling it
+static const uint32_t kGuardLogLimit  = 3;   // never log a fault per frame
+
 static std::atomic<HookId> s_next_id{1};
 
 // One registrant's callbacks on an address. Multiple mods can hook the same
@@ -81,6 +87,19 @@ struct HookRecord {
     std::atomic<HookChain*> chain{nullptr};
     std::mutex      chain_edit_mutex;   // serializes snapshot rebuilds
     std::atomic<uint64_t> call_count;
+    // ── Crash-guard circuit breaker ──────────────────────────────────────
+    // A safe-call guard recovers a faulting original via siglongjmp. That is
+    // fine for a one-shot fault — but several of these functions are called
+    // from cEmXX::move EVERY FRAME, and a permanently broken enemy (its room
+    // never loaded its model) faults every single frame. The guard then does
+    // signal -> handler -> siglongjmp 60+ times a second and the game crawls:
+    // we trade a crash for unplayable lag, which is not a fix.
+    // So once an original has faulted `kGuardTripLimit` times we stop calling
+    // it at all and return 0 immediately. The feature that function provided
+    // stays off (a cut enemy loses its cloth/sub-object), the game keeps its
+    // frame rate, and nothing faults again.
+    std::atomic<uint32_t> fault_count{0};
+    std::atomic<bool>     tripped{false};
     ~HookRecord() { delete chain.load(); }
 };
 
@@ -192,7 +211,22 @@ extern "C" uint64_t dispatch_full(int slot,
         if (crash_sig != 0) {
             __builtin_memcpy(&g_hook_recovery_jmp, &saved_jmp, sizeof(sigjmp_buf));
             g_in_hook_original_call = saved_in_call;
-            // Silent recovery — don't log every frame (rendering thread is high-frequency)
+            // Silent recovery — don't log every frame (this path is high-frequency).
+            // Still count it: an original that faults forever must trip the breaker
+            // here too, or we pay a signal per call for the rest of the session.
+            uint32_t n = rec->fault_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n >= kGuardTripLimit && !rec->tripped.exchange(true, std::memory_order_relaxed)) {
+                logger::log_warn("NHOOK",
+                    "'%s' faulted %u times off-thread — CIRCUIT BREAKER TRIPPED "
+                    "(no longer called; returns 0)", rec->name.c_str(), n);
+            }
+            return 0;
+        }
+
+        // Known-bad: don't call it, don't fault, don't signal.
+        if (rec->tripped.load(std::memory_order_relaxed)) {
+            __builtin_memcpy(&g_hook_recovery_jmp, &saved_jmp, sizeof(sigjmp_buf));
+            g_in_hook_original_call = saved_in_call;
             return 0;
         }
 
@@ -303,11 +337,35 @@ extern "C" uint64_t dispatch_full(int slot,
             // ── CRASH RECOVERED ──────────────────────────────────────
             __builtin_memcpy(&g_hook_recovery_jmp, &saved_jmp, sizeof(sigjmp_buf));
             g_in_hook_original_call = saved_in_call;
-            logger::log_error("NHOOK",
-                "SAFE-CALL RECOVERY: Hook '%s' original function crashed "
-                "(signal %d) — returning safe defaults (0/0.0). "
-                "Game continues running.",
-                rec->name.c_str(), crash_sig);
+
+            // Count it, and TRIP after a few. Several guarded functions are
+            // called from cEmXX::move every frame; a permanently broken enemy
+            // faults every frame, so recovering forever means signal + handler
+            // + siglongjmp 60x/sec — the crash becomes unplayable lag instead.
+            // Trip and the function is simply never called again.
+            uint32_t n = rec->fault_count.fetch_add(1, std::memory_order_relaxed) + 1;
+
+            // Log only the first few. This used to log_error EVERY recovery —
+            // a file write per frame, which was itself a large part of the lag.
+            if (n <= kGuardLogLimit) {
+                logger::log_error("NHOOK",
+                    "SAFE-CALL RECOVERY: Hook '%s' original crashed (signal %d) — "
+                    "returning safe defaults (0/0.0). Game continues. [fault %u/%u]",
+                    rec->name.c_str(), crash_sig, n, kGuardTripLimit);
+            }
+            if (n >= kGuardTripLimit && !rec->tripped.exchange(true, std::memory_order_relaxed)) {
+                logger::log_warn("NHOOK",
+                    "'%s' faulted %u times — CIRCUIT BREAKER TRIPPED: it will no longer be "
+                    "called (returns 0). Whatever it provided stays off, but the frame rate "
+                    "is back. Usually means an enemy whose model this room never loaded.",
+                    rec->name.c_str(), n);
+            }
+            ctx.ret_x0 = 0;
+            ctx.ret_d0 = 0.0;
+        } else if (rec->tripped.load(std::memory_order_relaxed)) {
+            // Already known-bad: skip the call entirely — no fault, no signal.
+            __builtin_memcpy(&g_hook_recovery_jmp, &saved_jmp, sizeof(sigjmp_buf));
+            g_in_hook_original_call = saved_in_call;
             ctx.ret_x0 = 0;
             ctx.ret_d0 = 0.0;
         } else {
@@ -1458,6 +1516,16 @@ bool install_null_this_guard(uintptr_t addr, const char* name) {
 static std::atomic<bool> s_dualfire_on{true};
 static uintptr_t         s_df_itemmgr = 0;
 static uint32_t          s_df_wno_off = 3360;
+// &pG (the pointer variable), and the GLOBAL armed weapon-no's offset from pG's
+// VALUE. Straight out of TryFire itself:
+//     LDR  X8, [X24]          ; X8 = pG value
+//     MOV  W9, #0x504C        ; armed weapon-no offset
+//     LDRB W8, [X8,X9]        ; armed_wno
+//     LDRB W9, [X19,#0xD20]   ; this gun's wno (3360)
+//     CMP  W8, W9
+//     B.NE loc_62DC614        ; only arms when they DIFFER
+static uintptr_t s_df_pg        = 0;
+static uint32_t  s_df_armed_off = 0x504C;
 
 using DfArmSearchFn = void*    (*)(void*, uint8_t);   // cItemMgr::ArmSearchWeaponNo
 using DfArmFn       = uint64_t (*)(void*, void*);     // cItemMgr::arm
@@ -1475,15 +1543,30 @@ static uint64_t df_tryfire(uint64_t self) {
         // stale cItem to arm.
         uint8_t wno = *reinterpret_cast<volatile uint8_t*>(self + s_df_wno_off);
         if (wno) {
-            void* item = s_df_search(reinterpret_cast<void*>(s_df_itemmgr), wno);
-            if (item) s_df_arm(reinterpret_cast<void*>(s_df_itemmgr), item);
+            // ONLY arm if this gun is not ALREADY the armed one — exactly what
+            // TryFire itself does (CMP armed_wno, gun[0xD20] / B.NE arm-path).
+            // Re-arming an already-armed gun on every trigger poll resets its
+            // weapon state: that is what stopped the MINIGUN from firing, because
+            // its spin-up was thrown away 60x/sec. Arming is for the OTHER gun in
+            // a dual-wield, never for the one the engine already has armed.
+            bool already_armed = false;
+            if (s_df_pg) {
+                uint64_t g = *reinterpret_cast<volatile uint64_t*>(s_df_pg);
+                if (g) already_armed =
+                    (*reinterpret_cast<volatile uint8_t*>(g + s_df_armed_off) == wno);
+            }
+            if (!already_armed) {
+                void* item = s_df_search(reinterpret_cast<void*>(s_df_itemmgr), wno);
+                if (item) s_df_arm(reinterpret_cast<void*>(s_df_itemmgr), item);
+            }
         }
     }
     return s_df_orig(self);
 }
 
 bool install_dualfire_arm(uintptr_t tryfire, uintptr_t itemmgr,
-                          uintptr_t armsearch, uintptr_t armfn, uint32_t wno_off) {
+                          uintptr_t armsearch, uintptr_t armfn, uint32_t wno_off,
+                          uintptr_t pg_addr, uint32_t armed_off) {
     if (!tryfire || !itemmgr || !armsearch || !armfn) {
         logger::log_error("DUALFIRE", "install: null address (tryfire=0x%lX itemmgr=0x%lX "
                                       "search=0x%lX arm=0x%lX) — not installed",
@@ -1496,6 +1579,8 @@ bool install_dualfire_arm(uintptr_t tryfire, uintptr_t itemmgr,
         s_df_wno_off = wno_off ? wno_off : 3360;
         s_df_search  = reinterpret_cast<DfArmSearchFn>(armsearch);
         s_df_arm     = reinterpret_cast<DfArmFn>(armfn);
+        s_df_pg        = pg_addr;
+        s_df_armed_off = armed_off ? armed_off : 0x504C;
         logger::log_info("DUALFIRE", "already installed — refreshed addresses only");
         return true;
     }
@@ -1503,6 +1588,8 @@ bool install_dualfire_arm(uintptr_t tryfire, uintptr_t itemmgr,
     s_df_wno_off = wno_off ? wno_off : 3360;
     s_df_search  = reinterpret_cast<DfArmSearchFn>(armsearch);
     s_df_arm     = reinterpret_cast<DfArmFn>(armfn);
+    s_df_pg        = pg_addr;
+    s_df_armed_off = armed_off ? armed_off : 0x504C;
 
     if (DobbyHook(reinterpret_cast<void*>(tryfire),
                   reinterpret_cast<dobby_dummy_func_t>(df_tryfire),
