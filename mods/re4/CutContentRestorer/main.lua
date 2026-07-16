@@ -201,12 +201,33 @@ do
     -- the safe-call guard instead. The circuit breaker means a permanently broken
     -- IK trips after 8 faults and stops being called — enemies lose IK (foot
     -- placement), the game keeps its frame rate.
+    -- Functions where the game calls cModel::getPartsPtr and derefs the result
+    -- with no null check. getPartsPtr correctly returns NULL when the model has
+    -- no such bone/part — routine for a crossover enemy whose rig doesn't match.
+    -- `this` is valid in both, so the null-this guard can't help; route them
+    -- through the safe-call guard. The circuit breaker means a permanently broken
+    -- one trips after 8 faults and stops being called, so it degrades (no IK / no
+    -- laser lock-on) instead of crashing or tanking the frame rate.
     if InstallCrashGuard then
-        pcall(function()
-            local a = Resolve("_Z6IKInitP6cModelP11MOTION_INFO", 0x5F53D90)
-            local ok = InstallCrashGuard(a, "IKInit")
-            Log(TAG .. ": crash guard IKInit: " .. (ok and "installed" or "FAILED"))
-        end)
+        for _, g in ipairs({
+            -- PartsPtr = getPartsPtr(model, motion->partIdx[i]);
+            -- v11 = *(_DWORD *)(PartsPtr + 472);        472 = 0x1D8 -> fault 0x1d8
+            { sym = "_Z6IKInitP6cModelP11MOTION_INFO", rva = 0x5F53D90, name = "IKInit" },
+            -- LASER SIGHT. Aiming at an enemy whose rig lacks part 0 killed the game:
+            --   5eef834  BL  cModel::getPartsPtr     ; -> NULL
+            --   5eef8c4  ADD X1, X0, #0x80           ; NULL + 0x80
+            --   5eef8d0  BL  MTXMultVec              ; LDP S2,S3,[X1] -> fault 0x80
+            -- seen as MTXMultVec+4 <- GetWepTargetPos+980 <- UpdateLaserSight
+            -- <- PostBio4Tick, i.e. every frame the laser is on a bad target.
+            { sym = "_Z15GetWepTargetPosP3VecS0_jjPP3cEmPj", rva = 0x5EEF4FC,
+              name = "GetWepTargetPos (laser sight)" },
+        }) do
+            pcall(function()
+                local a = Resolve(g.sym, g.rva)
+                local ok = InstallCrashGuard(a, g.name)
+                Log(TAG .. ": crash guard " .. g.name .. ": " .. (ok and "installed" or "FAILED"))
+            end)
+        end
     end
 
     -- U3 "It" (emId 50 = 0x32 = cEm32) — killable OUTSIDE its scripted level.
