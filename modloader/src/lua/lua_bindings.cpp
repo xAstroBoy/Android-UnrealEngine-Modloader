@@ -2137,6 +2137,21 @@ namespace lua_bindings
             return native_hooks::install_em32_subobject_guard();
         });
 
+        // ── InstallNullThisGuard — add the null check the game forgot ────────
+        // A family of RE4 crashes is ONE bug repeated per enemy: a NULL
+        // sub-object/model (normal for cut/unsupported content whose data the room
+        // never loaded) dereferenced with no check. They die as NULL+fieldOffset,
+        // always via EmSetFromList2 -> cEmXX::move:
+        //   cObjChain::setChain -> 0x438  (it is literally
+        //       `*((_QWORD*)this + 135) = a2;` — 135*8 = 0x438 — with no check)
+        //   em32 init -> 0x180,  cEm2d::setReset -> 0x0d
+        // Guards the function ENTRY and returns 0 when `this` is NULL, so the enemy
+        // loses that one feature (e.g. cloth) instead of killing the process.
+        // Sig: InstallNullThisGuard(addr, name) -> bool
+        lua.set_function("InstallNullThisGuard", [](void* addr, const std::string& name) -> bool {
+            return native_hooks::install_null_this_guard(reinterpret_cast<uintptr_t>(addr), name.c_str());
+        });
+
         // ── InstallDualFireArm — dual-fire WITHOUT a Lua hook on TryFire ─────
         // RE4 arms ONE weapon globally and TryFire only fires the gun that IS the
         // armed one, so dual-wielding fires only one gun. Arming each gun inside
@@ -2149,12 +2164,18 @@ namespace lua_bindings
         // hot-hook crash. So the whole trigger path is pure C++ now; Lua only
         // resolves the addresses once at load and flips the toggle.
         // Sig: InstallDualFireArm(tryFireAddr, itemMgrAddr, armSearchAddr, armAddr, wnoOff) -> bool
-        lua.set_function("InstallDualFireArm", [](uint64_t tryfire, uint64_t itemmgr,
-                                                  uint64_t armsearch, uint64_t armfn,
-                                                  uint32_t wno_off) -> bool {
-            return native_hooks::install_dualfire_arm((uintptr_t)tryfire, (uintptr_t)itemmgr,
-                                                      (uintptr_t)armsearch, (uintptr_t)armfn,
-                                                      wno_off);
+        // Addresses come in as void* — Resolve()/Offset() hand Lua LIGHTUSERDATA,
+        // not numbers, and sol only binds those to void*. Taking uint64_t here
+        // threw a type error that the mod's pcall swallowed, so the hook silently
+        // never installed (log said "nativeHook=false" with no [DUALFIRE] line).
+        // Every other address-taking binding uses void* — match it.
+        lua.set_function("InstallDualFireArm", [](void* tryfire, void* itemmgr,
+                                                  void* armsearch, void* armfn,
+                                                  sol::optional<uint32_t> wno_off) -> bool {
+            return native_hooks::install_dualfire_arm(
+                reinterpret_cast<uintptr_t>(tryfire), reinterpret_cast<uintptr_t>(itemmgr),
+                reinterpret_cast<uintptr_t>(armsearch), reinterpret_cast<uintptr_t>(armfn),
+                wno_off.value_or(3360));
         });
         // Sig: SetDualFireEnabled(bool) — flips an atomic; no hook churn.
         lua.set_function("SetDualFireEnabled", [](bool on) {

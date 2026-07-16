@@ -1344,6 +1344,92 @@ bool install_cut_villager_fix() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// NULL-`this` GUARD — the null check the game forgot
+// ═══════════════════════════════════════════════════════════════════════
+// A whole family of RE4 crashes is one bug repeated per enemy: an enemy's
+// sub-object/model is NULL (routine for cut or unsupported content, whose data
+// the room never loaded), the game dereferences it WITHOUT a null check, and it
+// dies far from the cause. Observed, all via EmSetFromList2 -> cEmXX::move:
+//   cObjChain::setChain  -> fault 0x438   (`*((_QWORD*)this + 135) = a2` on NULL)
+//   sub_5E49AA0 (em32)   -> fault 0x180
+//   cEm2d::setReset      -> fault 0x0d
+// The fault addresses ARE the field offsets — classic NULL + offset.
+//
+// setChain is the clearest case; the whole function is:
+//     *((_QWORD*)this + 135) = a2;  if (a2) return PenClothSet(this);  return this;
+// It never checks `this`. Add the check at the ENTRY and the enemy simply has no
+// cloth instead of taking the process down.
+//
+// ENTRY hooks only — deliberately. Patching mid-function is what turned a clean
+// `fault 0x180` into `pc = 0x512c662204`: libmodloader loads ~251MB from libUE4,
+// past ARM64's +/-128MB branch range, so Dobby must write a 16-byte absolute
+// sequence and two hooks <16 bytes apart shred each other. A function entry has
+// no neighbour to clobber.
+//
+// Each guarded function needs its OWN trampoline slot to hold its original, hence
+// the templated thunks. 8 args are forwarded (x0-x7 covers every AAPCS64 integer
+// arg); v0-v7 are untouched, so float args (e.g. PenClothSet's float) pass through
+// intact. Returning 0 matches what these functions return for "nothing to do".
+static const int kMaxNullGuards = 8;
+using NgFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t, uint64_t);
+static NgFn s_ng_orig[kMaxNullGuards] = {};
+static uintptr_t s_ng_addr[kMaxNullGuards] = {};
+// OWN the name. The Lua binding hands us a std::string::c_str() that dies the
+// moment the call returns, and the thunk logs it much later, from another thread.
+static char s_ng_name[kMaxNullGuards][48] = {};
+static std::atomic<uint32_t> s_ng_hits[kMaxNullGuards];
+static int  s_ng_count = 0;
+
+template <int N>
+static uint64_t ng_thunk(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                         uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
+    if (!a0) {
+        // First hit only — this can fire per-frame, so never log in a loop.
+        if (s_ng_hits[N].fetch_add(1, std::memory_order_relaxed) == 0)
+            logger::log_warn("NULLGUARD", "%s called with NULL `this` — returning 0 instead of "
+                                          "faulting (missing model/sub-object; further hits silent)",
+                             s_ng_name[N]);
+        return 0;
+    }
+    return s_ng_orig[N](a0, a1, a2, a3, a4, a5, a6, a7);
+}
+
+static NgFn s_ng_thunks[kMaxNullGuards] = {
+    ng_thunk<0>, ng_thunk<1>, ng_thunk<2>, ng_thunk<3>,
+    ng_thunk<4>, ng_thunk<5>, ng_thunk<6>, ng_thunk<7>,
+};
+
+bool install_null_this_guard(uintptr_t addr, const char* name) {
+    if (!addr) {
+        logger::log_error("NULLGUARD", "null address for '%s'", name ? name : "?");
+        return false;
+    }
+    for (int i = 0; i < s_ng_count; ++i) {
+        if (s_ng_addr[i] == addr) return true;   // idempotent: never stack on a reload
+    }
+    if (s_ng_count >= kMaxNullGuards) {
+        logger::log_error("NULLGUARD", "no free slot for '%s' (max %d)", name ? name : "?", kMaxNullGuards);
+        return false;
+    }
+    int n = s_ng_count;
+    __builtin_strncpy(s_ng_name[n], name ? name : "?", sizeof(s_ng_name[n]) - 1);
+    s_ng_name[n][sizeof(s_ng_name[n]) - 1] = 0;   
+    s_ng_hits[n].store(0, std::memory_order_relaxed);
+    if (DobbyHook(reinterpret_cast<void*>(addr),
+                  reinterpret_cast<dobby_dummy_func_t>(s_ng_thunks[n]),
+                  reinterpret_cast<dobby_dummy_func_t*>(&s_ng_orig[n])) != RT_SUCCESS) {
+        logger::log_error("NULLGUARD", "DobbyHook failed for '%s' @0x%lX", name ? name : "?", (unsigned long)addr);
+        return false;
+    }
+    s_ng_addr[n] = addr;
+    ++s_ng_count;
+    logger::log_info("NULLGUARD", "%s @0x%lX guarded — returns 0 when `this` is NULL "
+                                  "(the check the game is missing)", name ? name : "?", (unsigned long)addr);
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // DUAL-FIRE ARM — pure C++, because TryFire is a HOT function
 // ═══════════════════════════════════════════════════════════════════════
 // RE4 has ONE global "armed weapon". AVR4GamePlayerGun::TryFire only fires the
@@ -1476,13 +1562,11 @@ bool is_dualfire_enabled() { return s_dualfire_on.load(std::memory_order_relaxed
 // cModel, so a NULL model is already harmless there. sub_5E49AA0 is the only
 // function that sources X0 from the model itself — hence the only one that can
 // fault. Two sites, four instruments, whole class of cut-content AI covered.
-static const uintptr_t kEm32Guard[][2] = {   // { LDR Xd,[Xn,#0x180] , LDR X0,[Xd,#0x18] }
-    { 0x5E4A358, 0x5E4A364 },                // sub-object 1 (cEm+0xA80) — MOV X1,X19 sits between
-    { 0x5E4A374, 0x5E4A378 },                // sub-object 2 (cEm+0xA88) — the observed crash
+static const uintptr_t kEm32InitRva = 0x5E49AA0;   // sub_5E49AA0 — em32's init
+static const uintptr_t kEm32Guard[][2] = {   // fingerprint only — NOT hook sites
+    { 0x5E4A358, 0x5E4A364 },                // sub-object 1 (cEm+0xA80)
+    { 0x5E4A374, 0x5E4A378 },                // sub-object 2 (cEm+0xA88) — observed crash
 };
-
-// +0x180 must land inside the buffer and point back at it; +0x18 must read 0.
-alignas(16) static uint8_t g_em32_null_model[0x400];
 
 static bool em32_guard_is_ldr_x_imm(uint32_t w, int* rt, int* rn, uint32_t* off) {
     if ((w & 0xFFC00000u) != 0xF9400000u) return false;   // LDR Xt,[Xn,#imm] unsigned
@@ -1492,67 +1576,64 @@ static bool em32_guard_is_ldr_x_imm(uint32_t w, int* rt, int* rn, uint32_t* off)
     return true;
 }
 
-static void em32_sub_null_to_dummy(void* addr, DobbyRegisterContext* ctx) {
-    (void)addr;
-    // Only fires on a pointer that is already guaranteed to SIGSEGV one insn later.
-    if (ctx->general.x[2] == 0)
-        ctx->general.x[2] = reinterpret_cast<uint64_t>(g_em32_null_model);
-}
 
-static void em32_sub_disarm_call(void* addr, DobbyRegisterContext* ctx) {
-    (void)addr;
-    // X8 == our buffer <=> the load above was substituted. Zero the cEm so
-    // VR4CreateEmSubObject returns at `if (a2)` without touching anything.
-    if (ctx->general.x[8] == reinterpret_cast<uint64_t>(g_em32_null_model))
-        ctx->general.x[1] = 0;
-}
 
+// ── WHY THE MID-FUNCTION INSTRUMENT APPROACH WAS RIPPED OUT ──────────────
+// The first version DobbyInstrument'ed FOUR addresses inside sub_5E49AA0 to
+// swap X2/X1 in the register context. It made things WORSE, and the tombstones
+// say so plainly — same function, same path, before vs after:
+//     before:  cEm32::move+1508 -> fault addr 0x180        (a clean null deref)
+//     after:   cEm32::move+1508 -> pc = 0x512c662204       (a BR into garbage)
+// Two of the instrument sites were FOUR BYTES apart (0x5e4a374 / 0x5e4a378).
+// libmodloader loads ~251MB away from libUE4 — past ARM64's +/-128MB branch
+// range — so Dobby cannot always patch a 4-byte B and must write a 16-byte
+// absolute sequence (LDR x17,#8 / BR x17 / .quad target). 16 bytes at 0x374
+// swallows 0x378, 0x37c (the BL) and 0x380, and instrumenting 0x378 then writes
+// INTO that patch. Shredded code, wild jump.
+//
+// RULE: never place two inline hooks within 16 bytes of each other, and prefer
+// function-ENTRY hooks. Mid-function register surgery is not worth it here.
+//
+// What we do instead is the mechanism already proven on this title: a
+// callback-less safe-call guard on em32's init. If the unchecked deref faults,
+// the SIGSEGV is caught and the init returns 0 instead of killing the game. The
+// enemy may come out half-built — but it is CUT CONTENT that retail never spawns,
+// and a half-built cut enemy beats a hard crash. No code is rewritten, no
+// registers are touched, and there is nothing to overlap.
 bool install_em32_subobject_guard() {
     uintptr_t base = symbols::lib_base();
     if (!base) {
-        logger::log_error("EM32", "lib_base unavailable — sub-object null guard skipped");
+        logger::log_error("EM32", "lib_base unavailable — sub-object guard skipped");
         return false;
     }
-    *reinterpret_cast<void**>(g_em32_null_model + 0x180) = g_em32_null_model;
-
-    int done = 0;
+    // Sanity-check that this really is em32's init before guarding it: the two
+    // unchecked `LDR Xd,[X2,#0x180]` loads are its fingerprint. If a game update
+    // moved the code, guard nothing rather than the wrong function.
+    int ok_sites = 0;
     for (size_t i = 0; i < sizeof(kEm32Guard) / sizeof(kEm32Guard[0]); ++i) {
-        uintptr_t ld180 = base + kEm32Guard[i][0];
-        uintptr_t ld18  = base + kEm32Guard[i][1];
-
-        // Verify the exact encodings before instrumenting. If a game update moves
-        // this code, we must do nothing rather than corrupt an unrelated function.
-        int rt1, rn1, rt2, rn2; uint32_t off1, off2;
-        uint32_t w1 = *reinterpret_cast<const uint32_t*>(ld180);
-        uint32_t w2 = *reinterpret_cast<const uint32_t*>(ld18);
-        if (!em32_guard_is_ldr_x_imm(w1, &rt1, &rn1, &off1) || off1 != 0x180 || rn1 != 2) {
-            logger::log_warn("EM32", "0x%lX is not `LDR Xd,[X2,#0x180]` (insn 0x%08X) — guard skipped",
-                             (unsigned long)kEm32Guard[i][0], w1);
-            continue;
-        }
-        if (!em32_guard_is_ldr_x_imm(w2, &rt2, &rn2, &off2) || off2 != 0x18 || rt2 != 0 || rn2 != rt1) {
-            logger::log_warn("EM32", "0x%lX is not `LDR X0,[X%d,#0x18]` (insn 0x%08X) — guard skipped",
-                             (unsigned long)kEm32Guard[i][1], rt1, w2);
-            continue;
-        }
-        if (DobbyInstrument(reinterpret_cast<void*>(ld180), em32_sub_null_to_dummy) != RT_SUCCESS) {
-            logger::log_warn("EM32", "DobbyInstrument failed at 0x%lX", (unsigned long)kEm32Guard[i][0]);
-            continue;
-        }
-        if (DobbyInstrument(reinterpret_cast<void*>(ld18), em32_sub_disarm_call) != RT_SUCCESS) {
-            logger::log_warn("EM32", "DobbyInstrument failed at 0x%lX — rolling back the pair",
-                             (unsigned long)kEm32Guard[i][1]);
-            DobbyDestroy(reinterpret_cast<void*>(ld180));
-            continue;
-        }
-        logger::log_info("EM32", "sub-object %d guarded: 0x%lX (LDR X%d,[X2,#0x180]) + 0x%lX (LDR X0,[X%d,#0x18])",
-                         (int)i + 1, (unsigned long)kEm32Guard[i][0], rt1,
-                         (unsigned long)kEm32Guard[i][1], rt1);
-        ++done;
+        int rt, rn; uint32_t off;
+        uint32_t w = *reinterpret_cast<const uint32_t*>(base + kEm32Guard[i][0]);
+        if (em32_guard_is_ldr_x_imm(w, &rt, &rn, &off) && off == 0x180 && rn == 2)
+            ++ok_sites;
     }
-    logger::log_info("EM32", "em32 sub-object null guard: %d/2 sites — missing sub-object models "
-                             "now skip instead of SIGSEGV", done);
-    return done > 0;
+    if (ok_sites != 2) {
+        logger::log_warn("EM32", "sub_5E49AA0 does not match the expected em32 init "
+                                 "(%d/2 `LDR Xd,[X2,#0x180]` sites) — guard skipped",
+                         ok_sites);
+        return false;
+    }
+
+    HookId id = install_safe_call_guard(reinterpret_cast<void*>(base + kEm32InitRva),
+                                        "cEm32_init_subobjects");
+    if (!id) {
+        logger::log_error("EM32", "safe-call guard FAILED on em32 init @0x%lX",
+                          (unsigned long)kEm32InitRva);
+        return false;
+    }
+    logger::log_info("EM32", "em32 init guarded @0x%lX (safe-call): the game's own unchecked "
+                             "deref of SetObj00's NULL result now recovers instead of SIGSEGV",
+                     (unsigned long)kEm32InitRva);
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
