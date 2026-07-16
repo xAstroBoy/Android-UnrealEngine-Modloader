@@ -22,6 +22,7 @@ namespace lua_delayed
     struct DelayedAction
     {
         uint64_t handle;
+        std::string owner; // MOD_NAME of the registering env ("" = no mod)
         sol::function callback;
 
         // Timing
@@ -167,6 +168,32 @@ namespace lua_delayed
         }
     }
 
+    int cancel_all_for_mod(const std::string &mod)
+    {
+        if (mod.empty())
+            return 0;
+        std::lock_guard<std::recursive_mutex> lock(s_mutex);
+        int cancelled = 0;
+        for (auto &action : s_actions)
+        {
+            if (!action.cancelled && action.owner == mod)
+            {
+                action.cancelled = true;
+                cancelled++;
+            }
+        }
+        // Actions registered from a callback during THIS tick sit in s_pending
+        for (auto &action : s_pending)
+        {
+            if (!action.cancelled && action.owner == mod)
+            {
+                action.cancelled = true;
+                cancelled++;
+            }
+        }
+        return cancelled;
+    }
+
     bool is_valid(uint64_t handle)
     {
         std::lock_guard<std::recursive_mutex> lock(s_mutex);
@@ -184,13 +211,28 @@ namespace lua_delayed
     // Internal: add an action
     // ═══════════════════════════════════════════════════════════════════════
 
+    // Owner (MOD_NAME) of the registering environment, so a mod's loops can
+    // be cancelled wholesale on unload. "" when there is no mod env.
+    static std::string owner_from_env(const sol::this_environment &te)
+    {
+        if (te.env)
+        {
+            sol::optional<std::string> mn = (*te.env)["MOD_NAME"];
+            if (mn && !mn->empty())
+                return *mn;
+        }
+        return std::string();
+    }
+
     static uint64_t add_action(sol::function callback, double delay_ms, int delay_frames,
-                               bool is_loop, bool is_frame_based, bool game_thread)
+                               bool is_loop, bool is_frame_based, bool game_thread,
+                               const std::string &owner = std::string())
     {
         std::lock_guard<std::recursive_mutex> lock(s_mutex);
 
         DelayedAction action;
         action.handle = s_next_handle.fetch_add(1);
+        action.owner = owner;
         action.callback = callback;
         action.delay_ms = delay_ms;
         action.delay_frames = delay_frames;
@@ -226,18 +268,18 @@ namespace lua_delayed
 
         // ── ExecuteWithDelay(delayInMilliseconds, callback) → handle
         // Executes callback once after delay on the game thread
-        lua.set_function("ExecuteWithDelay", [](double delay_ms, sol::function callback) -> uint64_t
-                         { return add_action(callback, delay_ms, 0, false, false, true); });
+        lua.set_function("ExecuteWithDelay", [](sol::this_environment te, double delay_ms, sol::function callback) -> uint64_t
+                         { return add_action(callback, delay_ms, 0, false, false, true, owner_from_env(te)); });
 
         // ── ExecuteAsync(callback) → handle
         // Executes callback on next tick (0ms delay, one-shot)
-        lua.set_function("ExecuteAsync", [](sol::function callback) -> uint64_t
-                         { return add_action(callback, 0, 0, false, false, false); });
+        lua.set_function("ExecuteAsync", [](sol::this_environment te, sol::function callback) -> uint64_t
+                         { return add_action(callback, 0, 0, false, false, false, owner_from_env(te)); });
 
         // ── LoopAsync(delayInMilliseconds, callback) → handle
         // Executes callback repeatedly every delay_ms
-        lua.set_function("LoopAsync", [](double delay_ms, sol::function callback) -> uint64_t
-                         { return add_action(callback, delay_ms, 0, true, false, false); });
+        lua.set_function("LoopAsync", [](sol::this_environment te, double delay_ms, sol::function callback) -> uint64_t
+                         { return add_action(callback, delay_ms, 0, true, false, false, owner_from_env(te)); });
 
         // ── ExecuteInGameThread(callback)
         // Already exists in lua_bindings.cpp — this is a backup
@@ -245,30 +287,30 @@ namespace lua_delayed
         // (The lua_bindings version takes priority since it's registered first)
 
         // ── ExecuteInGameThreadWithDelay(delayInMilliseconds, callback) → handle
-        lua.set_function("ExecuteInGameThreadWithDelay", [](double delay_ms, sol::function callback) -> uint64_t
-                         { return add_action(callback, delay_ms, 0, false, false, true); });
+        lua.set_function("ExecuteInGameThreadWithDelay", [](sol::this_environment te, double delay_ms, sol::function callback) -> uint64_t
+                         { return add_action(callback, delay_ms, 0, false, false, true, owner_from_env(te)); });
 
         // ── LoopInGameThread(delayInMilliseconds, callback) → handle
-        lua.set_function("LoopInGameThread", [](double delay_ms, sol::function callback) -> uint64_t
-                         { return add_action(callback, delay_ms, 0, true, false, true); });
+        lua.set_function("LoopInGameThread", [](sol::this_environment te, double delay_ms, sol::function callback) -> uint64_t
+                         { return add_action(callback, delay_ms, 0, true, false, true, owner_from_env(te)); });
 
         // ── Frame-based variants ─────────────────────────────────────────
 
         // ── ExecuteWithDelayFrames(delayInFrames, callback) → handle
-        lua.set_function("ExecuteWithDelayFrames", [](int delay_frames, sol::function callback) -> uint64_t
-                         { return add_action(callback, 0, delay_frames, false, true, true); });
+        lua.set_function("ExecuteWithDelayFrames", [](sol::this_environment te, int delay_frames, sol::function callback) -> uint64_t
+                         { return add_action(callback, 0, delay_frames, false, true, true, owner_from_env(te)); });
 
         // ── LoopAsyncFrames(delayInFrames, callback) → handle
-        lua.set_function("LoopAsyncFrames", [](int delay_frames, sol::function callback) -> uint64_t
-                         { return add_action(callback, 0, delay_frames, true, true, false); });
+        lua.set_function("LoopAsyncFrames", [](sol::this_environment te, int delay_frames, sol::function callback) -> uint64_t
+                         { return add_action(callback, 0, delay_frames, true, true, false, owner_from_env(te)); });
 
         // ── LoopInGameThreadFrames(delayInFrames, callback) → handle
-        lua.set_function("LoopInGameThreadFrames", [](int delay_frames, sol::function callback) -> uint64_t
-                         { return add_action(callback, 0, delay_frames, true, true, true); });
+        lua.set_function("LoopInGameThreadFrames", [](sol::this_environment te, int delay_frames, sol::function callback) -> uint64_t
+                         { return add_action(callback, 0, delay_frames, true, true, true, owner_from_env(te)); });
 
         // ── ExecuteInGameThreadWithDelayFrames(delayInFrames, callback) → handle
-        lua.set_function("ExecuteInGameThreadWithDelayFrames", [](int delay_frames, sol::function callback) -> uint64_t
-                         { return add_action(callback, 0, delay_frames, false, true, true); });
+        lua.set_function("ExecuteInGameThreadWithDelayFrames", [](sol::this_environment te, int delay_frames, sol::function callback) -> uint64_t
+                         { return add_action(callback, 0, delay_frames, false, true, true, owner_from_env(te)); });
 
         // ── Handle management ────────────────────────────────────────────
 

@@ -121,9 +121,15 @@ namespace reflection
         uintptr_t end;
     };
     static std::vector<MemRange> s_readable_ranges;
+    // Guards s_readable_ranges. Recursive so is_readable_ptr can hold it while it
+    // triggers a rebuild. get_short_name now consults is_readable_ptr on EVERY
+    // reflection access (potentially from whatever thread a mod's hook runs on),
+    // so the snapshot must be both mutated and searched under this lock.
+    static std::recursive_mutex s_ranges_mutex;
 
     static void build_memory_map()
     {
+        std::lock_guard<std::recursive_mutex> lock(s_ranges_mutex);
         s_readable_ranges.clear();
         FILE *f = fopen("/proc/self/maps", "r");
         if (!f)
@@ -159,27 +165,58 @@ namespace reflection
         build_memory_map();
     }
 
-    // Check if a pointer is in a readable memory range (from /proc/self/maps snapshot)
-    static bool is_readable_ptr(const void *p)
+    // Check if a pointer is in a readable memory range (from /proc/self/maps snapshot).
+    // This is the ONLY validation that rejects a pointer which passes ue::is_valid_ptr()
+    // (any in-range 48-bit address) but points to an UNMAPPED page — e.g. a stale/garbage
+    // UObject such as 0x3c00_0000_0000. get_short_name() consults this before dereferencing.
+    // Exposed via reflection_walker.h so callers with uncertain-liveness pointers (e.g. the
+    // rebuilder's tracked instance list) can reject freed objects before dereferencing them.
+    bool is_readable_ptr(const void *p)
     {
         if (!p)
             return false;
-        uintptr_t addr = reinterpret_cast<uintptr_t>(p);
-        if (addr < 0x10000)
+        // ARM64 TBI: strip the tag byte before comparing against the (untagged) ranges.
+        uintptr_t addr = reinterpret_cast<uintptr_t>(p) & 0x00FFFFFFFFFFFFFFULL;
+        if (addr < 0x10000 || addr >= 0x0001000000000000ULL)
             return false;
 
-        // If memory map wasn't built, fall back to basic range check
-        if (s_readable_ranges.empty())
-            return ue::is_valid_ptr(p);
+        std::lock_guard<std::recursive_mutex> lock(s_ranges_mutex);
 
-        // Binary search: find the first range whose start > addr, then check the one before it
-        auto it = std::upper_bound(s_readable_ranges.begin(), s_readable_ranges.end(), addr,
-                                   [](uintptr_t val, const MemRange &r)
-                                   { return val < r.start; });
-        if (it != s_readable_ranges.begin())
+        // Lazily build the snapshot the first time we're consulted at runtime — walk_all()
+        // is no longer the only caller now that get_short_name() validates every access.
+        if (s_readable_ranges.empty())
+            build_memory_map();
+        if (s_readable_ranges.empty())
+            return ue::is_valid_ptr(p); // /proc/self/maps unavailable — degrade gracefully
+
+        auto in_ranges = [&addr]() -> bool
         {
-            --it;
-            return addr >= it->start && addr < it->end;
+            auto it = std::upper_bound(s_readable_ranges.begin(), s_readable_ranges.end(), addr,
+                                       [](uintptr_t val, const MemRange &r)
+                                       { return val < r.start; });
+            if (it != s_readable_ranges.begin())
+            {
+                --it;
+                return addr >= it->start && addr < it->end;
+            }
+            return false;
+        };
+
+        if (in_ranges())
+            return true;
+
+        // Miss. Could be a genuinely-bad pointer, OR a valid pointer in a region mapped
+        // AFTER our last snapshot (level stream / new UObject chunk). Rebuild at most once
+        // per few consultations and recheck, so we (a) don't blind ourselves to late
+        // allocations and (b) don't hammer /proc/self/maps on every bad pointer.
+        static uint32_t s_calls = 0;
+        static uint32_t s_last_rebuild = 0;
+        ++s_calls;
+        if (s_calls - s_last_rebuild >= 8)
+        {
+            s_last_rebuild = s_calls;
+            build_memory_map();
+            return in_ranges();
         }
         return false;
     }
@@ -413,7 +450,13 @@ namespace reflection
     // ═══ Object name helpers ════════════════════════════════════════════════
     std::string get_short_name(const ue::UObject *obj)
     {
-        if (!obj)
+        // Reject stale/garbage pointers BEFORE dereferencing. uobj_get_name_index()
+        // reads obj+NAME_OFF, which SIGSEGVs on an unmapped pointer (e.g. a freed/stale
+        // LuaUObject a mod still holds). ue::is_valid_ptr() alone is NOT enough — an
+        // address like 0x3c00_0000_0000 is in-range yet unmapped; is_readable_ptr()
+        // confirms the page is actually mapped. This was the tombstone crash
+        // (reflection::get_short_name via a ProcessEvent hook during thumbstick input).
+        if (!obj || !is_readable_ptr(obj))
             return "";
         int32_t name_idx = ue::uobj_get_name_index(obj);
         std::string name = fname_to_string(name_idx);
@@ -427,13 +470,15 @@ namespace reflection
 
     std::string get_full_name(const ue::UObject *obj)
     {
-        if (!obj)
+        // uobj_get_outer(obj) below dereferences obj, so the same unmapped-pointer
+        // guard as get_short_name applies here (and to every outer we walk).
+        if (!obj || !is_readable_ptr(obj))
             return "";
 
         std::string result = get_short_name(obj);
         ue::UObject *outer = ue::uobj_get_outer(obj);
 
-        while (outer && ue::is_valid_ptr(outer))
+        while (outer && is_readable_ptr(outer))
         {
             std::string outer_name = get_short_name(outer);
             if (outer_name.empty())
@@ -447,16 +492,16 @@ namespace reflection
 
     std::string get_package_name(const ue::UObject *obj)
     {
-        if (!obj)
+        if (!obj || !is_readable_ptr(obj))
             return "UnknownPackage";
         // Walk the outer chain to the top-level UPackage
         const ue::UObject *current = obj;
         const ue::UObject *top = obj;
-        while (current && ue::is_valid_ptr(current))
+        while (current && is_readable_ptr(current))
         {
             top = current;
             ue::UObject *outer = ue::uobj_get_outer(current);
-            if (!outer || !ue::is_valid_ptr(outer))
+            if (!outer || !is_readable_ptr(outer))
                 break;
             current = outer;
         }
@@ -1012,19 +1057,37 @@ namespace reflection
         if (symbols::GNames)
         {
             uintptr_t gnames_addr = reinterpret_cast<uintptr_t>(symbols::GNames);
-            s_fname_pool = gnames_addr + ue::GNNAMES_TO_FNAMEPOOL;
-            logger::log_info("REFLECT", "FNamePool at 0x%lX (GNames + 0x%X)",
-                             (unsigned long)s_fname_pool, ue::GNNAMES_TO_FNAMEPOOL);
 
-            // Verify by reading a known name (index 0 should be "None")
-            std::string test = fname_to_string(0);
-            if (test == "None" || test == "none")
+            // Resolve GNames → FNamePool base. Depending on how GNames was discovered it
+            // may BE the FNamePool object (the structural .bss finder returns the pool base
+            // directly) or a wrapper whose FNamePool sits at a fixed offset
+            // (GNNAMES_TO_FNAMEPOOL, e.g. 0x30 on some profiles). Rather than trust one
+            // convention, try the configured offset first then a small set of known
+            // candidates, and LOCK onto whichever makes FName[0] resolve to "None" (index 0
+            // is always NAME_None). This self-corrects across GNames-discovery methods.
+            const int32_t cand_offsets[] = {
+                static_cast<int32_t>(ue::GNNAMES_TO_FNAMEPOOL), 0x0, 0x30, 0x10, 0x8};
+            bool name_ok = false;
+            for (int32_t off : cand_offsets)
             {
-                logger::log_info("REFLECT", "FName[0] = \"%s\" — name resolution working", test.c_str());
+                s_fname_pool = gnames_addr + off;
+                std::string test = fname_to_string(0);
+                if (test == "None" || test == "none")
+                {
+                    logger::log_info("REFLECT",
+                                     "FNamePool at 0x%lX (GNames + 0x%X) — FName[0]=\"None\" OK",
+                                     (unsigned long)s_fname_pool, off);
+                    name_ok = true;
+                    break;
+                }
             }
-            else
+            if (!name_ok)
             {
-                logger::log_warn("REFLECT", "FName[0] = \"%s\" — unexpected, name resolution may be misconfigured", test.c_str());
+                s_fname_pool = gnames_addr + ue::GNNAMES_TO_FNAMEPOOL;
+                logger::log_warn("REFLECT",
+                                 "FName[0] != \"None\" at any candidate offset — name resolution may be "
+                                 "misconfigured (GNames=0x%lX, using +0x%X)",
+                                 (unsigned long)gnames_addr, ue::GNNAMES_TO_FNAMEPOOL);
             }
 
             // Walk the first few REAL FNamePool entries (matching UE4Dumper's DumpBlocks423 logic)

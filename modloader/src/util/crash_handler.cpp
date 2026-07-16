@@ -27,66 +27,43 @@
 #include <time.h>
 #include <setjmp.h>
 
-// Safe-call crash recovery state — defined in native_hooks.cpp
-// When a hooked original function crashes, dispatch_full() has set
-// g_in_hook_original_call=1. We detect this and siglongjmp back to
-// dispatch_full() which returns safe defaults instead of crashing.
-extern thread_local volatile int g_in_hook_original_call;
-extern thread_local sigjmp_buf g_hook_recovery_jmp;
-
-// Hook installation crash recovery — defined in native_hooks.cpp
-// When DobbyHook() crashes during trampoline installation (bad address,
-// unmapped memory, function too small), install_at() has set
-// g_in_hook_install=1. We siglongjmp back so install_at() returns 0.
-extern thread_local volatile int g_in_hook_install;
-extern thread_local sigjmp_buf g_hook_install_jmp;
-
-// ProcessEvent crash recovery — defined in lua_uobject.cpp
-// When Call()/CallBg() invokes ProcessEvent and the target UFunction
-// crashes (SIGSEGV/SIGBUS), we siglongjmp back to the Call() wrapper
-// which returns nil/false instead of killing the process.
-namespace lua_uobject
-{
-    extern thread_local volatile int g_in_call_ufunction;
-    extern thread_local sigjmp_buf g_call_ufunction_jmp;
-    extern thread_local volatile uintptr_t g_call_ufunction_fault_addr;
-}
-
-// Mod loading crash recovery — defined in mod_loader.cpp
-// When a mod's main.lua causes a SIGSEGV during loading, we siglongjmp
-// back to load_mod() which marks the mod as FAILED and continues.
-// This is the LOWEST PRIORITY recovery — checked AFTER all inner guards
-// (safe_call, hook install, hook execution, ProcessEvent) so that
-// crashes in those subsystems are handled locally instead of killing
-// the entire mod.
-namespace mod_loader
-{
-    extern thread_local sigjmp_buf s_mod_jmpbuf;
-    extern thread_local volatile sig_atomic_t s_in_mod_loading;
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// CRASH-HIDING RECOVERY REMOVED (intentionally).
+//
+// This handler used to consult FIVE siglongjmp "recovery" guards — safe_call
+// regions, hook installation, hooked-original calls, ProcessEvent/Call, and mod
+// loading. On a fatal signal inside any of them, it jumped back to a checkpoint
+// that RESUMED execution while returning a fake default (nil / 0 / skip-the-mod).
+// That silently swallowed real SIGSEGV/SIGBUS faults — a dangling-pointer deref
+// inside a hooked game function, a UFunction, or a mod became an invisible
+// "return nil" instead of a crash, so genuine bugs never surfaced.
+//
+// ALL FIVE are now GONE. A fatal fault is never resumed: the handler writes a
+// crash report (for faults inside libmodloader.so) and chains to the platform
+// handler so debuggerd produces a real tombstone.
+//
+// The one legitimate use of the old recovery — safe_call::probe_read /
+// safe_memcpy testing unknown pointers during boot-time offset discovery — was
+// FIXED at the root instead of recovered: those primitives now test readability
+// through the kernel (pread on /proc/self/mem, which returns an error rather
+// than raising SIGSEGV), so the scanner probes garbage addresses without ever
+// faulting. A readability test that crashes on unreadable memory was itself the
+// bug. The inert scaffolding still in safe_call.cpp / native_hooks.cpp /
+// lua_uobject.cpp / mod_loader.cpp (sigsetjmp checkpoints never jumped to) is
+// harmless; its try/catch still guards C++ exceptions, a separate category from
+// these hardware faults. Crashes are meant to be seen and fixed, not hidden.
+// ═══════════════════════════════════════════════════════════════════════════
 
 namespace crash_handler
 {
 
+    // Previous handlers, captured when we install()/reinstall() on top. A fatal
+    // fault chains to these (the VR runtime / debuggerd) so a real tombstone is
+    // produced after we write our report.
     static struct sigaction s_old_sigsegv;
     static struct sigaction s_old_sigabrt;
     static struct sigaction s_old_sigbus;
     static struct sigaction s_old_sigfpe;
-
-    // Original platform handlers captured at first install().
-    // These are used as a stable fallback so we keep debuggerd/tombstones working.
-    static struct sigaction s_orig_sigsegv;
-    static struct sigaction s_orig_sigabrt;
-    static struct sigaction s_orig_sigbus;
-    static struct sigaction s_orig_sigfpe;
-
-    // Tombstone-first mode:
-    // When true, forward fatal signals immediately to previous/system handlers
-    // and skip all in-process recovery guards.
-    //
-    // Keep this OFF in production so safe_call / hook / ProcessEvent siglongjmp
-    // recovery can prevent expected mod-side faults from killing the game.
-    static constexpr bool kTombstoneOnlyMode = false;
 
     // Boot grace period — skip SIGABRT logging during first 5 seconds.
     // Frida's gadget (libfrda.so) calls abort() ~1.4s after boot which
@@ -213,88 +190,12 @@ namespace crash_handler
         return "unknown code";
     }
 
-    static void forward_to_handler_or_default(int sig, siginfo_t *info, void *ucontext_raw)
-    {
-        struct sigaction *old_action = nullptr;
-        switch (sig)
-        {
-        case SIGSEGV:
-            old_action = &s_old_sigsegv;
-            break;
-        case SIGABRT:
-            old_action = &s_old_sigabrt;
-            break;
-        case SIGBUS:
-            old_action = &s_old_sigbus;
-            break;
-        case SIGFPE:
-            old_action = &s_old_sigfpe;
-            break;
-        }
-
-        if (old_action && old_action->sa_sigaction)
-        {
-            old_action->sa_sigaction(sig, info, ucontext_raw);
-            return;
-        }
-        if (old_action && old_action->sa_handler != SIG_DFL && old_action->sa_handler != SIG_IGN)
-        {
-            old_action->sa_handler(sig);
-            return;
-        }
-
-        // Fallback to original system handlers captured at initial install.
-        struct sigaction *orig = nullptr;
-        switch (sig)
-        {
-        case SIGSEGV:
-            orig = &s_orig_sigsegv;
-            break;
-        case SIGABRT:
-            orig = &s_orig_sigabrt;
-            break;
-        case SIGBUS:
-            orig = &s_orig_sigbus;
-            break;
-        case SIGFPE:
-            orig = &s_orig_sigfpe;
-            break;
-        }
-        if (orig && orig->sa_sigaction)
-        {
-            orig->sa_sigaction(sig, info, ucontext_raw);
-            return;
-        }
-        if (orig && orig->sa_handler != SIG_DFL && orig->sa_handler != SIG_IGN)
-        {
-            orig->sa_handler(sig);
-            return;
-        }
-
-        signal(sig, SIG_DFL);
-        if (sig == SIGABRT)
-        {
-            raise(SIGABRT);
-            while (true)
-            {
-                pause();
-            }
-        }
-        // For synchronous faults (SIGSEGV/SIGBUS/SIGFPE), return under SIG_DFL,
-        // letting the fault re-trigger and debuggerd generate a tombstone.
-    }
-
     static void crash_handler_fn(int sig, siginfo_t *info, void *ucontext_raw)
     {
-        if (kTombstoneOnlyMode)
-        {
-            forward_to_handler_or_default(sig, info, ucontext_raw);
-            return;
-        }
-
         // ── SIGABRT BOOT GRACE PERIOD ────────────────────────────────────────
-        // During the first ~5s, Frida's gadget calls abort() which is expected.
-        // Don't intercept it — let the old handler deal with it.
+        // During the first ~5s, Frida's gadget calls abort() which is expected
+        // (not a real bug). Forward it to the old handler. This is NOT crash
+        // suppression — it's letting a known-benign startup abort proceed.
         if (sig == SIGABRT && !s_boot_complete)
         {
             if (s_old_sigabrt.sa_sigaction)
@@ -309,66 +210,14 @@ namespace crash_handler
             return;
         }
 
-        // ── SAFE_CALL RECOVERY (highest priority) ────────────────────────────
-        // If we're inside a safe_call::execute() region, recover via siglongjmp.
-        // This is the modern, unified recovery path for all modloader code.
-        if (safe_call::is_in_safe_region())
-        {
-            uintptr_t fault = info ? reinterpret_cast<uintptr_t>(info->si_addr) : 0;
-            safe_call::signal_recovery(sig, fault);
-            // Never reaches here — siglongjmp jumps back to safe_call::execute()
-        }
-
-        // ── HOOK INSTALL CRASH RECOVERY ──────────────────────────────────────
-        // If this crash happened while DobbyHook() was installing a trampoline
-        // (inside install_at), recover via siglongjmp. install_at() returns 0
-        // and the mod continues loading without the failed hook.
-        if (g_in_hook_install)
-        {
-            g_in_hook_install = 0;
-            siglongjmp(g_hook_install_jmp, sig);
-            // Never reaches here
-        }
-
-        // ── HOOK SAFE-CALL RECOVERY ──────────────────────────────────────────
-        // If this crash happened while executing a hooked original function
-        // (inside the asm blr call in dispatch_full), recover via siglongjmp
-        // instead of killing the process. dispatch_full() returns safe defaults.
-        // This catches crashes from dangling pointers, corrupted vtables, etc.
-        // that happen inside game functions called through modloader hooks.
-        if (g_in_hook_original_call)
-        {
-            g_in_hook_original_call = 0;
-            siglongjmp(g_hook_recovery_jmp, sig);
-            // Never reaches here — siglongjmp jumps to sigsetjmp in dispatch_full
-        }
-
-        // ── PROCESSEVENT CRASH RECOVERY ──────────────────────────────────────
-        // If this crash happened inside ProcessEvent called from Lua's Call(),
-        // CallBg(), or CallRaw(), recover via siglongjmp. The Call() wrapper
-        // returns nil/false and logs the crash instead of killing the process.
-        // This protects against UFunction implementations that crash due to
-        // uninitialized state, null pointers, or unsupported parameter combos.
-        if (lua_uobject::g_in_call_ufunction)
-        {
-            lua_uobject::g_call_ufunction_fault_addr = info ? reinterpret_cast<uintptr_t>(info->si_addr) : 0;
-            lua_uobject::g_in_call_ufunction = 0;
-            siglongjmp(lua_uobject::g_call_ufunction_jmp, sig);
-            // Never reaches here
-        }
-
-        // ── MOD LOADING CRASH RECOVERY (lowest priority) ────────────────────
-        // If we're inside a mod's main.lua execution and none of the inner
-        // recovery guards above caught this crash, recover here.
-        // This is the LAST resort — it kills the current mod and skips to the
-        // next one, but it must be checked AFTER all inner guards so that e.g.
-        // a DobbyHook() crash during hook installation jumps to the hook-install
-        // guard (which just skips that hook) instead of killing the entire mod.
-        if (mod_loader::s_in_mod_loading)
-        {
-            siglongjmp(mod_loader::s_mod_jmpbuf, sig);
-            // Never reaches here
-        }
+        // NOTE: ALL five siglongjmp recovery guards that used to sit here —
+        // safe_call regions, hook install, hooked-original call, ProcessEvent/
+        // Call, and mod load — have been REMOVED (see the file-top banner). No
+        // fatal fault is resumed anymore. Memory probing that used to fault-and-
+        // recover (safe_call::probe_read / safe_memcpy) is now non-faulting
+        // (/proc/self/mem), so the boot-time offset scanner needs no recovery.
+        // Everything else that faults is a real bug: we report it (if it's ours)
+        // and let it become a tombstone so it can be found and fixed.
 
         // Determine if crash PC is inside libmodloader.so or game code.
         ucontext_t *uc = static_cast<ucontext_t *>(ucontext_raw);
@@ -669,12 +518,6 @@ namespace crash_handler
         sigaction(SIGABRT, &sa, &s_old_sigabrt);
         sigaction(SIGBUS, &sa, &s_old_sigbus);
         sigaction(SIGFPE, &sa, &s_old_sigfpe);
-
-        // Save original handlers once for stable fallback chaining.
-        s_orig_sigsegv = s_old_sigsegv;
-        s_orig_sigabrt = s_old_sigabrt;
-        s_orig_sigbus = s_old_sigbus;
-        s_orig_sigfpe = s_old_sigfpe;
     }
 
     void mark_boot_complete()
@@ -706,6 +549,16 @@ namespace crash_handler
         sigaction(SIGBUS, nullptr, &cur_bus);
         sigaction(SIGFPE, nullptr, &cur_fpe);
 
+        // Did something (VR runtime / Frida) actually replace one of ours since
+        // last time? Only then is a re-install meaningful — and only then do we
+        // log. This watchdog runs every ~5s; logging unconditionally spammed the
+        // log with an identical line forever. Silent when nothing changed.
+        bool replaced =
+            (cur_segv.sa_sigaction != crash_handler_fn) ||
+            (cur_abrt.sa_sigaction != crash_handler_fn && s_boot_complete) ||
+            (cur_bus.sa_sigaction != crash_handler_fn) ||
+            (cur_fpe.sa_sigaction != crash_handler_fn);
+
         // Re-install ours.
         sigaction(SIGSEGV, &sa, nullptr);
         sigaction(SIGABRT, &sa, nullptr);
@@ -722,7 +575,8 @@ namespace crash_handler
         if (cur_fpe.sa_sigaction != crash_handler_fn)
             s_old_sigfpe = cur_fpe;
 
-        logger::log_info("CRASH", "Signal handler re-installed (protecting against runtime handler replacement)");
+        if (replaced)
+            logger::log_info("CRASH", "Signal handler re-asserted (a runtime handler had replaced ours)");
     }
 
 } // namespace crash_handler

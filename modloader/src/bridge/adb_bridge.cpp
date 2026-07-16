@@ -14,6 +14,7 @@
 #include "modloader/class_rebuilder.h"
 #include "modloader/object_monitor.h"
 #include "modloader/symbols.h"
+#include "modloader/safe_call.h"
 #include "modloader/logger.h"
 #include "modloader/paths.h"
 #include "modloader/aes_extractor.h"
@@ -24,15 +25,23 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <cerrno>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
 #include <unordered_map>
 #include <functional>
 #include <memory>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <algorithm>
+#include <cctype>
 
 using json = nlohmann::json;
 
@@ -69,6 +78,15 @@ namespace adb_bridge
         logger::log_info("ADB", "Registered custom command: '%s'", name.c_str());
     }
 
+    void unregister_command(const std::string &name)
+    {
+        std::lock_guard<std::mutex> lock(s_command_mutex);
+        if (s_custom_commands.erase(name) > 0)
+        {
+            logger::log_info("ADB", "Unregistered custom command: '%s'", name.c_str());
+        }
+    }
+
     std::vector<std::string> get_registered_commands()
     {
         std::lock_guard<std::mutex> lock(s_command_mutex);
@@ -102,7 +120,206 @@ namespace adb_bridge
         return resp.dump() + "\n";
     }
 
+    // ═══ NATIVE memory primitives ═══════════════════════════════════════════
+    // mem_read / mem_write / mem_read_bytes / mem_regions / module_base run
+    // ENTIRELY on the bridge socket thread via /proc/self/mem + /proc/self/maps.
+    // They deliberately do NOT queue on the game thread: reading process memory
+    // needs no UE reflection, and the game thread is frozen whenever the VR
+    // runtime pauses the app (headset off face / proximity sleep) or during
+    // cutscenes that stall the tick. Previously these were shipped as exec_lua
+    // wrappers (MemReadU64 etc.), so they timed out exactly when you most need
+    // to inspect live memory. Now they always work while the process is alive.
+
+    // Shared /proc/self/mem fd (kernel-mediated R/W; works on PROT_NONE pages).
+    static int bridge_mem_fd()
+    {
+        static int fd = -1;
+        if (fd < 0)
+            fd = open("/proc/self/mem", O_RDWR);
+        return fd;
+    }
+
+    // Parse an address/value field that may arrive as a JSON string ("0x..",
+    // decimal) or a JSON number. Strings avoid float precision loss on >2^53
+    // addresses, so the MCP sends decimal strings; we accept both for safety.
+    static uint64_t json_u64(const json &j, uint64_t dflt = 0)
+    {
+        if (j.is_string())
+            return strtoull(j.get<std::string>().c_str(), nullptr, 0);
+        if (j.is_number_unsigned())
+            return j.get<uint64_t>();
+        if (j.is_number_integer())
+            return (uint64_t)j.get<int64_t>();
+        if (j.is_number_float())
+            return (uint64_t)(int64_t)j.get<double>();
+        return dflt;
+    }
+
+    static bool mem_type_size(const std::string &t, int &size, char &kind)
+    {
+        if (t == "u8"  || t == "i8")  { size = 1; kind = (t[0]=='i')?'s':'u'; return true; }
+        if (t == "u16" || t == "i16") { size = 2; kind = (t[0]=='i')?'s':'u'; return true; }
+        if (t == "u32" || t == "i32") { size = 4; kind = (t[0]=='i')?'s':'u'; return true; }
+        if (t == "u64" || t == "i64") { size = 8; kind = (t[0]=='i')?'s':'u'; return true; }
+        if (t == "f32" || t == "float") { size = 4; kind = 'f'; return true; }
+        if (t == "f64" || t == "double") { size = 8; kind = 'd'; return true; }
+        return false;
+    }
+
+    static std::string handle_mem_read(const json &cmd)
+    {
+        if (!cmd.contains("addr"))
+            return error_response("mem_read: missing 'addr'");
+        uint64_t addr = json_u64(cmd["addr"]);
+        std::string type = cmd.value("type", std::string("u64"));
+        int size = 8; char kind = 'u';
+        if (!mem_type_size(type, size, kind))
+            return error_response("mem_read: bad type '" + type + "'");
+        int fd = bridge_mem_fd();
+        if (fd < 0)
+            return error_response("mem_read: cannot open /proc/self/mem");
+        uint64_t bits = 0;
+        if (pread64(fd, &bits, size, (off64_t)addr) != size)
+            return error_response("mem_read: read failed at 0x" + [&]{ char b[24]; snprintf(b,sizeof b,"%llX",(unsigned long long)addr); return std::string(b); }() + " (unmapped?)");
+        char val[64];
+        switch (kind)
+        {
+        case 'f': { float f; std::memcpy(&f, &bits, 4); snprintf(val, sizeof val, "%g", (double)f); break; }
+        case 'd': { double d; std::memcpy(&d, &bits, 8); snprintf(val, sizeof val, "%g", d); break; }
+        case 's':
+            if (size == 1) snprintf(val, sizeof val, "%d", (int)(int8_t)(uint8_t)bits);
+            else if (size == 2) snprintf(val, sizeof val, "%d", (int)(int16_t)(uint16_t)bits);
+            else if (size == 4) snprintf(val, sizeof val, "%d", (int)(int32_t)(uint32_t)bits);
+            else snprintf(val, sizeof val, "%lld", (long long)bits);
+            break;
+        default:
+            if (size == 1) snprintf(val, sizeof val, "%u", (unsigned)(uint8_t)bits);
+            else if (size == 2) snprintf(val, sizeof val, "%u", (unsigned)(uint16_t)bits);
+            else if (size == 4) snprintf(val, sizeof val, "%u", (unsigned)(uint32_t)bits);
+            else snprintf(val, sizeof val, "%llu", (unsigned long long)bits);
+            break;
+        }
+        char out[160];
+        snprintf(out, sizeof out, "0x%llX = %s (%s)", (unsigned long long)addr, val, type.c_str());
+        return ok_response(std::string(out));
+    }
+
+    static std::string handle_mem_write(const json &cmd)
+    {
+        if (!cmd.contains("addr") || !cmd.contains("value"))
+            return error_response("mem_write: missing 'addr'/'value'");
+        uint64_t addr = json_u64(cmd["addr"]);
+        std::string type = cmd.value("type", std::string("u64"));
+        int size = 8; char kind = 'u';
+        if (!mem_type_size(type, size, kind))
+            return error_response("mem_write: bad type '" + type + "'");
+        // Value comes as a string/number; interpret via double (Lua-number parity)
+        // then reinterpret into the target width.
+        double dv = 0.0;
+        if (cmd["value"].is_string()) dv = strtod(cmd["value"].get<std::string>().c_str(), nullptr);
+        else if (cmd["value"].is_number()) dv = cmd["value"].get<double>();
+        uint64_t bits = 0;
+        if (kind == 'f') { float f = (float)dv; std::memcpy(&bits, &f, 4); }
+        else if (kind == 'd') { std::memcpy(&bits, &dv, 8); }
+        else { long long iv = (long long)dv; bits = (uint64_t)iv; }
+        int fd = bridge_mem_fd();
+        if (fd < 0)
+            return error_response("mem_write: cannot open /proc/self/mem");
+        bool ok = (pwrite64(fd, &bits, size, (off64_t)addr) == size);
+        char out[160];
+        snprintf(out, sizeof out, "write 0x%llX = %g (%s) -> %s",
+                 (unsigned long long)addr, dv, type.c_str(), ok ? "true" : "false");
+        return ok_response(std::string(out));
+    }
+
+    static std::string handle_mem_read_bytes(const json &cmd)
+    {
+        if (!cmd.contains("addr"))
+            return error_response("mem_read_bytes: missing 'addr'");
+        uint64_t addr = json_u64(cmd["addr"]);
+        int len = cmd.value("len", 32);
+        if (len <= 0 || len > 4096)
+            return error_response("mem_read_bytes: len out of range (1..4096)");
+        int fd = bridge_mem_fd();
+        if (fd < 0)
+            return error_response("mem_read_bytes: cannot open /proc/self/mem");
+        std::vector<uint8_t> buf(len, 0);
+        if (pread64(fd, buf.data(), len, (off64_t)addr) != len)
+            return error_response("mem_read_bytes: read failed (unmapped?)");
+        static const char *hx = "0123456789abcdef";
+        std::string s; s.reserve(len * 2);
+        for (int i = 0; i < len; i++) { s += hx[buf[i] >> 4]; s += hx[buf[i] & 0xF]; }
+        return ok_response(s);
+    }
+
+    static std::string handle_mem_regions(const json &cmd)
+    {
+        std::string filter = cmd.value("filter", std::string(""));
+        std::ifstream maps("/proc/self/maps");
+        if (!maps.is_open())
+            return error_response("mem_regions: cannot open /proc/self/maps");
+        std::string line;
+        std::vector<std::string> rows;
+        while (std::getline(maps, line))
+        {
+            uintptr_t s = 0, e = 0; char perms[8] = {0}; char path[512] = {0};
+            int n = sscanf(line.c_str(), "%lx-%lx %7s %*s %*s %*s %511[^\n]", &s, &e, perms, path);
+            if (n < 3) continue;
+            std::string p = (n >= 4) ? path : "";
+            if (!filter.empty() && p.find(filter) == std::string::npos) continue;
+            char b[640];
+            snprintf(b, sizeof b, "0x%llX-0x%llX %s %-9llu %s",
+                     (unsigned long long)s, (unsigned long long)e, perms,
+                     (unsigned long long)(e - s), p.c_str());
+            rows.push_back(b);
+        }
+        std::string out = std::to_string(rows.size()) + " regions\n";
+        for (size_t i = 0; i < rows.size(); i++) { out += rows[i]; if (i + 1 < rows.size()) out += "\n"; }
+        return ok_response(out);
+    }
+
+    static std::string handle_module_base(const json &cmd)
+    {
+        std::string want = cmd.value("name", std::string("libUnreal.so"));
+        std::ifstream maps("/proc/self/maps");
+        if (!maps.is_open())
+            return error_response("module_base: cannot open /proc/self/maps");
+        std::string line; uintptr_t best = 0;
+        while (std::getline(maps, line))
+        {
+            uintptr_t s = 0, e = 0; char pr[8] = {0}; char path[512] = {0};
+            int n = sscanf(line.c_str(), "%lx-%lx %7s %*s %*s %*s %511[^\n]", &s, &e, pr, path);
+            if (n < 4) continue;
+            std::string p = path;
+            if (p.find(want) != std::string::npos && (best == 0 || s < best)) best = s;
+        }
+        char out[32];
+        snprintf(out, sizeof out, "0x%llX", (unsigned long long)best);
+        return ok_response(std::string(out));
+    }
+
     // ═══ Command handlers ═══════════════════════════════════════════════════
+
+    // Forward decl — mod enable/disable/unload handlers (defined below) queue
+    // work onto the game thread via this helper, which is defined further down.
+    static bool run_modop_on_game_thread(const std::function<bool()> &fn, int timeout_s, bool &timed_out);
+
+    static const char *mod_status_str(mod_loader::ModStatus s)
+    {
+        switch (s)
+        {
+        case mod_loader::ModStatus::LOADED:
+            return "loaded";
+        case mod_loader::ModStatus::ERRORED:
+            return "errored";
+        case mod_loader::ModStatus::DISABLED:
+            return "disabled";
+        case mod_loader::ModStatus::UNLOADED:
+            return "unloaded";
+        default:
+            return "failed";
+        }
+    }
 
     static std::string handle_list_mods()
     {
@@ -112,13 +329,55 @@ namespace adb_bridge
         {
             json entry;
             entry["name"] = m.name;
-            entry["status"] = (m.status == mod_loader::ModStatus::LOADED) ? "loaded" : (m.status == mod_loader::ModStatus::ERRORED) ? "errored"
-                                                                                                                                    : "failed";
+            entry["status"] = mod_status_str(m.status);
+            entry["enabled"] = m.enabled;
             entry["errors"] = m.error_count;
             if (!m.error.empty())
                 entry["last_error"] = m.error;
             result.push_back(entry);
         }
+        return ok_response(result);
+    }
+
+    // enable/disable/unload a single mod — must run on the game thread because
+    // tearing a mod down drops the sol::function refs its hooks hold (touching
+    // the game-thread-owned Lua state), and re-enabling executes Lua.
+    static std::string handle_mod_toggle(const json &payload, int mode)
+    {
+        // mode: 0 = enable, 1 = disable, 2 = unload
+        if (!payload.contains("name"))
+            return error_response("missing 'name' parameter");
+        std::string name = payload["name"];
+        bool timed_out = false;
+        bool ok = run_modop_on_game_thread([name, mode]()
+                                           {
+            switch (mode) {
+            case 0: return mod_loader::enable_mod(name);
+            case 1: return mod_loader::disable_mod(name);
+            default: return mod_loader::unload_mod(name);
+            } }, 20, timed_out);
+        const char *verb = (mode == 0) ? "enable" : (mode == 1) ? "disable"
+                                                                 : "unload";
+        if (timed_out)
+            return error_response(std::string(verb) + " queued on game thread but exceeded 20s; it may still finish");
+        std::string msg = std::string(verb) + (ok ? "d: " : " (no-op): ") + name;
+        return ok_response(msg);
+    }
+
+    static std::string handle_set_all_mods(const json &payload)
+    {
+        bool enabled = payload.value("enabled", true);
+        bool timed_out = false;
+        int affected = 0;
+        run_modop_on_game_thread([enabled, &affected]()
+                                 {
+            affected = mod_loader::set_all_enabled(enabled);
+            return true; }, 60, timed_out);
+        if (timed_out)
+            return error_response("set_all_mods queued on game thread but exceeded 60s; it may still finish");
+        json result;
+        result["enabled"] = enabled;
+        result["affected"] = affected;
         return ok_response(result);
     }
 
@@ -235,7 +494,10 @@ namespace adb_bridge
                 // Mark as cancelled so the queued lambda skips execution
                 ctx->cancelled.store(true, std::memory_order_release);
                 logger::log_warn("ADB", "exec_lua: timed out, marking queued command as cancelled");
-                return error_response("exec_lua timed out (game thread did not process within 8s)");
+                return error_response(
+                    "exec_lua timed out (game thread did not drain queue in 8s). If persistent, the "
+                    "game thread is frozen (headset off / proximity sleep) — put the headset on. "
+                    "mem_read/mem_write/mem_regions/module_base run natively and work regardless.");
             }
         }
 
@@ -486,6 +748,342 @@ namespace adb_bridge
         return ok_response(result);
     }
 
+    // ═══ Live object inspector ══════════════════════════════════════════════
+    // list_instances / inspect read live UObject state for the PCBridge object
+    // inspector. CRITICAL: every game-memory read goes through the non-faulting
+    // safe_call::safe_memcpy (/proc/self/mem). With the crash suppressor removed,
+    // a raw deref of a stale/freed instance would tombstone the GAME — inspecting
+    // must never do that. A bad read simply yields "<unreadable>".
+
+    // Read a UE FString (u16 chars) safely; truncates long strings for display.
+    static std::string read_fstring_safe(const void *fstr_addr)
+    {
+        struct FStr
+        {
+            const char16_t *data;
+            int32_t num, max;
+        } fs{};
+        if (!safe_call::safe_memcpy(&fs, fstr_addr, sizeof(fs)))
+            return std::string();
+        if (!fs.data || fs.num <= 0 || fs.num > 8192)
+            return std::string();
+        int n = fs.num > 256 ? 256 : fs.num;
+        std::vector<char16_t> tmp(n, 0);
+        if (!safe_call::safe_memcpy(tmp.data(), fs.data, (size_t)n * sizeof(char16_t)))
+            return std::string();
+        std::string out;
+        for (int i = 0; i < n && tmp[i]; i++)
+        {
+            char16_t c = tmp[i];
+            out += (c < 0x80) ? (char)c : '?';
+        }
+        return out;
+    }
+
+    // Describe an object-typed property target: "ClassName @ 0xADDR" or "null".
+    static std::string describe_obj_ptr(const uint8_t *buf)
+    {
+        ue::UObject *o = *reinterpret_cast<ue::UObject *const *>(buf);
+        if (!o || !ue::is_mapped_ptr(o))
+            return o ? "0x?(bad)" : "null";
+        ue::UClass *cls = ue::uobj_get_class(o);
+        std::string cn = (cls && ue::is_valid_ptr(cls))
+                             ? reflection::get_short_name(reinterpret_cast<const ue::UObject *>(cls))
+                             : "UObject";
+        char b[96];
+        snprintf(b, sizeof(b), "%s @ 0x%lX", cn.c_str(), (unsigned long)reinterpret_cast<uintptr_t>(o));
+        return std::string(b);
+    }
+
+    // Format one property's live value as a JSON value (typed where possible).
+    static json format_prop_value(const rebuilder::RebuiltProperty &p, ue::UObject *obj)
+    {
+        const uint8_t *base = reinterpret_cast<const uint8_t *>(obj) + p.offset;
+        uint8_t buf[16] = {0};
+
+        auto read = [&](size_t n) -> bool
+        {
+            return n <= sizeof(buf) && safe_call::safe_memcpy(buf, base, n);
+        };
+
+        switch (p.type)
+        {
+        case reflection::PropType::BoolProperty:
+        {
+            uint8_t b = 0;
+            if (!safe_call::safe_memcpy(&b, base + p.bool_byte_offset_extra, 1))
+                return "<unreadable>";
+            return p.bool_byte_mask ? ((b & p.bool_byte_mask) != 0) : (b != 0);
+        }
+        case reflection::PropType::IntProperty:
+            return read(4) ? json(*reinterpret_cast<int32_t *>(buf)) : json("<unreadable>");
+        case reflection::PropType::UInt32Property:
+            return read(4) ? json(*reinterpret_cast<uint32_t *>(buf)) : json("<unreadable>");
+        case reflection::PropType::Int64Property:
+            return read(8) ? json(*reinterpret_cast<int64_t *>(buf)) : json("<unreadable>");
+        case reflection::PropType::UInt64Property:
+            return read(8) ? json(*reinterpret_cast<uint64_t *>(buf)) : json("<unreadable>");
+        case reflection::PropType::Int16Property:
+            return read(2) ? json(*reinterpret_cast<int16_t *>(buf)) : json("<unreadable>");
+        case reflection::PropType::UInt16Property:
+            return read(2) ? json(*reinterpret_cast<uint16_t *>(buf)) : json("<unreadable>");
+        case reflection::PropType::Int8Property:
+            return read(1) ? json((int)*reinterpret_cast<int8_t *>(buf)) : json("<unreadable>");
+        case reflection::PropType::ByteProperty:
+            return read(1) ? json((unsigned)buf[0]) : json("<unreadable>");
+        case reflection::PropType::EnumProperty:
+        {
+            int sz = p.element_size > 0 && p.element_size <= 8 ? p.element_size : 1;
+            if (!read((size_t)sz))
+                return "<unreadable>";
+            int64_t v = 0;
+            std::memcpy(&v, buf, sz);
+            return v;
+        }
+        case reflection::PropType::FloatProperty:
+            return read(4) ? json(*reinterpret_cast<float *>(buf)) : json("<unreadable>");
+        case reflection::PropType::DoubleProperty:
+            return read(8) ? json(*reinterpret_cast<double *>(buf)) : json("<unreadable>");
+        case reflection::PropType::NameProperty:
+            return read(4) ? json(reflection::fname_to_string(*reinterpret_cast<int32_t *>(buf)))
+                           : json("<unreadable>");
+        case reflection::PropType::StrProperty:
+            return read_fstring_safe(base);
+        case reflection::PropType::ObjectProperty:
+        case reflection::PropType::WeakObjectProperty:
+        case reflection::PropType::LazyObjectProperty:
+        case reflection::PropType::ClassProperty:
+        case reflection::PropType::InterfaceProperty:
+            return read(sizeof(void *)) ? json(describe_obj_ptr(buf)) : json("<unreadable>");
+        case reflection::PropType::TextProperty:
+            return "<FText>";
+        case reflection::PropType::StructProperty:
+            return std::string("<struct ") + p.type_name + ">";
+        case reflection::PropType::ArrayProperty:
+            return "<array>";
+        case reflection::PropType::MapProperty:
+            return "<map>";
+        case reflection::PropType::SetProperty:
+            return "<set>";
+        default:
+            return std::string("<") + p.type_name + ">";
+        }
+    }
+
+    // Resolve an inspect/list target from the payload → UObject* (or class ptr).
+    static ue::UObject *resolve_target_object(const json &cmd)
+    {
+        if (cmd.contains("address"))
+        {
+            uint64_t a = json_u64(cmd["address"]);
+            return reinterpret_cast<ue::UObject *>(static_cast<uintptr_t>(a));
+        }
+        if (cmd.contains("name"))
+            return reflection::find_object_by_name(cmd["name"].get<std::string>());
+        if (cmd.contains("class"))
+        {
+            std::string cls = cmd["class"].get<std::string>();
+            int index = cmd.value("index", 0);
+            auto insts = reflection::find_all_instances(cls);
+            if (index >= 0 && index < (int)insts.size())
+                return insts[index];
+        }
+        return nullptr;
+    }
+
+    // Case-insensitive substring test.
+    static bool icontains(const std::string &hay, const std::string &needle)
+    {
+        if (needle.empty())
+            return true;
+        auto it = std::search(
+            hay.begin(), hay.end(), needle.begin(), needle.end(),
+            [](char a, char b)
+            { return std::tolower((unsigned char)a) == std::tolower((unsigned char)b); });
+        return it != hay.end();
+    }
+
+    // list_classes — all reflection-known UClass names (cached, instant), for the
+    // Objects-tab class browser. Optional 'filter' (case-insensitive substring).
+    static std::string handle_list_classes(const json &cmd)
+    {
+        std::string filter = cmd.value("filter", std::string(""));
+        int limit = cmd.value("limit", 0); // 0 = unlimited (no clamping)
+
+        const auto &classes = reflection::get_classes();
+        json arr = json::array();
+        int n = 0;
+        for (const auto &ci : classes)
+        {
+            if (!icontains(ci.name, filter))
+                continue;
+            json e;
+            e["name"] = ci.name;
+            e["package"] = ci.package_name;
+            arr.push_back(e);
+            n++;
+            if (limit > 0 && n >= limit)
+                break;
+        }
+        json result;
+        result["total_known"] = (int)classes.size();
+        result["returned"] = n;
+        result["classes"] = arr;
+        return ok_response(result);
+    }
+
+    // class_counts — walk GUObjectArray ONCE and tally live instances per class.
+    // This is the "what can I actually inspect right now" view. Reads are guarded
+    // (is_mapped_ptr / is_valid_ptr) so a torn object during the walk can't crash
+    // the game now that the crash suppressor is gone.
+    static std::string handle_class_counts(const json &cmd)
+    {
+        int min_count = cmd.value("min", 1);
+        int limit = cmd.value("limit", 0); // 0 = unlimited (no clamping)
+        std::string filter = cmd.value("filter", std::string(""));
+
+        int32_t total = reflection::get_live_object_count();
+        std::unordered_map<std::string, int> counts;
+        counts.reserve(4096);
+        for (int32_t i = 0; i < total; i++)
+        {
+            ue::UObject *obj = reflection::get_object_by_index(i);
+            if (!obj || !ue::is_mapped_ptr(obj))
+                continue;
+            ue::UClass *cls = ue::uobj_get_class(obj);
+            if (!cls || !ue::is_valid_ptr(cls))
+                continue;
+            std::string cn = reflection::get_short_name(reinterpret_cast<const ue::UObject *>(cls));
+            if (cn.empty())
+                continue;
+            counts[cn]++;
+        }
+
+        std::vector<std::pair<std::string, int>> rows;
+        rows.reserve(counts.size());
+        for (auto &kv : counts)
+        {
+            if (kv.second >= min_count && icontains(kv.first, filter))
+                rows.push_back(kv);
+        }
+        std::sort(rows.begin(), rows.end(),
+                  [](const std::pair<std::string, int> &a, const std::pair<std::string, int> &b)
+                  { return a.second != b.second ? a.second > b.second : a.first < b.first; });
+
+        json arr = json::array();
+        int n = 0;
+        for (auto &r : rows)
+        {
+            json e;
+            e["name"] = r.first;
+            e["count"] = r.second;
+            arr.push_back(e);
+            n++;
+            if (limit > 0 && n >= limit)
+                break;
+        }
+        json result;
+        result["scanned_objects"] = total;
+        result["distinct_classes"] = (int)counts.size();
+        result["returned"] = n;
+        result["classes"] = arr;
+        return ok_response(result);
+    }
+
+    static std::string handle_list_instances(const json &cmd)
+    {
+        if (!cmd.contains("class"))
+            return error_response("list_instances: missing 'class'");
+        std::string cls = cmd["class"].get<std::string>();
+        int limit = cmd.value("limit", 0); // 0 = unlimited (no clamping)
+
+        auto insts = reflection::find_all_instances(cls);
+        json arr = json::array();
+        int n = 0;
+        for (auto *obj : insts)
+        {
+            if (limit > 0 && n >= limit)
+                break;
+            if (!obj || !ue::is_mapped_ptr(obj))
+                continue;
+            json e;
+            char addr[24];
+            snprintf(addr, sizeof(addr), "0x%lX", (unsigned long)reinterpret_cast<uintptr_t>(obj));
+            e["address"] = std::string(addr);
+            e["name"] = reflection::get_short_name(obj);
+            e["full_name"] = reflection::get_full_name(obj);
+            arr.push_back(e);
+            n++;
+        }
+        json result;
+        result["class"] = cls;
+        result["total"] = (int)insts.size();
+        result["returned"] = n;
+        result["instances"] = arr;
+        return ok_response(result);
+    }
+
+    static std::string handle_inspect(const json &cmd)
+    {
+        ue::UObject *obj = resolve_target_object(cmd);
+        if (!obj || !ue::is_mapped_ptr(obj))
+            return error_response("inspect: object not found / not resolvable "
+                                  "(pass 'address', 'name', or 'class'[+'index'])");
+
+        ue::UClass *cls = ue::uobj_get_class(obj);
+        if (!cls || !ue::is_valid_ptr(cls))
+            return error_response("inspect: object has no valid class");
+        std::string class_name = reflection::get_short_name(reinterpret_cast<const ue::UObject *>(cls));
+
+        auto *rc = rebuilder::rebuild(class_name);
+        if (!rc)
+            return error_response("inspect: could not rebuild class " + class_name);
+
+        json result;
+        char addr[24];
+        snprintf(addr, sizeof(addr), "0x%lX", (unsigned long)reinterpret_cast<uintptr_t>(obj));
+        result["address"] = std::string(addr);
+        result["name"] = reflection::get_short_name(obj);
+        result["full_name"] = reflection::get_full_name(obj);
+        result["class"] = class_name;
+        result["parent"] = rc->parent_name;
+
+        bool want_values = cmd.value("values", true);
+        json props = json::array();
+        for (const auto &p : rc->all_properties)
+        {
+            json e;
+            e["name"] = p.name;
+            e["type"] = p.type_name;
+            e["offset"] = p.offset;
+            if (want_values)
+                e["value"] = format_prop_value(p, obj);
+            props.push_back(e);
+        }
+        result["properties"] = props;
+
+        json funcs = json::array();
+        for (const auto &f : rc->all_functions)
+        {
+            json e;
+            e["name"] = f.name;
+            e["num_parms"] = f.num_parms;
+            e["flags"] = f.flags;
+            json params = json::array();
+            for (const auto &pp : f.params)
+            {
+                json pe;
+                pe["name"] = pp.name;
+                pe["type"] = (int)pp.type;
+                params.push_back(pe);
+            }
+            e["params"] = params;
+            funcs.push_back(e);
+        }
+        result["functions"] = funcs;
+        return ok_response(result);
+    }
+
     // ═══ Dispatch command ═══════════════════════════════════════════════════
     static std::string dispatch(const std::string &raw_json)
     {
@@ -507,6 +1105,14 @@ namespace adb_bridge
             return handle_reload_mod(cmd);
         if (command == "load_mod")
             return handle_load_mod(cmd);
+        if (command == "enable_mod")
+            return handle_mod_toggle(cmd, 0);
+        if (command == "disable_mod")
+            return handle_mod_toggle(cmd, 1);
+        if (command == "unload_mod")
+            return handle_mod_toggle(cmd, 2);
+        if (command == "set_all_mods")
+            return handle_set_all_mods(cmd);
         if (command == "exec_lua")
             return handle_exec_lua(cmd);
         if (command == "list_hooks")
@@ -529,6 +1135,14 @@ namespace adb_bridge
             return handle_find_object(cmd);
         if (command == "find_class")
             return handle_find_class(cmd);
+        if (command == "list_classes")
+            return handle_list_classes(cmd);
+        if (command == "class_counts")
+            return handle_class_counts(cmd);
+        if (command == "list_instances")
+            return handle_list_instances(cmd);
+        if (command == "inspect")
+            return handle_inspect(cmd);
         if (command == "object_count")
             return handle_object_count();
         if (command == "aes_scan")
@@ -575,6 +1189,20 @@ namespace adb_bridge
             std::string result = pe_trace::dump_to_file();
             return ok_response(result);
         }
+
+        // ═══ NATIVE memory primitives (socket-thread; no game thread) ════════
+        // These read/write /proc/self/mem directly and work even while the game
+        // thread is frozen (headset off / cutscene stall). See handlers above.
+        if (command == "mem_read")
+            return handle_mem_read(cmd);
+        if (command == "mem_write")
+            return handle_mem_write(cmd);
+        if (command == "mem_read_bytes")
+            return handle_mem_read_bytes(cmd);
+        if (command == "mem_regions")
+            return handle_mem_regions(cmd);
+        if (command == "module_base")
+            return handle_module_base(cmd);
 
         // simple ping for console connectivity
         if (command == "ping")
@@ -718,9 +1346,13 @@ namespace adb_bridge
             json result = json::array();
             // list built-ins hardcoded as in dispatch table
             std::vector<std::string> built = {
-                "list_mods", "reload_mod", "load_mod", "exec_lua", "list_hooks",
+                "list_mods", "reload_mod", "load_mod",
+                "enable_mod", "disable_mod", "unload_mod", "set_all_mods",
+                "exec_lua", "list_hooks",
                 "dump_sdk", "dump_ida", "mount_pak", "list_paks", "log_tail", "get_stats",
-                "find_object", "find_class", "object_count", "dump_symbols",
+                "find_object", "find_class", "list_classes", "class_counts",
+                "list_instances", "inspect",
+                "object_count", "dump_symbols",
                 "exec_console", "dump_console_commands",
                 "aes_scan", "aes_latest", "aes_keys",
                 "pe_trace_start", "pe_trace_stop", "pe_trace_clear", "pe_trace_status",

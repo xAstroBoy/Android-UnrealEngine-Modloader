@@ -47,6 +47,7 @@ set(MOD_SOURCES
     src/lua/lua_ustruct.cpp
     src/lua/lua_enum_ext.cpp
     src/mods/mod_loader.cpp
+    src/mods/mod_tracker.cpp
     src/pak/pak_mounter.cpp
     src/pak/aes_extractor.cpp
     src/bridge/adb_bridge.cpp

@@ -7,6 +7,7 @@
 
 #include <sol/sol.hpp>
 #include <cstdint>
+#include <string>
 
 namespace lua_delayed {
 
@@ -21,6 +22,11 @@ void register_all(sol::state& lua);
 
 // Cancel a specific delayed action by handle
 void cancel(uint64_t handle);
+
+// Cancel every delayed action registered by a mod (LoopAsync loops etc.).
+// Owner is derived from the registering environment's MOD_NAME.
+// Returns the number of actions cancelled.
+int cancel_all_for_mod(const std::string& mod);
 
 // Check if a delayed action handle is still valid/running
 bool is_valid(uint64_t handle);

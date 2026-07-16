@@ -25,6 +25,8 @@
 #include <exception>
 #include <stdexcept>
 #include <inttypes.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace safe_call
 {
@@ -204,32 +206,56 @@ namespace safe_call
         return result;
     }
 
-    // ═══ Pointer probe ══════════════════════════════════════════════════════
+    // ═══ Non-faulting /proc/self/mem probe fd ═══════════════════════════════
+    // A readability test must never itself crash. Dereferencing the pointer and
+    // catching the SIGSEGV (the old approach) both relied on the crash handler
+    // and turned every heuristic-scan miss into an expensive signal round-trip.
+    // Reading through /proc/self/mem instead is kernel-mediated: pread returns
+    // -1/EIO for unmapped or PROT_NONE pages instead of raising a signal, so the
+    // offset scanner can probe millions of garbage candidates without a single
+    // fault. Same primitive the ADB bridge's mem_read uses. O_RDONLY: probing
+    // never writes. The fd lives for the process; we never close it.
+    static int probe_mem_fd()
+    {
+        static int fd = -1;
+        if (fd < 0)
+            fd = open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
+        return fd;
+    }
+
+    // ═══ Pointer probe (non-faulting) ═══════════════════════════════════════
     bool probe_read(const void *addr, size_t size)
     {
         if (!addr)
             return false;
+        int fd = probe_mem_fd();
+        if (fd < 0)
+            return false;
 
-        volatile uint8_t sink = 0;
-        auto result = execute([&]()
-                              {
-            const volatile uint8_t* p = static_cast<const volatile uint8_t*>(addr);
-            // Read first and last byte to verify the full range
-            sink = p[0];
-            if (size > 1) sink = p[size - 1]; }, "probe_read");
-        (void)sink;
-        return result.ok;
+        off64_t base = static_cast<off64_t>(reinterpret_cast<uintptr_t>(addr));
+        uint8_t b;
+        // Verify the first and last byte of the range are mapped/readable.
+        if (pread64(fd, &b, 1, base) != 1)
+            return false;
+        if (size > 1)
+        {
+            if (pread64(fd, &b, 1, base + static_cast<off64_t>(size - 1)) != 1)
+                return false;
+        }
+        return true;
     }
 
-    // ═══ Safe memcpy ════════════════════════════════════════════════════════
+    // ═══ Safe memcpy (non-faulting) ═════════════════════════════════════════
     bool safe_memcpy(void *out, const void *addr, size_t size)
     {
         if (!addr || !out || size == 0)
             return false;
-
-        auto result = execute([&]()
-                              { std::memcpy(out, addr, size); }, "safe_memcpy");
-        return result.ok;
+        int fd = probe_mem_fd();
+        if (fd < 0)
+            return false;
+        return pread64(fd, out, size,
+                       static_cast<off64_t>(reinterpret_cast<uintptr_t>(addr))) ==
+               static_cast<ssize_t>(size);
     }
 
     // ═══ Statistics ═════════════════════════════════════════════════════════

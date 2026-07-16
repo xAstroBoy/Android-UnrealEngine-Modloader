@@ -113,6 +113,26 @@ HookId install_safe_call_guard(void* addr, const char* name);
 // Patches the switch's jump table to give each the id-9 case (_prologEm09), so
 // they spawn with the real ganado init + AI. Pure data patch, no hook.
 bool install_cut_villager_fix();
+// em32's init (sub_5E49AA0) null-checks SetObj00's result and then dereferences
+// it anyway 4 instructions later — SIGSEGV, fault addr 0x180 — whenever a
+// sub-object model is missing from the archive, i.e. for cut content. The callee
+// (VR4CreateEmSubObject) null-checks both pointers and returns, so the crash is
+// purely in COMPUTING AN ARGUMENT IT DISCARDS. Feeds the two loads a self-pointing
+// scratch buffer and zeroes the cEm arg so the callee opts out at its first `if`.
+// No-op whenever the pointer isn't null. The other 105 call sites take X0 from the
+// cEm's archive and never deref the model, so they were never at risk.
+bool install_em32_subobject_guard();
+// True if em `id` has a real init. cEmMgr::construct calls the EmInitFunc global
+// WITHOUT a null check, so an id with no ArmEmCallProlog case runs the previous
+// enemy's init over the wrong archive — or jumps to NULL (pc=0). Ask the jump
+// table so the list can't rot. Ids 75/78 (em4b/em4e = vehicles, Houdai) are
+// genuinely unimplemented and must not be spawned.
+bool is_em_id_supported(uint32_t id);
+// Lift the per-level live-enemy cap. EmSetEvent returns errEm ("pool full") once
+// the fixed cEm pool is exhausted; cEmMgr::arrayAlloc(n) sizes that pool as
+// stride*n AND sets count=n, so scaling its argument scales both together.
+// Takes effect on the next level load. mult is clamped to 1..16.
+bool set_enemy_pool_multiplier(uint32_t mult);
 
 // Get info about all installed hooks
 struct HookInfo {

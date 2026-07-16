@@ -1,6 +1,14 @@
--- mods/Randomizer/main.lua v12.6
+-- mods/Randomizer/main.lua v12.7
 -- ═══════════════════════════════════════════════════════════════════════
 -- UE4SS-enhanced Enemy Randomizer — re-randomizes on EVERY level load
+--
+-- v12.7 — Scripted/cutscene enemies are randomizable ("Randomize Cutscene
+--   Enemies", default ON). v11.4's gate skipped every EmSetEvent that landed
+--   during a cutscene; cutscene spawns use that same path, so the gate was the
+--   only thing stopping them. The engine has no objection. What can suffer is the
+--   SCENE: a cutscene drives its actor by motion id, and a swapped-in enemy has
+--   no such motion, so it may miss its scripted beat. That's a cosmetic break, so
+--   it's a toggle, not a ban. The begin/end hooks stay installed for stats.
 --
 -- v12.4 — Strict EM_LIST cast + non-enemy skip + replacement dump:
 --   Every rewrite now reads/casts EM_LIST fields first, applies writes via a
@@ -66,11 +74,28 @@
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "Randomizer"
 local VERBOSE = false
--- v12.5 safety default:
--- Room-load full-list rewrites are the crash-correlated path in live sessions.
--- Keep manual rewrite command available for testing, but disable automatic room
--- rewrites so only EmSetEvent performs spawn-time mutation.
-local ENABLE_AUTO_DIRECT_LIST_REWRITES = false
+-- v12.6 — RE-ENABLED. This is why "the randomizer doesn't randomize on first load".
+--
+-- Enemies already placed in a room when you enter it are written by the engine
+-- from the ESL at room-load time; they never pass through EmSetEvent. So with
+-- this flag false, the ONLY mutation path was EmSetEvent = spawn-time = enemies
+-- that appear LATER. Walk into a room and everything standing there is stock.
+-- That is not "randomizer off", it is "randomizer only affects reinforcements",
+-- which reads exactly like a mod that isn't working.
+--
+-- It was disabled in v12.5 as "the crash-correlated path" — the crash being
+-- tombstone-05: a stale pG_ptr yields a list pointer INSIDE libUE4.so's
+-- .rodata/vtables, and writing there corrupts a vtable → SIGBUS (BUS_ADRALN).
+-- But rewriteListSlotByIndex now REJECTS exactly that: any pointer below
+-- 0x100000000, and any pointer inside the ~200MB engine-library window, is
+-- refused before the write (see the tombstone-05 mitigation there). The cause was
+-- found and fixed; only the flag stayed off, so the fix was never actually used.
+--
+-- ENABLE_EMSETFROMLIST2_DIRECT_REWRITES below stays FALSE on its own merits (it
+-- runs Lua synchronously inside engine spawn and stalls to 1 FPS) — note its
+-- comment justifies itself with "the room-load rewrite ALREADY handles all
+-- pre-placed items", which was only true while THIS flag was on.
+local ENABLE_AUTO_DIRECT_LIST_REWRITES = true
 local ALLOW_MANUAL_DIRECT_LIST_REWRITES = true
 -- ⚠️ CRITICAL: EmSetFromList2 direct mutation MUST STAY FALSE
 -- Reason: EmSetFromList2 fires SYNCHRONOUSLY during engine spawn.
@@ -88,7 +113,17 @@ local function V(msg)
     if VERBOSE then Log(TAG .. ": [V] " .. msg) end
 end
 
-local INSTALL_HOOKS_WHEN_DISABLED = false
+-- MUST be true. The hooks are installed ONCE at mod load; every handler already
+-- guards itself with `if not state.enabled then return end`, so installing them
+-- while disabled costs a predicate and nothing else.
+--
+-- With this false, loading with the mod OFF (the saved default) installed NO
+-- hooks — and then toggling it ON in the debug menu set state.enabled = true with
+-- nothing listening. The toggle looked like it worked, the status line said ON,
+-- and not a single enemy changed until you restarted the game with it already on.
+-- That is the "randomizer isn't randomizing even though it's on" bug: the switch
+-- was wired to a light that had been unplugged at boot.
+local INSTALL_HOOKS_WHEN_DISABLED = true
 
 -- ── Pointer helpers ─────────────────────────────────────────────────
 -- Native hooks and CallNative with 'p' return pass lightuserdata (void*).
@@ -299,6 +334,16 @@ end
 local state = {
     enabled = false,    -- v12.6 isolation default: OFF until explicitly enabled
     hpMode  = "MATCH",  -- MATCH, EASY, NORMAL, HARD, RANDOM
+    -- v12.7: randomize the SCRIPTED enemies that cutscenes spawn, too.
+    -- Cutscene spawns go through the same EmSetEvent path as everything else, so
+    -- they were only ever skipped by our own gate — the engine doesn't care.
+    -- What the engine DOES care about is that a cutscene drives its actor by
+    -- motion id: swap Saddler for a crow and the scene's "grab Ashley" motion
+    -- doesn't exist on the new model, so the scene plays out wrong or the em
+    -- never does its scripted beat. That's a broken SCENE, not a broken game —
+    -- so it's yours to choose. ON because it's what was asked for; flip it off in
+    -- the menu if a specific cutscene misbehaves.
+    randomizeCutscenes = true,
     enabledEnemies = {},
     swapCount = 0,
 }
@@ -332,6 +377,7 @@ local function saveConfig()
         configVersion = 2,
         enabled = state.enabled,
         hpMode = state.hpMode,
+        randomizeCutscenes = state.randomizeCutscenes,
         enabledNames = names,
     })
     invalidatePool()  -- Rebuild cached pool on next pickRandom
@@ -354,6 +400,7 @@ local function loadConfig()
         pcall(saveConfig)
     end
     if cfg.hpMode then state.hpMode = cfg.hpMode end
+    if cfg.randomizeCutscenes ~= nil then state.randomizeCutscenes = cfg.randomizeCutscenes end
     if cfg.enabledNames then
         for name, _ in pairs(state.enabledEnemies) do state.enabledEnemies[name] = false end
         for _, name in ipairs(cfg.enabledNames) do
@@ -382,8 +429,31 @@ end
 local function getEnabledPool()
     if cachedPool and not poolDirty then return cachedPool end
     local pool = {}
+    local dropped = {}
     for _, e in ipairs(ENEMIES) do
-        if state.enabledEnemies[e.name] then pool[#pool + 1] = e end
+        if state.enabledEnemies[e.name] then
+            -- Now that we WRITE the pick's emId (see applyReplacementToEmListRow),
+            -- an enemy the engine can't construct is no longer a dud spawn — it is
+            -- a hard crash: cEmMgr::construct calls the EmInitFunc global with no
+            -- null check, so an id with no ArmEmCallProlog case runs the previous
+            -- enemy's init over the wrong archive, or jumps to NULL (pc=0).
+            -- Keep those out of the pool entirely instead of discovering it at
+            -- room-load. IsEmIdSupported reads the jump table, so this stays true
+            -- even as we wire more cut ids up.
+            local id = e.bytes and e.bytes[1]
+            if IsEmIdSupported and id and not (pcall(IsEmIdSupported, id)) then
+                dropped[#dropped + 1] = e.name
+            elseif IsEmIdSupported and id then
+                local ok, sup = pcall(IsEmIdSupported, id)
+                if ok and sup then pool[#pool + 1] = e else dropped[#dropped + 1] = e.name end
+            else
+                pool[#pool + 1] = e
+            end
+        end
+    end
+    if #dropped > 0 then
+        Log(TAG .. ": pool: dropped " .. #dropped .. " enemy(s) the engine cannot construct: "
+            .. table.concat(dropped, ", "))
     end
     cachedPool = pool
     poolDirty = false
@@ -486,10 +556,74 @@ local function buildExactEmIdCandidates(origEmId)
     return exact
 end
 
+-- FULL CROSSOVER: any enemy may become ANY other enabled enemy.
+--
+-- The family system below can never cross species, by construction. For each
+-- emId, NATIVE_EMID_COMPAT gives a "preserve-emid" spec, and
+-- buildNativeRewritePlan then picks the template out of `exact` = "enemies whose
+-- emId equals the original". For a crow (emId 35) that set contains exactly one
+-- thing: the crow. So pick == crow, and the write is crow -> crow. Same for every
+-- family: a ganado could only ever become another ganado variant. That is why
+-- "the crows still aren't scrambled" no matter what else is fixed.
+--
+-- With this on we ignore the family templates entirely and draw from the whole
+-- enabled pool. nativePlan is returned nil so applyReplacementToEmListRow takes
+-- its full-write path: the pick's emId AND its tail bytes (subtype/params), which
+-- is what makes the enemy genuinely become that enemy.
+--
+-- getEnabledPool() already filters out ids the engine cannot construct
+-- (IsEmIdSupported), so a pick can never be the stale/NULL EmInitFunc crash.
+-- Cross-emId tail bytes remain the known risk — they were authored for a
+-- different character, so odd variant flags are possible; the log names both
+-- emIds if something looks wrong.
+local FULL_CROSSOVER = true
+
+-- Enemies that must never be a crossover TARGET.
+--
+-- These are placement-dependent: the ESL authors an anchor/spot per instance and
+-- the enemy's reset path assumes it. Dropping one into an arbitrary randomized
+-- slot hands its reset a garbage position.
+--
+-- 45 (0x2D) = Novistador (cEm2d) — the wall/ceiling clingers. Observed crash:
+--     cEm2d::setReset(Vec*,Vec*)+116  SIGSEGV fault addr 0x0D
+--     CSEL X10, X10, X21, EQ   ; X10 = (pos==0) ? this+0x8CD : pos
+--     LDR  W9, [X10,#8]        ; fault => X10 == 5, i.e. pos == 5
+-- setReset is vtable slot 64 (+0x200, the last virtual — 65+ is string data), so
+-- generic room-reset code calls it for every enemy; a Novistador that was never
+-- anchored gets junk. HONEST NOTE: this is EMPIRICAL. I have not traced where the
+-- `5` originates (the stack unwinds through make_fcontext, so the caller frames
+-- are unreliable). If another placement-special enemy shows the same signature,
+-- add its emId here — and if someone later traces the anchor properly, this list
+-- should shrink, not grow.
+-- These stay fully spawnable on purpose: EnemySpawner places them deliberately at
+-- the player, which is a different (working) path. This only blocks them as a
+-- random REPLACEMENT for a pre-placed slot.
+local CROSSOVER_BLOCK_EMIDS = { [45] = "Novistador (cEm2d) — anchor-dependent setReset" }
+
+local function crossoverAllowed(e)
+    if not e or not e.bytes then return false end
+    local why = CROSSOVER_BLOCK_EMIDS[e.bytes[1]]
+    if why then return false, why end
+    return true
+end
+
 local function chooseDirectListTarget(origEntry, origEmId, sourceSig)
     local avoidName = nil
     if sourceSig and sourceSig ~= "" then
         avoidName = lastChoiceBySourceSig[sourceSig]
+    end
+
+    if FULL_CROSSOVER then
+        local pool = getEnabledPool()
+        -- Drop placement-dependent targets (see CROSSOVER_BLOCK_EMIDS).
+        local ok = {}
+        for _, e in ipairs(pool) do
+            if crossoverAllowed(e) then ok[#ok + 1] = e end
+        end
+        if #ok > 0 then
+            -- nil plan => full emId + tail write in applyReplacementToEmListRow
+            return pickFromCandidatesAvoidName(ok, avoidName), nil
+        end
     end
 
     local nativePlan = buildNativeRewritePlan(origEmId, avoidName)
@@ -859,11 +993,51 @@ local function castEmListRow(emListPtr)
     }
 end
 
+-- ── ACTUALLY CHANGE THE ENEMY ──────────────────────────────────────────
+-- Until now this mod could not change an enemy TYPE at all. Every entry in
+-- NATIVE_EMID_COMPAT is mode="preserve-emid", so nativePlan was always non-nil
+-- and the line below read `nativePlan and orig.emId` = keep the ORIGINAL emId.
+-- A ganado became another ganado variant; a crow (emId 35, also preserve-emid)
+-- stayed a crow. With mode="hp-only" the write block was skipped entirely and
+-- ONLY the HP changed — which is what the log showed:
+--     emId=18 -> Dr. Salvador 150 (outEmId=18) mode=hp-only
+-- i.e. it *picked* Dr. Salvador and then wrote the ganado back. That is why
+-- "no enemies get scrambled" no matter what the menu said.
+--
+-- SWAP_EMID writes the pick's REAL emId + its tail bytes, so the enemy actually
+-- becomes the picked enemy.
+--
+-- The v11.7 "safety rule" this overrides said cross-emId tail copies crashed in
+-- cutscene/room-load paths. The real mechanism behind that is now known: writing
+-- an emId whose ArmEmCallProlog case does not exist leaves the GLOBAL EmInitFunc
+-- stale (or NULL) and cEmMgr::construct calls it with no null check → wrong init
+-- over the wrong archive, or BLR 0 (tombstone pc=0). So the guard is not "never
+-- swap" — it is "never write an id the engine cannot construct", which
+-- IsEmIdSupported answers from the jump table itself. Picks are filtered below.
+local SWAP_EMID = true
+
+-- True if the engine can actually construct this emId (asks ArmEmCallProlog's
+-- jump table via the modloader). Fail-safe: if the binding is missing we return
+-- false, because writing an unconstructable id is a hard crash, not a glitch.
+local function emIdConstructable(emId)
+    if not emId then return false end
+    if not IsEmIdSupported then return false end
+    local ok, v = pcall(IsEmIdSupported, emId)
+    return ok and v == true
+end
+
 local function applyReplacementToEmListRow(emListPtr, pick, hp, nativePlan)
-    if nativePlan == nil or nativePlan.mode == "preserve-emid" then
+    -- Swap the type whenever the pick is something the engine can build.
+    local wantSwap = SWAP_EMID and pick and pick.bytes and emIdConstructable(pick.bytes[1])
+    if wantSwap or nativePlan == nil or nativePlan.mode == "preserve-emid" then
         local orig = castEmListRow(emListPtr)
         if not orig then return nil end
-        local targetEmId = nativePlan and orig.emId or pick.bytes[1]
+        local targetEmId
+        if wantSwap then
+            targetEmId = pick.bytes[1]            -- become the picked enemy
+        else
+            targetEmId = nativePlan and orig.emId or pick.bytes[1]
+        end
         WriteU8(Offset(emListPtr, 0x01), targetEmId)
         WriteU8(Offset(emListPtr, 0x02), pick.bytes[2])
         WriteU8(Offset(emListPtr, 0x03), pick.bytes[3])
@@ -1052,6 +1226,9 @@ local function nowSec()
 end
 
 local function isCutsceneSuppressed()
+    -- v12.7: opt back in to scripted/cutscene enemies. The begin/end hooks stay
+    -- installed either way so the stats still report what's happening.
+    if state.randomizeCutscenes then return false, nil end
     if cutsceneActive then return true, "active" end
     if nowSec() < cutsceneSuppressUntil then return true, "cooldown" end
     return false, nil
@@ -1063,20 +1240,23 @@ rewriteListSlotByIndex = function(idx, sourceTag)
     local listPtr = getListPtrFromIndex(idx)
     if not listPtr or ptrval(listPtr) == 0 then return false end
 
-    -- tombstone-05 mitigation: stale pG_ptr can produce an offset inside
-    -- libUE4.so (.rodata/vtables). Writing there corrupts the vtable and causes
-    -- SIGBUS (BUS_ADRALN). Reject any pointer that falls inside the ~200 MB
-    -- engine library window.  Below 0x100000000 is also invalid on 64-bit AArch64.
+    -- The EM_LIST array lives INSIDE libUE4's .data — do not reject it for that.
+    --
+    -- The old "tombstone-05 mitigation" rejected any pointer inside the ~200MB
+    -- engine window. But pG is not a heap object: it is `&Global`, a global struct
+    -- in the engine image. Verified live:
+    --     libUE4 base = 0x71992FD000 ; pG = 0x71A385FC68 ; pG-base = 0xA562C68
+    -- and 0xA562C68 is exactly the `Global` symbol IDA shows in cEmMgr::construct.
+    -- EmSetFromList2 reads the list the same way: `v5=(char*)pG; v7=&v5[32*idx]+21660`.
+    -- So EVERY valid slot is "inside the engine range" and the guard rejected all
+    -- 255 of them — "Full-level rewrite complete changed=0" while the array really
+    -- held 18 23 23 18 18 ... That is why no pre-placed enemy ever changed.
+    -- tombstone-05 was a STALE/garbage pG writing into .rodata; the fix for that is
+    -- validating the slot, not banning the only address it can legally be.
     local _lpv = ptrval(listPtr)
-    if _lpv < 0x100000000 then return false end
-    if base and ptrval(base) > 0 then
-        local _lbStart = ptrval(base)
-        if _lpv >= _lbStart and _lpv < (_lbStart + 0x0D000000) then
-            Log(TAG .. ": rewriteListSlotByIndex SKIP ptr inside engine range 0x"
-                .. string.format("%X", _lpv))
-            return false
-        end
-    end
+    if _lpv < 0x100000000 then return false end   -- still bogus on AArch64
+    -- Sanity-check the slot itself: a real EM_LIST row has a plausible emId
+    -- (non-zero) — the emId==0 test below is the actual stale-pointer guard.
 
     local row = castEmListRow(listPtr)
     if not row then return false end
@@ -1405,18 +1585,13 @@ local function installEmSetEventHook()
                     if not state.enabled then return end
                     ensureLevelDetected("EmSetEvent bootstrap")
                     if emListPtr == nil or ptrval(emListPtr) == 0 then return end
-                    -- tombstone-05 mitigation: reject pointer in engine library range
+                    -- Do NOT reject "inside the engine range": the EM_LIST array is
+                    -- pG + 0x549C and pG is &Global, a struct inside libUE4's .data
+                    -- (verified: pG-base = 0xA562C68 = the `Global` symbol). The old
+                    -- guard here banned the only address this can legally have.
                     do
                         local _epv = ptrval(emListPtr)
-                        if _epv < 0x100000000 then return end
-                        if base and ptrval(base) > 0 then
-                            local _lbStart = ptrval(base)
-                            if _epv >= _lbStart and _epv < (_lbStart + 0x0D000000) then
-                                Log(TAG .. ": EmSetEvent SKIP ptr inside engine range 0x"
-                                    .. string.format("%X", _epv))
-                                return
-                            end
-                        end
+                        if _epv < 0x100000000 then return end   -- bogus on AArch64
                     end
                     if hookErrors >= MAX_HOOK_ERRORS then return end
 
@@ -1785,6 +1960,8 @@ if SharedAPI then
         end,
         getHPMode  = function() return state.hpMode end,
         setHPMode  = function(m) state.hpMode = m; saveConfig() end,
+        getRandomizeCutscenes = function() return state.randomizeCutscenes end,
+        setRandomizeCutscenes = function(v) state.randomizeCutscenes = v; saveConfig() end,
         scramble   = scrambleNow,
         rewriteLevel = function() return queueFullLevelRewrite("sharedapi", true) end,
         getPoolSize = function() return #getEnabledPool() end,
@@ -1846,6 +2023,15 @@ if SharedAPI and SharedAPI.DebugMenu then
                     if m == state.hpMode then idx = i; break end
                 end
                 state.hpMode = modes[(idx % #modes) + 1]
+                saveConfig()
+                api.Refresh()
+            end)
+
+            -- Scripted/cutscene enemies. A cutscene drives its actor by motion id,
+            -- so a swapped one can miss its scripted beat — turn this off if a
+            -- specific scene misbehaves.
+            api.AddItem("[" .. (state.randomizeCutscenes and "ON" or "OFF") .. "] Randomize Cutscene Enemies", function()
+                state.randomizeCutscenes = not state.randomizeCutscenes
                 saveConfig()
                 api.Refresh()
             end)

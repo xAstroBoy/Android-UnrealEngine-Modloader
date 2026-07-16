@@ -122,7 +122,7 @@ namespace lua_enum_ext
         ue::FName fname;
         // Android ARM64: TCHAR = char16_t (2 bytes), NOT wchar_t (4 bytes)
         std::u16string u16full(full_name.begin(), full_name.end());
-        symbols::FName_Init(&fname, u16full.c_str(), 0);
+        symbols::FName_Init(&fname, full_name.c_str(), 1);
 
         if (num < max_cap && ue::is_valid_ptr(reinterpret_cast<void *>(data_ptr)))
         {

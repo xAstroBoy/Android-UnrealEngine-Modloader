@@ -62,9 +62,73 @@ namespace pak_mounter
     // Early paks path — built dynamically from game profile package name.
     // Before JNI paths::init is available, we construct the path from the
     // package name detected by game_profile::init() (which reads /proc/self/cmdline).
-    // We use the Android standard external files dir convention — this is NOT
-    // hardcoding; it's the same path getExternalFilesDir(null) returns.
-    // Every app has read/write access to its own external files dir without root.
+    //
+    // MUST match paths::paks_dir() == <data_dir>/paks. That resolves to
+    // /sdcard/UnrealModloader/<pkg>/paks when the app holds MANAGE_EXTERNAL_STORAGE
+    // (the patched APK grants it; LSPosed setups get it via the bind mirror), and
+    // to the app's own scoped dir /sdcard/Android/data/<pkg>/files/modloader/paks
+    // when it doesn't.
+    //
+    // This used to hardcode the scoped path, because without all-files access the
+    // game cannot read what another uid wrote to the public store, so the early
+    // mount silently read nothing. True — but the reverse is now just as true: with
+    // the patched APK everything else lives in the public store, so hardcoding
+    // scoped meant paks dropped next to the mods were read by NOTHING, with no
+    // error. "Everything in one folder" is the whole point of the public store.
+    //
+    // We can't ask paths::data_dir() here: the early mount runs from the
+    // MountAllPakFiles hook, long before JNI is up and paths::init() has run. So
+    // don't guess the permission — probe. Whichever store we can actually READ is
+    // the answer, and the public store only wins when it holds real paks, so a
+    // stray empty folder can't shadow a working scoped setup.
+    static std::string public_paks_path_for_pkg(const std::string &pkg)
+    {
+        return "/sdcard/UnrealModloader/" + pkg + "/paks";
+    }
+
+    static std::string scoped_paks_path_for_pkg(const std::string &pkg)
+    {
+        return "/sdcard/Android/data/" + pkg + "/files/modloader/paks";
+    }
+
+    // True if `dir` is readable AND holds at least one .pak. opendir() succeeding
+    // is not enough: without MANAGE_EXTERNAL_STORAGE the public store can list as
+    // empty rather than fail outright.
+    static bool dir_has_readable_pak(const std::string &dir)
+    {
+        DIR *d = opendir(dir.c_str());
+        if (!d) return false;
+        bool found = false;
+        while (struct dirent *e = readdir(d))
+        {
+            std::string name = e->d_name;
+            if (name.size() > 4 && name.compare(name.size() - 4, 4, ".pak") == 0)
+            {
+                // Must be OPENABLE, not merely listed.
+                FILE *f = fopen((dir + "/" + name).c_str(), "rb");
+                if (f) { fclose(f); found = true; break; }
+            }
+        }
+        closedir(d);
+        return found;
+    }
+
+    static std::string best_paks_path_for_pkg(const std::string &pkg)
+    {
+        std::string pub = public_paks_path_for_pkg(pkg);
+        if (dir_has_readable_pak(pub))
+        {
+            __android_log_print(ANDROID_LOG_INFO, "UEModLoader",
+                                "[PAK] using public store: %s", pub.c_str());
+            return pub;
+        }
+        std::string scoped = scoped_paks_path_for_pkg(pkg);
+        __android_log_print(ANDROID_LOG_INFO, "UEModLoader",
+                            "[PAK] public store has no readable .pak (%s) — using scoped: %s",
+                            pub.c_str(), scoped.c_str());
+        return scoped;
+    }
+
     static std::string build_early_paks_path()
     {
         const std::string &pkg = game_profile::package_name();
@@ -79,7 +143,7 @@ namespace pak_mounter
                 fclose(f);
                 if (n > 0 && buf[0] != '\0')
                 {
-                    return std::string("/sdcard/UnrealModloader/") + buf + "/paks";
+                    return best_paks_path_for_pkg(std::string(buf));
                 }
             }
             // Absolute last resort — cannot determine package. This path won't
@@ -88,7 +152,7 @@ namespace pak_mounter
                                 "[PAK] CRITICAL: Cannot determine package name for PAK path!");
             return "";
         }
-        return "/sdcard/UnrealModloader/" + pkg + "/paks";
+        return best_paks_path_for_pkg(pkg);
     }
 
     static std::string s_early_paks_path;
@@ -192,6 +256,14 @@ namespace pak_mounter
             __android_log_print(ANDROID_LOG_WARN, "UEModLoader",
                                 "[PAK-EARLY] Paks dir not found: %s — creating", paks_path);
             mkdir(paks_path, 0755);
+            // Nothing mounted => the caller's "done" latch MUST NOT stand, or the
+            // synchronous fallback logs "already mounted by early hooks" and skips
+            // itself. That fallback resolves paths::paks_dir() (the authoritative
+            // data dir, JNI-resolved), which is the ONLY code here that reliably
+            // knows which store the app can actually read. Leaving the latch set
+            // here is what silently mounted ZERO paks and forced people to hand-
+            // edit the OBB instead.
+            s_custom_mount_done.store(false);
             return;
         }
 
@@ -213,7 +285,10 @@ namespace pak_mounter
         if (pak_files.empty())
         {
             __android_log_print(ANDROID_LOG_INFO, "UEModLoader",
-                                "[PAK-EARLY] No custom PAK files in %s", paks_path);
+                                "[PAK-EARLY] No custom PAK files in %s — releasing the "
+                                "mount latch so the fallback can try paths::paks_dir()",
+                                paks_path);
+            s_custom_mount_done.store(false);
             return;
         }
 
@@ -268,6 +343,17 @@ namespace pak_mounter
         __android_log_print(ANDROID_LOG_INFO, "UEModLoader",
                             "[PAK-EARLY] Mounted %d/%zu custom PAKs INSIDE engine mount pass",
                             mounted_count, pak_files.size());
+
+        // If we mounted NOTHING, do NOT keep the "done" flag latched — reset it so
+        // the synchronous fallback (mount_custom_paks_now) retries from
+        // paths::paks_dir(). The latch may only stand when a pak actually mounted.
+        if (mounted_count == 0)
+        {
+            s_custom_mount_done.store(false);
+            __android_log_print(ANDROID_LOG_WARN, "UEModLoader",
+                                "[PAK-EARLY] 0 mounted despite %zu file(s) — resetting flag for fallback retry",
+                                pak_files.size());
+        }
     }
 
     // ═══ Mount custom PAKs synchronously — fallback for late init ══════════
@@ -887,43 +973,85 @@ namespace pak_mounter
     }
 
     // ═══ Mount all paks in paks/ directory ══════════════════════════════════
+    // Scans EVERY store a pak could legitimately live in, not just one guess:
+    //   1. paths::paks_dir()  — the authoritative JNI-resolved data dir
+    //   2. /sdcard/UnrealModloader/<pkg>/paks   — the public store
+    //   3. /sdcard/Android/data/<pkg>/files/modloader/paks — the scoped store
+    // Whether (2) or (3) is the live one depends on MANAGE_EXTERNAL_STORAGE, which
+    // differs per install (patched APK = granted; plain LSPosed = not), and the
+    // user rightly expects paks to load from the SAME folder as their mods. Only
+    // looking in one store is what made people hand-edit their OBB to mod at all.
+    // Dedup by filename so the first (most authoritative) store wins.
+    static std::vector<std::string> candidate_pak_dirs()
+    {
+        std::vector<std::string> dirs;
+        auto add = [&dirs](std::string d) {
+            while (d.size() > 1 && d.back() == '/') d.pop_back();
+            if (d.empty()) return;
+            for (const auto &e : dirs) if (e == d) return;   // dedup
+            dirs.push_back(std::move(d));
+        };
+        add(paths::paks_dir());
+        const std::string &pkg = game_profile::package_name();
+        if (!pkg.empty())
+        {
+            add(public_paks_path_for_pkg(pkg));
+            add(scoped_paks_path_for_pkg(pkg));
+        }
+        return dirs;
+    }
+
     int mount_all()
     {
-        std::string paks_path = paths::paks_dir();
+        std::string primary = paths::paks_dir();
+        std::vector<std::string> dirs = candidate_pak_dirs();
 
-        if (!dir_exists(paks_path))
+        // Collect absolute paths, first store to provide a given filename wins.
+        std::vector<std::string> pak_files;   // absolute paths
+        std::vector<std::string> seen_names;
+        for (const auto &d : dirs)
         {
-            logger::log_info("PAK", "Paks directory does not exist: %s — creating", paks_path.c_str());
-            mkdir(paks_path.c_str(), 0755);
-            return 0;
-        }
-
-        DIR *dir = opendir(paks_path.c_str());
-        if (!dir)
-        {
-            logger::log_error("PAK", "Failed to open paks directory: %s", paks_path.c_str());
-            return 0;
-        }
-
-        std::vector<std::string> pak_files;
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != nullptr)
-        {
-            if (entry->d_name[0] == '.')
+            DIR *dir = opendir(d.c_str());
+            if (!dir)
                 continue;
-            std::string name(entry->d_name);
-            if (name.size() > 4 && name.substr(name.size() - 4) == ".pak")
+            int found_here = 0;
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != nullptr)
             {
-                pak_files.push_back(name);
+                if (entry->d_name[0] == '.')
+                    continue;
+                std::string name(entry->d_name);
+                if (name.size() > 4 && name.substr(name.size() - 4) == ".pak")
+                {
+                    bool dup = false;
+                    for (const auto &s : seen_names)
+                        if (s == name) { dup = true; break; }
+                    if (dup)
+                    {
+                        logger::log_info("PAK", "  (ignoring duplicate %s in %s — already taken from a higher-priority store)",
+                                         name.c_str(), d.c_str());
+                        continue;
+                    }
+                    seen_names.push_back(name);
+                    pak_files.push_back(d + "/" + name);
+                    ++found_here;
+                }
             }
+            closedir(dir);
+            if (found_here)
+                logger::log_info("PAK", "Found %d pak(s) in %s", found_here, d.c_str());
         }
-        closedir(dir);
 
         std::sort(pak_files.begin(), pak_files.end());
 
         if (pak_files.empty())
         {
-            logger::log_info("PAK", "No PAK files found in %s", paks_path.c_str());
+            // Create the primary dir so there is somewhere obvious to drop paks.
+            if (!dir_exists(primary))
+                mkdir(primary.c_str(), 0755);
+            std::string tried;
+            for (const auto &d : dirs) { tried += "\n    "; tried += d; }
+            logger::log_info("PAK", "No PAK files found. Searched:%s", tried.c_str());
             return 0;
         }
 
@@ -940,8 +1068,8 @@ namespace pak_mounter
                 mounted++;
         }
 
-        logger::log_info("PAK", "Mounted %d/%zu PAK files from %s",
-                         mounted, pak_files.size(), paks_path.c_str());
+        logger::log_info("PAK", "Mounted %d/%zu PAK file(s) (primary store: %s)",
+                         mounted, pak_files.size(), primary.c_str());
         return mounted;
     }
 

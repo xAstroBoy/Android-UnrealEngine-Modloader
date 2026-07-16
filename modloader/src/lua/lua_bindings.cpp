@@ -2122,6 +2122,46 @@ namespace lua_bindings
             return native_hooks::install_cut_villager_fix();
         });
 
+        // ── InstallEm32SubObjectGuard — the cut-enemy spawn SIGSEGV ──────────
+        // em32's init (sub_5E49AA0) calls SetObj00 for two sub-object models,
+        // CBZ-checks each result, and then dereferences it anyway a few
+        // instructions later: `LDR X2,[X25,#0xA88]; LDR X8,[X2,#0x180]` =>
+        // SIGSEGV fault addr 0x180. SetObj00 returns NULL whenever
+        // cModel::modelInit can't find the model in the archive, which is the norm
+        // for cut content. Retail never spawns em32, so the bug shipped.
+        // VR4CreateEmSubObject null-checks BOTH pointers and returns, so the fault
+        // is entirely in building an argument the callee discards — we just make
+        // the loads safe and zero the cEm so it opts out. No-op when non-null.
+        // Sig: InstallEm32SubObjectGuard() -> bool
+        lua.set_function("InstallEm32SubObjectGuard", []() -> bool {
+            return native_hooks::install_em32_subobject_guard();
+        });
+
+        // ── SetEnemyPoolMultiplier — lift the per-level enemy cap ────────────
+        // EmSetEvent hands out cEm slots from a FIXED pool and returns the errEm
+        // sentinel when they're gone — that's the "hard limit" (EnemySpawner
+        // reports it as "Pool full or invalid emId"). cEmMgr::arrayAlloc(n) is the
+        // only place that sizes it, and it does `pool = memAlloc(stride*n);
+        // count = n`, so scaling n scales the ALLOCATION and the COUNT together —
+        // bumping the count alone would run the slot scan off the allocation.
+        // Applies on the NEXT level load. mult clamped 1..16.
+        // Sig: SetEnemyPoolMultiplier(mult) -> bool
+        lua.set_function("SetEnemyPoolMultiplier", [](uint32_t mult) -> bool {
+            return native_hooks::set_enemy_pool_multiplier(mult);
+        });
+
+        // ── IsEmIdSupported — can the engine actually construct this em id? ──
+        // cEmMgr::construct guards the archive but calls the EmInitFunc GLOBAL with
+        // no null check. An id with no ArmEmCallProlog case leaves that global at
+        // the previous enemy's init (wrong init, wrong archive => initJoint crash)
+        // or at NULL if nothing spawned yet (=> BLR 0, tombstone pc=0). Spawning
+        // such an id is unsurvivable, so ASK before spawning. Reads the jump table,
+        // so it can't drift out of sync with a hand-maintained list.
+        // Sig: IsEmIdSupported(id) -> bool
+        lua.set_function("IsEmIdSupported", [](uint32_t id) -> bool {
+            return native_hooks::is_em_id_supported(id);
+        });
+
         // ── RegisterNativeCapture — a PURE-C++ hook (no Lua callback) ───────
         // On every call to `addr`, if arg `argIdx` is a pointer in the half-open
         // range [minHeap, maxHeap) (maxHeap == 0 → no upper bound), store its VALUE

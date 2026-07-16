@@ -1278,6 +1278,37 @@ static void patch_ro(void* addr, const void* src, size_t n) {
     __builtin_memcpy(addr, src, n);
 }
 
+// Is `id` an em the engine can actually construct?
+//
+// cEmMgr::construct [0x5D90288] guards the ARCHIVE but not the INIT POINTER:
+//     BL   EmReadSearch ; STR X0,[X19,#0x460] ; CBZ X0, ret   <- archive checked
+//     LDR  X8,[X8]      ; BLR X8                              <- EmInitFunc, UNCHECKED
+// EmInitFunc is a global that only ArmEmCallProlog's per-id case sets. An id with
+// no case leaves it at whatever the last enemy stored — or NULL if nothing has
+// spawned yet, which is a straight `BLR 0` (tombstone: pc=0, "null pointer
+// dereference"). So spawning an unimplemented id either runs the WRONG init over
+// the wrong archive or jumps to zero. Neither is survivable and no guard helps,
+// because by then the wrong function is already running.
+//
+// The jump table IS the ground truth for "does this id have an init", so ask it
+// instead of maintaining a hand-written list that will rot:
+//     supported  <=>  0 <= id-3 <= 0x4C  &&  jpt[id-3] != <the default case byte>
+// Per IDA the default cases are ids 6-8,10,11,13,51,55,75,78 — we wire the first
+// eight to _prologEm09 (they share em10.das with id 9), which leaves 75/78
+// (em4b.das / em4e.das = the vehicles + Houdai cannon) genuinely unimplemented.
+bool is_em_id_supported(uint32_t id) {
+    uintptr_t base = symbols::lib_base();
+    if (!base) return true;                 // can't tell — don't block the caller
+    int idx = static_cast<int>(id) - 3;
+    if (idx < 0 || idx > 0x4C) return false;   // outside the switch => default
+    const uint8_t* jpt = reinterpret_cast<const uint8_t*>(base + kJptRva);
+    // The default's byte = (def_617E658 - loc_617E65C)/4 = (0x617E864-0x617E65C)/4.
+    // Derive it rather than trusting a constant, so a game update can't silently
+    // turn this into "everything is supported".
+    static const uint8_t kDefaultByte = (uint8_t)((0x617E864u - 0x617E65Cu) / 4u);  // 0x82
+    return jpt[idx] != kDefaultByte;
+}
+
 bool install_cut_villager_fix() {
     uintptr_t base = symbols::lib_base();
     if (!base) {
@@ -1310,6 +1341,173 @@ bool install_cut_villager_fix() {
     logger::log_info("CUTEM", "cut villager ganados wired to the id-9 ganado init: %d/%d (real AI; no stale EmInitFunc)",
                      done, total);
     return done > 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// em32 SUB-OBJECT NULL GUARD — the "cut enemy explodes on spawn" crash
+// ═══════════════════════════════════════════════════════════════════════
+// sub_5E49AA0 (em32's init, reached from cEm32::move) builds two sub-object
+// models with SetObj00 and hands each to VR4CreateEmSubObject. SetObj00 returns
+// NULL whenever cModel::modelInit can't find the model in the archive — which is
+// exactly what happens for cut content, whose sub-object data was never shipped.
+//
+// The game checks for that NULL and then dereferences it anyway, four
+// instructions later:
+//     5e4a31c  BL   SetObj00
+//     5e4a320  STR  X0, [X25,#0xA88]     ; may be NULL
+//     5e4a324  CBZ  X0, loc_5E4A33C      ; ...checked here...
+//     5e4a36c  LDR  X2, [X25,#0xA88]     ; ...reloaded...
+//     5e4a374  LDR  X8, [X2,#0x180]      ; ...and derefed. SIGSEGV, fault 0x180.
+// The first site (0x5e4a358) is worse: one path literally does MOV X2, XZR and
+// falls straight into the same load. Retail never spawns em32, so it never fired.
+//
+// The joke is that the callee never wanted the value:
+//     VR4CreateEmSubObject(archive, cEm *a2, cModel *a3) { if (a2) if (a3) {...} }
+// It null-checks both pointers and returns. The crash happens purely while
+// COMPUTING AN ARGUMENT THAT WOULD HAVE BEEN THROWN AWAY. So we don't need to
+// skip the call — we need the two loads not to fault, and the callee will opt out
+// on its own.
+//
+// Both loads are fed a scratch buffer that points at itself (+0x180 -> self), so
+// LDR X8,[X2,#0x180] yields the buffer and LDR X0,[X8,#0x18] yields 0. X8 then
+// doubles as the "we substituted" flag for the second instrument, which zeroes X1
+// (the cEm) — that is what makes VR4CreateEmSubObject bail at its very first `if`.
+// Nothing is written, no actor is spawned, and X0's return is discarded by the
+// caller anyway. When the pointer is NOT null, every handler is a no-op, so the
+// normal path keeps its exact original behaviour.
+//
+// Checked all 107 VR4CreateEmSubObject call sites: the other 105 take X0 from the
+// cEm's own archive (LDR X8,[X19,#0x460] / ADD X0,X9,X8) and never dereference the
+// cModel, so a NULL model is already harmless there. sub_5E49AA0 is the only
+// function that sources X0 from the model itself — hence the only one that can
+// fault. Two sites, four instruments, whole class of cut-content AI covered.
+static const uintptr_t kEm32Guard[][2] = {   // { LDR Xd,[Xn,#0x180] , LDR X0,[Xd,#0x18] }
+    { 0x5E4A358, 0x5E4A364 },                // sub-object 1 (cEm+0xA80) — MOV X1,X19 sits between
+    { 0x5E4A374, 0x5E4A378 },                // sub-object 2 (cEm+0xA88) — the observed crash
+};
+
+// +0x180 must land inside the buffer and point back at it; +0x18 must read 0.
+alignas(16) static uint8_t g_em32_null_model[0x400];
+
+static bool em32_guard_is_ldr_x_imm(uint32_t w, int* rt, int* rn, uint32_t* off) {
+    if ((w & 0xFFC00000u) != 0xF9400000u) return false;   // LDR Xt,[Xn,#imm] unsigned
+    *rt  = (int)(w & 0x1F);
+    *rn  = (int)((w >> 5) & 0x1F);
+    *off = ((w >> 10) & 0xFFF) * 8u;
+    return true;
+}
+
+static void em32_sub_null_to_dummy(void* addr, DobbyRegisterContext* ctx) {
+    (void)addr;
+    // Only fires on a pointer that is already guaranteed to SIGSEGV one insn later.
+    if (ctx->general.x[2] == 0)
+        ctx->general.x[2] = reinterpret_cast<uint64_t>(g_em32_null_model);
+}
+
+static void em32_sub_disarm_call(void* addr, DobbyRegisterContext* ctx) {
+    (void)addr;
+    // X8 == our buffer <=> the load above was substituted. Zero the cEm so
+    // VR4CreateEmSubObject returns at `if (a2)` without touching anything.
+    if (ctx->general.x[8] == reinterpret_cast<uint64_t>(g_em32_null_model))
+        ctx->general.x[1] = 0;
+}
+
+bool install_em32_subobject_guard() {
+    uintptr_t base = symbols::lib_base();
+    if (!base) {
+        logger::log_error("EM32", "lib_base unavailable — sub-object null guard skipped");
+        return false;
+    }
+    *reinterpret_cast<void**>(g_em32_null_model + 0x180) = g_em32_null_model;
+
+    int done = 0;
+    for (size_t i = 0; i < sizeof(kEm32Guard) / sizeof(kEm32Guard[0]); ++i) {
+        uintptr_t ld180 = base + kEm32Guard[i][0];
+        uintptr_t ld18  = base + kEm32Guard[i][1];
+
+        // Verify the exact encodings before instrumenting. If a game update moves
+        // this code, we must do nothing rather than corrupt an unrelated function.
+        int rt1, rn1, rt2, rn2; uint32_t off1, off2;
+        uint32_t w1 = *reinterpret_cast<const uint32_t*>(ld180);
+        uint32_t w2 = *reinterpret_cast<const uint32_t*>(ld18);
+        if (!em32_guard_is_ldr_x_imm(w1, &rt1, &rn1, &off1) || off1 != 0x180 || rn1 != 2) {
+            logger::log_warn("EM32", "0x%lX is not `LDR Xd,[X2,#0x180]` (insn 0x%08X) — guard skipped",
+                             (unsigned long)kEm32Guard[i][0], w1);
+            continue;
+        }
+        if (!em32_guard_is_ldr_x_imm(w2, &rt2, &rn2, &off2) || off2 != 0x18 || rt2 != 0 || rn2 != rt1) {
+            logger::log_warn("EM32", "0x%lX is not `LDR X0,[X%d,#0x18]` (insn 0x%08X) — guard skipped",
+                             (unsigned long)kEm32Guard[i][1], rt1, w2);
+            continue;
+        }
+        if (DobbyInstrument(reinterpret_cast<void*>(ld180), em32_sub_null_to_dummy) != RT_SUCCESS) {
+            logger::log_warn("EM32", "DobbyInstrument failed at 0x%lX", (unsigned long)kEm32Guard[i][0]);
+            continue;
+        }
+        if (DobbyInstrument(reinterpret_cast<void*>(ld18), em32_sub_disarm_call) != RT_SUCCESS) {
+            logger::log_warn("EM32", "DobbyInstrument failed at 0x%lX — rolling back the pair",
+                             (unsigned long)kEm32Guard[i][1]);
+            DobbyDestroy(reinterpret_cast<void*>(ld180));
+            continue;
+        }
+        logger::log_info("EM32", "sub-object %d guarded: 0x%lX (LDR X%d,[X2,#0x180]) + 0x%lX (LDR X0,[X%d,#0x18])",
+                         (int)i + 1, (unsigned long)kEm32Guard[i][0], rt1,
+                         (unsigned long)kEm32Guard[i][1], rt1);
+        ++done;
+    }
+    logger::log_info("EM32", "em32 sub-object null guard: %d/2 sites — missing sub-object models "
+                             "now skip instead of SIGSEGV", done);
+    return done > 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ENEMY POOL SIZE — lift the per-level cap on live enemies
+// ═══════════════════════════════════════════════════════════════════════
+// EmSetEvent [0x5EE9E8C] hands out cEm slots from a fixed pool and returns the
+// `errEm` sentinel when every slot is busy — that IS the "hard limit of enemies
+// allowed for each level" (EnemySpawner surfaces it as "Pool full or invalid
+// emId"). The pool is the usual manager shape:
+//     EmMgr @ 0xA54AB68 : +0 vtable, +8 pool base, +16 slot count, +20 stride
+// so bumping the COUNT alone would walk the free-slot scan straight off the end
+// of the allocation — corruption, not more enemies.
+//
+// cEmMgr::arrayAlloc(this, n) [0x5D90680] is the one place that sizes it, and it
+// is perfectly self-consistent:
+//     free(pool); pool = memAlloc(stride * n); count = n; memClear(pool, stride * n);
+// so scaling its `n` argument scales the ALLOCATION and the COUNT together.
+// A pre-hook rewriting x1 is therefore the whole fix — no reallocation dance, no
+// stale pointers (it runs before any cEm exists), nothing to keep in sync.
+// Its prologue is STP/STP/ADD/LDR — position-independent, so the trampoline is
+// safe here (unlike ArmEmCallProlog, whose ADRL/ADR jump-table setup it broke).
+//
+// Cost is stride * (mult-1) extra bytes once per level load. The engine still
+// enforces its own per-type AI/anim budgets, so this raises the ceiling; it does
+// not promise 100 ganados will path or render well.
+static uint32_t s_em_pool_mult = 1;
+
+bool set_enemy_pool_multiplier(uint32_t mult) {
+    if (mult < 1) mult = 1;
+    if (mult > 16) mult = 16;          // sanity: stride*count must stay sane
+    s_em_pool_mult = mult;
+    void* fn = symbols::resolve("_ZN6cEmMgr10arrayAllocEj");
+    if (!fn) {
+        uintptr_t b = symbols::lib_base();
+        if (!b) { logger::log_error("EMPOOL", "lib_base unavailable"); return false; }
+        fn = reinterpret_cast<void*>(b + 0x5D90680);
+    }
+    // install_at dedupes by name, so re-calling this just updates the multiplier.
+    HookId h = install_at(fn, "__em_pool_mult", [](NativeCallContext& ctx) {
+        uint32_t n = static_cast<uint32_t>(ctx.x[1]);
+        if (!n || s_em_pool_mult <= 1) return;
+        uint64_t want = static_cast<uint64_t>(n) * s_em_pool_mult;
+        if (want > 4096) want = 4096;  // absurd sizes are a bug, not a feature
+        ctx.x[1] = want;
+        logger::log_info("EMPOOL", "cEmMgr::arrayAlloc: %u -> %llu slots (x%u)",
+                         n, (unsigned long long)want, s_em_pool_mult);
+    }, nullptr);
+    logger::log_info("EMPOOL", "enemy pool multiplier x%u : %s (takes effect on the next level load)",
+                     s_em_pool_mult, h ? "armed" : "FAILED");
+    return h != 0;
 }
 
 // ── Targeted safe-call guard ───────────────────────────────────────────────

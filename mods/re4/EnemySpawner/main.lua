@@ -862,9 +862,25 @@ local function spawnSingle(enemy, offsetX, offsetZ)
     if not buf or IsNull(buf) then return false, "EM_LIST buffer missing" end
     if not emSetEvent or IsNull(emSetEvent) then return false, "EmSetEvent missing" end
 
-    -- Safety: warn about NPC spawns (they often crash without level context)
-    if enemy.hpType == "npc" then
-        Log(TAG .. ": ⚠️ NPC spawn attempted: " .. enemy.name .. " — may crash without level context!")
+    -- ── REFUSE ids the engine cannot construct (this is the "NPC crash") ──
+    -- cEmMgr::construct guards the ARCHIVE but calls the EmInitFunc global with
+    -- NO null check:
+    --     BL EmReadSearch ; STR X0,[cEm+0x460] ; CBZ X0, ret   <- archive checked
+    --     LDR X8,[X8] ; BLR X8                                 <- init, UNCHECKED
+    -- EmInitFunc is only ever set by ArmEmCallProlog's per-id case. An id with no
+    -- case leaves it holding the PREVIOUS enemy's init (which then runs over the
+    -- wrong archive → cModel::initJoint SIGSEGV) or NULL if nothing has spawned
+    -- yet (→ BLR 0, tombstone pc=0 "null pointer dereference"). That is what the
+    -- old "NPCs are EXPERIMENTAL, may crash" warning was really describing — it
+    -- logged and then spawned anyway, which is just a crash with a note attached.
+    -- IsEmIdSupported asks the jump table itself, so it cannot drift out of sync.
+    local emId = enemy.bytes and enemy.bytes[1]
+    if IsEmIdSupported and emId and not IsEmIdSupported(emId) then
+        local msg = string.format(
+            "%s (emId 0x%02X) has NO init in this build — the engine would call a "
+            .. "stale/NULL EmInitFunc and crash. Refusing to spawn.", enemy.name, emId)
+        Log(TAG .. ": " .. msg)
+        return false, msg
     end
 
     -- Get player position in RE4 world coords
@@ -986,17 +1002,15 @@ local function spawnSingle(enemy, offsetX, offsetZ)
     return true, result
 end
 
--- Debounce: the VR debug-menu confirm re-fires a single click several times
--- (a trigger press spans many frames), so one "Spawn X" tap was producing 6+
--- enemies. Collapse repeat calls within 500ms into ONE spawn batch.
-local _lastSpawnClock = -1
+-- NOTE: this used to carry a 500ms debounce because the VR debug-menu confirm
+-- re-fired one click across many frames (a trigger press spans many frames), so
+-- a single "Spawn X" tap produced 6+ enemies. That was treating the symptom in
+-- the wrong module: it fired for EVERY custom-page action, not just spawning,
+-- and the local guard silently returned 0 for legitimate rapid taps — you tap
+-- twice, you get one enemy, and nothing says why.
+-- DebugMenuAPI now edge-detects the confirm (one action per physical press), so
+-- every call that reaches here is a real, intended click. No debounce.
 local function spawnEnemy(enemy, count)
-    local now = os.clock()
-    if now - _lastSpawnClock < 0.5 then
-        V("spawnEnemy: DEBOUNCED (%.3fs since last click) — ignoring repeat", now - _lastSpawnClock)
-        return 0
-    end
-    _lastSpawnClock = now
     count = count or state.spawnCount
     V("spawnEnemy: name=%s count=%d diff=%s dist=%d", enemy.name, count, state.difficulty, state.spawnDistance)
 
@@ -1296,6 +1310,28 @@ end
 V("Init: calling initNative (non-fatal)")
 pcall(initNative)
 V("Init: nativeReady=%s", tostring(nativeReady))
+
+-- ── LIFT THE PER-LEVEL ENEMY CAP ────────────────────────────────────────
+-- "Pool full or invalid emId (errEm)" is not our error: EmSetEvent hands out
+-- cEm slots from a FIXED pool and returns the errEm sentinel once they are all
+-- busy. That pool is sized in exactly one place — cEmMgr::arrayAlloc(n) does
+--     pool = memAlloc(stride * n);  count = n;
+-- so scaling n scales the allocation AND the count together. (Raising the count
+-- alone would walk the free-slot scan off the end of the buffer = corruption.)
+-- Applies from the NEXT level load, since that is when the pool is (re)allocated.
+-- The engine still has its own per-type AI/anim budgets — this raises the
+-- ceiling, it does not promise 100 ganados will path or render nicely.
+local POOL_MULT = 4
+if SetEnemyPoolMultiplier then
+    pcall(function()
+        local ok = SetEnemyPoolMultiplier(POOL_MULT)
+        Log(TAG .. ": enemy pool x" .. POOL_MULT .. " — " .. (ok and "armed" or "FAILED")
+            .. " (applies on next level load; removes the 'Pool full' cap)")
+    end)
+else
+    LogWarn(TAG .. ": SetEnemyPoolMultiplier missing — rebuild the modloader; "
+        .. "the per-level enemy cap stays at the stock pool size")
+end
 
 Log(TAG .. ": v10.2 loaded — " .. #ALL_ENEMIES .. " enemies, "
     .. #CATEGORIES .. " categories"

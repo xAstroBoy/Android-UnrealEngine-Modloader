@@ -55,6 +55,12 @@ GAMES = {
         "src": "re4",
         "label": "Resident Evil 4 VR",
         "aliases": ["re4vr", "residentevil", "armature"],
+        # Same VR/no-LAUNCHER story as PFX, but this is a UE4 title, so the
+        # activity lives under com.epicgames.ue4 — NOT com.epicgames.unreal,
+        # which is the UE5 package name and does not exist here ("Activity class
+        # ... does not exist"). With no activity set at all, game_launch fell back
+        # to `monkey -c LAUNCHER` and died with "No activities found to run".
+        "activity": "com.epicgames.ue4.GameActivity",
     },
     "handboi": {
         "pkg": "com.Capricia.HandBoi",
@@ -375,6 +381,17 @@ def _sync_script(pkg):
         'SCOPED="%s"\n'
         'if [ ! -d "$PUB/mods" ]; then echo "NO-PUBLIC"; exit 0; fi\n'
         'mkdir -p "$SCOPED/mods"\n'
+        # ── The guard that has to come FIRST ──────────────────────────────────
+        # If the bind mirror is up, $SCOPED IS $PUB — the same directory through a
+        # bind mount — and the `rm -rf` below would DELETE THE SOURCE, then copy an
+        # empty dir onto itself. That is not hypothetical: it wiped a freshly
+        # deployed 23-mod set while still reporting "pushed 23/23", because the
+        # push genuinely succeeded and the sync ate it afterwards.
+        # Compare device:inode, not the path strings — a bind mount makes two
+        # different paths the same directory, which is the whole point of it.
+        'PI=$(stat -c "%%d:%%i" "$PUB/mods" 2>/dev/null)\n'
+        'SI=$(stat -c "%%d:%%i" "$SCOPED/mods" 2>/dev/null)\n'
+        'if [ -n "$PI" ] && [ "$PI" = "$SI" ]; then echo "SAME-DIR-NOOP"; exit 0; fi\n'
         'OWN=$(stat -c "%%u:%%g" "$SCOPED" 2>/dev/null)\n'
         'rm -rf "$SCOPED/mods"/* 2>/dev/null\n'
         'cp -a "$PUB/mods/." "$SCOPED/mods/" 2>/dev/null\n'
@@ -386,15 +403,26 @@ def _sync_script(pkg):
 
 
 def sync_scoped(game=None):
-    """DEPRECATED — do not use. Kept only as an emergency fallback.
+    """REMOVED — this function DESTROYED mod deployments. Use ensure_mirror().
 
-    This copied public->scoped instead of binding, which means the two stores are
-    SEPARATE directories that silently diverge: the game writes its log/SDK into
-    scoped, deploys land in one or the other, and you end up debugging a stale
-    mod set (exactly what happened — public had a Dec-21 EnemyFixes_P.pak and 1
-    pak while scoped had the live 62). Use ensure_mirror(): the bind makes the
-    scoped path BE /sdcard/UnrealModloader/<pkg>, so there is only ever one store.
+    It ran `rm -rf "$SCOPED/mods"/*` and then copied public -> scoped. With the
+    bind mirror active — which is the NORMAL state, and the whole design — $SCOPED
+    *is* $PUB (one directory, two paths), so the rm deleted the very mods it was
+    about to copy and the cp copied an empty dir onto itself. Observed live: a
+    freshly deployed 23-mod set wiped seconds after "pushed 23/23", twice, and
+    game_launch called this on EVERY launch.
+
+    The copy model was wrong to begin with: two real directories silently diverge.
+    ensure_mirror() bind-mounts the public store onto the scoped path, so there is
+    only ever ONE store and nothing to sync. Nothing may call this again.
     """
+    return ("SYNC-REMOVED: sync_scoped deleted mods when the bind was active "
+            "(rm -rf on what is the same dir as the source). Use ensure_mirror(); "
+            "the boot script /data/adb/service.d/98-uml-mirror.sh binds every "
+            "package automatically.")
+
+
+def _sync_scoped_disabled(game=None):
     _, info = resolve_game(game)
     try:
         r = run_device_script(_sync_script(info["pkg"]), root=True, timeout=60)
@@ -402,7 +430,7 @@ def sync_scoped(game=None):
         return "SYNC-FAILED: %s" % e
     out = (r["stdout"] or "").strip().splitlines()
     for line in reversed(out):
-        if line.startswith("SYNCED:") or line == "NO-PUBLIC":
+        if line.startswith("SYNCED:") or line in ("NO-PUBLIC", "SAME-DIR-NOOP"):
             return line
     return "SYNC-FAILED: %s" % (out or (r["stderr"] or "").strip() or "unknown")
 
@@ -1079,6 +1107,23 @@ def deploy_mods(game: str = "", mod: str = "", hot: bool = True) -> str:
     if pushed:
         mstat = ensure_mirror(key)
         lines.append("mirror: %s" % mstat)
+
+    # VERIFY what is actually on disk. `adb push` returning rc=0 only proves the
+    # bytes left the PC — it says nothing about what survived afterwards. The old
+    # scoped-sync used to delete this very directory right after a successful
+    # push, and the report still cheerfully said "pushed 23/23" over an empty
+    # folder. Never report success you haven't looked at.
+    try:
+        chk = adb_shell('ls -1 "%s" 2>/dev/null | wc -l' % remote_mods.rstrip("/"), timeout=20)
+        landed = int((chk["stdout"] or "0").strip() or 0)
+        if landed < len(pushed):
+            lines.append("  !! VERIFY FAILED: pushed %d but only %d present in %s"
+                         % (len(pushed), landed, remote_mods))
+            lines.append("  -> something deleted them after the push (check the mirror/sync path)")
+        else:
+            lines.append("verified on device: %d mod dirs in %s" % (landed, remote_mods))
+    except (AdbError, ValueError) as e:
+        lines.append("  (verify skipped: %s)" % e)
 
     if hot and pushed:
         lines.append("--- hot-reload ---")

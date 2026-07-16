@@ -159,6 +159,13 @@ namespace reflection
     // initial snapshot taken during walk_all().
     void refresh_memory_map();
 
+    // True if `p` points into a currently-mapped, readable page (via the
+    // /proc/self/maps snapshot, lazily built/rebuilt at runtime). Rejects stale/freed
+    // pointers that pass the cheap ue::is_valid_ptr() range check but point to an
+    // UNMAPPED page. Call this BEFORE dereferencing any UObject pointer whose liveness
+    // is uncertain (e.g. tracked instance lists that may hold freed objects).
+    bool is_readable_ptr(const void *p);
+
     // Walk all objects in GUObjectArray and classify them
     // Populates the internal caches — call once on boot
     void walk_all();

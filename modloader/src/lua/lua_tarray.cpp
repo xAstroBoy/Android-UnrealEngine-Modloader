@@ -567,7 +567,7 @@ namespace lua_tarray
                     ue::FName fname;
                     // On Android ARM64, TCHAR = char16_t (2 bytes), NOT wchar_t (4 bytes)
                     std::u16string u16name(s.begin(), s.end());
-                    symbols::FName_Init(&fname, u16name.c_str(), 0);
+                    symbols::FName_Init(&fname, s.c_str(), 1);
                     comp_idx = fname.ComparisonIndex;
                 }
             }
@@ -899,7 +899,7 @@ namespace lua_tarray
                 if (comp_idx == 0 && symbols::FName_Init) {
                     ue::FName fname;
                     std::u16string u16name(s.begin(), s.end());
-                    symbols::FName_Init(&fname, u16name.c_str(), 0);
+                    symbols::FName_Init(&fname, s.c_str(), 1);
                     comp_idx = fname.ComparisonIndex;
                 }
             } else if (value.is<int32_t>()) {

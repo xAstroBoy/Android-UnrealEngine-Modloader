@@ -644,10 +644,42 @@ local function setup_hooks()
     -- └─────────────────────────────────────────────────────────────────┘
     local CONFIRM_IDS = {3, 8, 10}
 
+    -- ── ONE ACTION PER PHYSICAL PRESS (edge detect) ──────────────────────
+    -- A VR trigger pull spans MANY frames and the Blueprint re-fires BndEvt with
+    -- pressed=1 on every one of them, so a single tap used to run dispatch_item
+    -- dozens of times — "Spawn X" gave 6+ enemies, toggles flickered, every
+    -- custom-page action fired repeatedly. (EnemySpawner worked around this with
+    -- its own 500ms debounce, which then silently ATE legitimate rapid taps.)
+    -- Fix it here, at the source, for every page and every mod: act only on the
+    -- rising edge (release re-arms). The three IDs share ONE flag — L Trigger,
+    -- A and R Trigger all mean "confirm", so a press that lights up more than one
+    -- must still be a single action.
+    local confirm_armed   = true    -- true → the next press will act
+    local confirm_press_t = -1
+    -- Safety valve: if a release event is ever lost we would wedge the menu
+    -- forever, so a press held longer than this re-arms. Long enough that no
+    -- normal tap repeats, short enough that the menu can never feel dead.
+    local CONFIRM_REARM_SEC = 2.0
+
     local function on_confirm_post(self, func, parms)
         local pressed = ReadU8(parms)
-        V("BndEvt Confirm: pressed=%d", pressed)
-        if pressed == 0 then return end   -- release event, skip
+        V("BndEvt Confirm: pressed=%d armed=%s", pressed, tostring(confirm_armed))
+        if pressed == 0 then
+            confirm_armed = true      -- release → re-arm for the next press
+            return
+        end
+        local ok_t, now = pcall(os.clock)
+        now = (ok_t and type(now) == "number") and now or 0
+        if not confirm_armed then
+            if now - confirm_press_t > CONFIRM_REARM_SEC then
+                V("BndEvt Confirm: held %.1fs with no release — re-arming", now - confirm_press_t)
+                confirm_armed = true
+            else
+                return                -- same press still held → ignore the repeat
+            end
+        end
+        confirm_armed   = false
+        confirm_press_t = now
 
         pcall(function()
             local dm = get_dm()

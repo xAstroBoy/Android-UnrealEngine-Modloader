@@ -68,9 +68,10 @@ namespace lua_types
         if (symbols::FName_Init)
         {
             ue::FName fname;
-            // Android ARM64: TCHAR = char16_t (2 bytes), NOT wchar_t (4 bytes)
-            std::u16string u16name(name.begin(), name.end());
-            symbols::FName_Init(&fname, u16name.c_str(), 0);
+            // Resolved ctor is the ANSI (char*) overload; pass the narrow string
+            // directly (UTF-16 truncates at strlen's 2nd byte). 3rd arg is EFindName;
+            // 1 = FNAME_Add so unknown names are interned instead of collapsing.
+            symbols::FName_Init(&fname, name.c_str(), 1);
             comparison_index = fname.ComparisonIndex;
             number = fname.Number;
         }
@@ -91,13 +92,13 @@ namespace lua_types
             number = 0;
         }
         else
-        { // FNAME_Add
+        { // FNAME_Add (or Replace) — pass the caller's EFindName so unknown names
+          // actually get interned. Was hardcoded 0 (FNAME_Find) = never created.
             if (symbols::FName_Init)
             {
                 ue::FName fname;
-                // Android ARM64: TCHAR = char16_t (2 bytes), NOT wchar_t (4 bytes)
-                std::u16string u16name(name.begin(), name.end());
-                symbols::FName_Init(&fname, u16name.c_str(), 0);
+                // ANSI (char*) overload — pass narrow string, not UTF-16.
+                symbols::FName_Init(&fname, name.c_str(), find_type);
                 comparison_index = fname.ComparisonIndex;
                 number = fname.Number;
             }

@@ -5,6 +5,7 @@
 
 #include "modloader/mod_loader.h"
 #include "modloader/lua_engine.h"
+#include "modloader/mod_tracker.h"
 #include "modloader/logger.h"
 #include "modloader/paths.h"
 
@@ -15,6 +16,8 @@
 #include <signal.h>
 #include <setjmp.h>
 #include <atomic>
+#include <fstream>
+#include <set>
 
 namespace mod_loader
 {
@@ -22,6 +25,96 @@ namespace mod_loader
     static std::vector<ModInfo> s_mods;
     static std::mutex s_mods_mutex;
     static std::atomic<int> s_active_mod_loaders{0};
+
+    // ═══ Persisted disabled set ═════════════════════════════════════════════
+    // One mod name per line at <data_dir>/disabled_mods.txt. Mods listed here
+    // are skipped at boot and shown as DISABLED. Kept in memory + mirrored to
+    // disk so the choice survives a restart / game update.
+    static std::set<std::string> s_disabled;
+    static std::mutex s_disabled_mutex;
+    static bool s_disabled_loaded = false;
+
+    static std::string disabled_file_path()
+    {
+        return paths::data_dir() + "/disabled_mods.txt";
+    }
+
+    static void load_disabled_set_locked()
+    {
+        if (s_disabled_loaded)
+            return;
+        s_disabled_loaded = true;
+        std::ifstream ifs(disabled_file_path());
+        if (!ifs.is_open())
+            return;
+        std::string line;
+        while (std::getline(ifs, line))
+        {
+            // trim CR/whitespace
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
+                                     line.back() == ' ' || line.back() == '\t'))
+                line.pop_back();
+            if (!line.empty())
+                s_disabled.insert(line);
+        }
+        logger::log_info("MOD", "Loaded disabled set: %zu mod(s) disabled", s_disabled.size());
+    }
+
+    static void save_disabled_set_locked()
+    {
+        std::ofstream ofs(disabled_file_path(), std::ios::trunc);
+        if (!ofs.is_open())
+        {
+            logger::log_error("MOD", "Could not write disabled set to %s",
+                              disabled_file_path().c_str());
+            return;
+        }
+        for (const auto &n : s_disabled)
+            ofs << n << "\n";
+    }
+
+    bool is_disabled(const std::string &name)
+    {
+        std::lock_guard<std::mutex> lock(s_disabled_mutex);
+        load_disabled_set_locked();
+        return s_disabled.count(name) > 0;
+    }
+
+    static void set_disabled_persist(const std::string &name, bool disabled)
+    {
+        std::lock_guard<std::mutex> lock(s_disabled_mutex);
+        load_disabled_set_locked();
+        if (disabled)
+            s_disabled.insert(name);
+        else
+            s_disabled.erase(name);
+        save_disabled_set_locked();
+    }
+
+    // Set/refresh a mod's ModInfo status entry (create if missing).
+    static void set_mod_status(const std::string &name, ModStatus status, bool enabled,
+                               const std::string &error = "")
+    {
+        std::lock_guard<std::mutex> lock(s_mods_mutex);
+        for (auto &m : s_mods)
+        {
+            if (m.name == name)
+            {
+                m.status = status;
+                m.enabled = enabled;
+                if (!error.empty())
+                    m.error = error;
+                return;
+            }
+        }
+        ModInfo mi;
+        mi.name = name;
+        mi.path = paths::mods_dir() + "/" + name;
+        mi.status = status;
+        mi.enabled = enabled;
+        mi.error = error;
+        s_mods.push_back(mi);
+    }
 
     // ═══ SIGSEGV recovery for mod loading ═══════════════════════════════════
     // When a mod causes a SIGSEGV during loading, we recover via siglongjmp
@@ -113,8 +206,17 @@ namespace mod_loader
         // the LOWEST priority recovery, ensuring inner guards (hook install,
         // hook execution, ProcessEvent, safe_call) fire first.
 
+        int skipped = 0;
         for (const auto &mod_name : mod_dirs)
         {
+            // Respect the persisted disabled set — list it, but don't execute it.
+            if (is_disabled(mod_name))
+            {
+                set_mod_status(mod_name, ModStatus::DISABLED, false);
+                logger::log_info("MOD", "Skipping disabled mod: %s", mod_name.c_str());
+                skipped++;
+                continue;
+            }
             if (load_mod(mod_name))
             {
                 loaded++;
@@ -125,7 +227,8 @@ namespace mod_loader
             }
         }
 
-        logger::log_info("MOD", "Loaded %d mods, %d failed (from %s)", loaded, failed, mods_path.c_str());
+        logger::log_info("MOD", "Loaded %d mods, %d failed, %d disabled (from %s)",
+                         loaded, failed, skipped, mods_path.c_str());
         s_active_mod_loaders.fetch_sub(1, std::memory_order_relaxed);
         return loaded;
     }
@@ -134,6 +237,16 @@ namespace mod_loader
     bool load_mod(const std::string &name)
     {
         s_active_mod_loaders.fetch_add(1, std::memory_order_relaxed);
+
+        // Never execute a disabled mod — enable_mod() clears the flag before
+        // it calls here, so this only blocks accidental direct loads.
+        if (is_disabled(name))
+        {
+            logger::log_warn("MOD", "Mod '%s' is disabled — refusing to load", name.c_str());
+            set_mod_status(name, ModStatus::DISABLED, false);
+            s_active_mod_loaders.fetch_sub(1, std::memory_order_relaxed);
+            return false;
+        }
 
         std::lock_guard<std::mutex> lock(s_mods_mutex);
 
@@ -190,6 +303,16 @@ namespace mod_loader
             logger::log_error("MOD", "%s: This mod caused a native crash. Check for invalid memory access.",
                               name.c_str());
 
+            // CRITICAL: the siglongjmp above unwound the C++ stack but NOT the Lua
+            // VM's call stack — the mod's chunk was running inside safe_script_file's
+            // lua_pcall, so the shared lua_State is now left with a dangling L->ci /
+            // L->top. If we leave it, the next garbage-collection cycle traverses the
+            // corrupt thread and SIGSEGVs deep in the GC (traversethread/propagatemark)
+            // — which is why the game began crash-looping on boot once the game-thread
+            // queue started draining and running the GC. Reset the main Lua thread now
+            // so the remaining mods load onto a clean stack and the GC stays sane.
+            lua_engine::reset_after_crash();
+
             ModInfo mi;
             mi.name = name;
             mi.path = mod_dir;
@@ -221,6 +344,7 @@ namespace mod_loader
         ModInfo mi;
         mi.name = name;
         mi.path = mod_dir;
+        mi.enabled = true;
 
         if (result.success)
         {
@@ -254,6 +378,11 @@ namespace mod_loader
     {
         logger::log_info("MOD", "Hot-reloading mod: %s", name.c_str());
 
+        // Tear down the mod's previous hooks/patches/timers/commands FIRST so a
+        // reload doesn't stack a second set of callbacks (or leak a code patch)
+        // on top of the old ones. Safe no-op if the mod registered nothing.
+        mod_tracker::release_mod(name);
+
         // Remove the old entry
         {
             std::lock_guard<std::mutex> lock(s_mods_mutex);
@@ -277,6 +406,133 @@ namespace mod_loader
         }
 
         return ok;
+    }
+
+    // ═══ Unload / disable / enable ══════════════════════════════════════════
+
+    bool unload_mod(const std::string &name)
+    {
+        bool was_loaded = false;
+        {
+            std::lock_guard<std::mutex> lock(s_mods_mutex);
+            for (const auto &m : s_mods)
+            {
+                if (m.name == name &&
+                    (m.status == ModStatus::LOADED || m.status == ModStatus::ERRORED))
+                {
+                    was_loaded = true;
+                    break;
+                }
+            }
+        }
+
+        // Release resources OUTSIDE the mods mutex — mod_tracker touches other
+        // subsystems (pe_hook, native_hooks, delayed, bridge) with their own locks.
+        auto stats = mod_tracker::release_mod(name);
+        (void)stats;
+
+        // Mark UNLOADED but keep enabled=true (transient release). If it isn't
+        // in the list at all, add a stub so the UI reflects the state.
+        set_mod_status(name, ModStatus::UNLOADED, true);
+
+        logger::log_info("MOD", "%s: unloaded (%s)", name.c_str(),
+                         was_loaded ? "was loaded" : "was not loaded");
+        return was_loaded;
+    }
+
+    bool disable_mod(const std::string &name)
+    {
+        logger::log_info("MOD", "Disabling mod: %s", name.c_str());
+        // Tear down its live resources, then persist the choice.
+        mod_tracker::release_mod(name);
+        set_disabled_persist(name, true);
+        set_mod_status(name, ModStatus::DISABLED, false);
+        return true;
+    }
+
+    bool enable_mod(const std::string &name)
+    {
+        logger::log_info("MOD", "Enabling mod: %s", name.c_str());
+        // Clear the persisted flag FIRST so load_mod's disabled guard passes.
+        set_disabled_persist(name, false);
+
+        // Drop any stale DISABLED/UNLOADED entry so load_mod starts clean.
+        {
+            std::lock_guard<std::mutex> lock(s_mods_mutex);
+            s_mods.erase(
+                std::remove_if(s_mods.begin(), s_mods.end(),
+                               [&name](const ModInfo &m)
+                               { return m.name == name && m.status != ModStatus::LOADED; }),
+                s_mods.end());
+        }
+        return load_mod(name);
+    }
+
+    int set_all_enabled(bool enabled)
+    {
+        // Snapshot the on-disk mod directory names so we affect every scanned
+        // mod, not just those with a current ModInfo entry.
+        std::vector<std::string> names;
+        std::string mods_path = paths::mods_dir();
+        if (DIR *dir = opendir(mods_path.c_str()))
+        {
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != nullptr)
+            {
+                if (entry->d_name[0] == '.')
+                    continue;
+                std::string mp = mods_path + "/" + entry->d_name;
+                if (!dir_exists(mp))
+                    continue;
+                if (!file_exists(mp + "/main.lua"))
+                    continue;
+                names.push_back(entry->d_name);
+            }
+            closedir(dir);
+        }
+
+        // Snapshot current status by value (avoid holding a ModInfo* across the
+        // enable/disable calls below, which mutate s_mods).
+        auto status_of = [](const std::string &n, bool &found) -> ModStatus
+        {
+            std::lock_guard<std::mutex> lock(s_mods_mutex);
+            for (const auto &m : s_mods)
+            {
+                if (m.name == n)
+                {
+                    found = true;
+                    return m.status;
+                }
+            }
+            found = false;
+            return ModStatus::FAILED;
+        };
+
+        int affected = 0;
+        for (const auto &n : names)
+        {
+            if (enabled)
+            {
+                bool found = false;
+                ModStatus st = status_of(n, found);
+                if (is_disabled(n) || !found || st != ModStatus::LOADED)
+                {
+                    if (enable_mod(n))
+                        affected++;
+                }
+            }
+            else
+            {
+                if (!is_disabled(n))
+                {
+                    disable_mod(n);
+                    affected++;
+                }
+            }
+        }
+        logger::log_info("MOD", "set_all_enabled(%s): %d mod(s) affected",
+                         enabled ? "true" : "false", affected);
+        return affected;
     }
 
     // ═══ Query mod status ═══════════════════════════════════════════════════

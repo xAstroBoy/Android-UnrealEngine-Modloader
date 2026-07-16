@@ -49,19 +49,37 @@ namespace pattern
             return;
         }
 
+        // Snapshot every maps row first so we can, in a second pass, fold the
+        // anonymous .bss that trails the library's file-backed .data (see below).
+        struct Row { uintptr_t start; uintptr_t end; char perms[5]; bool is_lib; bool is_anon_priv; };
+        std::vector<Row> rows;
         char line[512];
         bool found_lib = false;
+
         while (fgets(line, sizeof(line), maps))
         {
-            // Match the engine library name from game profile
-            if (!strstr(line, lib_name.c_str()))
-                continue;
-            found_lib = true;
-
             uintptr_t start, end;
-            char perms[5];
+            char perms[5] = {0};
             if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3)
                 continue;
+
+            bool is_lib = (strstr(line, lib_name.c_str()) != nullptr);
+            // Anonymous PRIVATE mapping: no file path ('/' absent) and 'p' in perms.
+            // Matches "[anon:.bss]", "[anon:...]" and bare anonymous rows; excludes
+            // file-backed (has a '/path') and shared (rw-s, e.g. /dev/kgsl) rows.
+            bool is_anon_priv = (strchr(line, '/') == nullptr) && (perms[3] == 'p');
+
+            Row r;
+            r.start = start;
+            r.end = end;
+            memcpy(r.perms, perms, 5);
+            r.is_lib = is_lib;
+            r.is_anon_priv = is_anon_priv;
+            rows.push_back(r);
+
+            if (!is_lib)
+                continue;
+            found_lib = true;
 
             MemRegion region;
             region.start = start;
@@ -88,9 +106,51 @@ namespace pattern
         }
         fclose(maps);
 
+        // ── Absorb the trailing anonymous .bss ──────────────────────────────────
+        // On Android the dynamic linker splits a shared object's writable segment
+        // into a FILE-BACKED rw-p region (.data — carries the .so path) IMMEDIATELY
+        // followed by an ANONYMOUS rw-p region (.bss — no path, often labelled
+        // "[anon:.bss]"). Because the anon .bss doesn't carry the .so name, the loop
+        // above never sees it and s_data_end stops at the end of the small .data.
+        // But UE's GUObjectArray / GNames (FNamePool) globals live in .bss — so any
+        // structural sweep over [data_start,data_end) missed them entirely (this was
+        // THE bug: the scanner returned .data false positives on stripped builds).
+        // Walk the contiguous anon rw-p chain that starts exactly at s_data_end and
+        // fold it into the scannable data range. Contiguity (no gap) + private +
+        // anonymous uniquely picks out .bss; the next unrelated mapping (heap, kgsl,
+        // dalvik, guard page…) has a gap or a path, so the chain stops there.
+        if (found_lib && s_data_end != 0)
+        {
+            const uintptr_t kMaxBssAbsorb = 256ULL * 1024 * 1024; // runaway guard
+            const uintptr_t absorb_from = s_data_end;
+            bool grew = true;
+            while (grew)
+            {
+                grew = false;
+                for (const Row &r : rows)
+                {
+                    if (r.is_anon_priv && r.perms[1] == 'w' &&
+                        r.start == s_data_end && r.end > r.start &&
+                        (r.end - absorb_from) <= kMaxBssAbsorb)
+                    {
+                        MemRegion region;
+                        region.start = r.start;
+                        region.end = r.end;
+                        region.readable = (r.perms[0] == 'r');
+                        region.writable = true;
+                        region.executable = false;
+                        s_regions.push_back(region);
+                        s_data_end = r.end; // extend the data range across .bss
+                        grew = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         if (found_lib)
         {
-            logger::log_info("PATTERN", "%s mapped: .text 0x%lX-0x%lX, .data 0x%lX-0x%lX (%zu regions)",
+            logger::log_info("PATTERN", "%s mapped: .text 0x%lX-0x%lX, .data+.bss 0x%lX-0x%lX (%zu regions)",
                              lib_name.c_str(), s_text_start, s_text_end, s_data_start, s_data_end, s_regions.size());
         }
         else
