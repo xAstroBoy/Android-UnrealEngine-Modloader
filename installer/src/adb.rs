@@ -320,14 +320,26 @@ pub fn restore_game_dirs(serial: &str, backups: &[(String, String)]) -> Result<(
         }
         let exists = shell(serial, &format!("[ -d '{}' ] && echo Y || echo N", bak))?;
         if exists.contains('Y') {
-            // If new install created the dir, merge
+            // If the new install already recreated the dir, merge into it.
+            // NOTE: `cp -a src/.` not `cp -a src/*` — the glob silently skips
+            // DOTFILES, and the game keeps state in them (.sdk_dumped etc).
             let new_exists = shell(serial, &format!("[ -d '{}' ] && echo Y || echo N", orig))?;
             if new_exists.contains('Y') {
-                shell(serial, &format!("cp -a '{}'/* '{}/' 2>/dev/null; rm -rf '{}'", bak, orig, bak))?;
+                shell(serial, &format!("cp -a '{}/.' '{}/' 2>/dev/null", bak, orig))?;
             } else {
                 shell(serial, &format!("mv '{}' '{}'", bak, orig))?;
             }
-            log::info!("Restored {} → {}", bak, orig);
+            // Only drop the backup once the data is verifiably back.
+            let restored = shell(serial, &format!("[ -d '{}' ] && echo Y || echo N", orig))?;
+            if restored.contains('Y') {
+                shell(serial, &format!("rm -rf '{}'", bak))?;
+                log::info!("Restored {} → {}", bak, orig);
+            } else {
+                log::error!(
+                    "Restore of {} FAILED — your data is still at {}. Not deleting it.",
+                    orig, bak
+                );
+            }
         }
     }
     Ok(())
