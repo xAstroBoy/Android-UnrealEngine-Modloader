@@ -2209,6 +2209,19 @@ namespace lua_bindings
             return native_hooks::install_laser_sight_fix(reinterpret_cast<uintptr_t>(site));
         });
 
+        // ── InstallShootGamePausedGuard — a gallery target in a normal room ──
+        // cEmMark::move -> armIsShootingGamePaused reads the shooting-minigame
+        // manager global (qword_A597D28) and derefs it at +0x181. That global has
+        // exactly ONE writer in the whole binary — R22cInit — so it is NULL in
+        // every room but the gallery, and the fault addr IS the field offset.
+        // armIsShootingGamePaused has exactly one caller, so this is surgical.
+        // NOTE: the param MUST be void* — Resolve/Offset return lightuserdata, and
+        // a uint64_t param makes sol throw (a pcall then hides it as "returned
+        // false"). Sig: InstallShootGamePausedGuard(addrOfLdrbW8X8_0x181) -> bool
+        lua.set_function("InstallShootGamePausedGuard", [](void* site) -> bool {
+            return native_hooks::install_shootgame_paused_guard(reinterpret_cast<uintptr_t>(site));
+        });
+
         // ── InstallDualFireArm — dual-fire WITHOUT a Lua hook on TryFire ─────
         // RE4 arms ONE weapon globally and TryFire only fires the gun that IS the
         // armed one, so dual-wielding fires only one gun. Arming each gun inside

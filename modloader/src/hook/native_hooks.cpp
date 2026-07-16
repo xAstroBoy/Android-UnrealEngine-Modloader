@@ -1576,6 +1576,53 @@ static void laser_null_parts_to_zero(void* addr, DobbyRegisterContext* ctx) {
         ctx->general.x[0] = reinterpret_cast<uint64_t>(g_zero_parts);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// cEmMark OUTSIDE THE SHOOTING GALLERY — fault addr 0x181
+// ═══════════════════════════════════════════════════════════════════════
+// cEmMark is the shooting-gallery target. Its move() asks whether the minigame
+// is paused, and that reads a GLOBAL manager pointer:
+//     60d1b10  ADRP X8, #qword_A597D28@PAGE
+//     60d1b14  LDR  X8, [X8,#qword_A597D28@PAGEOFF]   ; the shooting-game mgr
+//     60d1b18  LDRB W8, [X8,#0x181]                   ; <== NULL outside R22
+//     60d1b1c  CMP  W8, #0
+//     60d1b20  CSET W0, NE                            ; return (paused != 0)
+// IDA says qword_A597D28 has exactly ONE writer — R22cInit — so the pointer is
+// only ever set while the shooting range itself is loaded, and is NULL in every
+// other room. armIsShootingGamePaused has exactly ONE caller (cEmMark::move), so
+// neutralising it here cannot affect anything but a gallery target.
+//
+// Redirecting the NULL to a zeroed buffer makes the LDRB read 0, so CSET yields
+// W0 = 0 = "not paused" — which is the truthful answer when the minigame is not
+// running at all, and lets the mark move like any other enemy.
+alignas(16) static uint8_t g_zero_shootgame[0x200];   // the read lands at +0x181
+
+static void shootgame_null_to_zero(void* /*addr*/, DobbyRegisterContext* ctx) {
+    if (ctx->general.x[8] == 0)
+        ctx->general.x[8] = reinterpret_cast<uint64_t>(g_zero_shootgame);
+}
+
+bool install_shootgame_paused_guard(uintptr_t ldrb_site) {
+    if (!ldrb_site) return false;
+    // Verify it really is `LDRB W8,[X8,#0x181]` before instrumenting it.
+    //   LDRB (imm, unsigned offset) = 0x39400000 | (imm12 << 10) | (Rn << 5) | Rt
+    const uint32_t kLdrbW8_X8_181 = 0x39400000u | (0x181u << 10) | (8u << 5) | 8u;  // 0x39460508
+    uint32_t w = *reinterpret_cast<const uint32_t*>(ldrb_site);
+    if (w != kLdrbW8_X8_181) {
+        logger::log_warn("EMMARK", "0x%lX is not `LDRB W8,[X8,#0x181]` (insn 0x%08X) — fix skipped",
+                         (unsigned long)ldrb_site, w);
+        return false;
+    }
+    if (DobbyInstrument(reinterpret_cast<void*>(ldrb_site),
+                        shootgame_null_to_zero) != RT_SUCCESS) {
+        logger::log_error("EMMARK", "DobbyInstrument failed at 0x%lX", (unsigned long)ldrb_site);
+        return false;
+    }
+    logger::log_info("EMMARK", "shooting-game null guard installed @0x%lX — a gallery target "
+                               "spawned outside R22 now reads 'not paused' instead of SIGSEGV 0x181",
+                     (unsigned long)ldrb_site);
+    return true;
+}
+
 bool install_laser_sight_fix(uintptr_t add_x1_site) {
     if (!add_x1_site) return false;
     // Verify it really is `ADD X1, X0, #0x80` before touching it.

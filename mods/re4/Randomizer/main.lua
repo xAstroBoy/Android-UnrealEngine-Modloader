@@ -268,7 +268,9 @@ local POOL = {
     -- bytes = { emId, +2, +3, +4..7 dword, hpLo, hpHi }; zeros = engine defaults,
     -- 1000 HP. Grouped so you can bulk-toggle them in the menu.
     {"em03  [em/pl11.das]", {3,0,0,0,0,0,0,232,3}, nil, "NPC / Player models", false, true},
-    {"em04  [em/pl14.das]", {4,0,0,0,0,0,0,232,3}, nil, "NPC / Player models", false, true},
+    -- emId 4 is LUIS — not a guess: ArmEmCallProlog sends it to _prologPl_luis,
+    -- the game's own symbol, and cSubLuis is a real class in the binary.
+    {"Luis Sera  [em/pl14.das]", {4,0,0,0,0,0,0,232,3}, nil, "NPC / Player models", false, true},
     {"em05  [em/pl15.das]", {5,0,0,0,0,0,0,232,3}, nil, "NPC / Player models", false, true},
     {"em09  [em/em10.das]", {9,0,0,0,0,0,0,232,3}, nil, "Ganados (cut/extra)", false, true},
     {"em0c  [em/pl18.das]", {12,0,0,0,0,0,0,232,3}, nil, "NPC / Player models", false, true},
@@ -293,7 +295,22 @@ local POOL = {
     {"em34  [em/em34.das]", {52,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
     {"em3b  [em/em3b.das]", {59,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
     {"em3d  [em/em3d.das]", {61,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
-    {"em3e  [em/em3e.das]", {62,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
+    -- emId 62 (0x3e) REMOVED — it is NOT an enemy.
+    -- ArmEmCallProlog dispatches it to _prologEmmark => cEmMark, the SHOOTING-
+    -- GALLERY TARGET. cEmMark::move asks armIsShootingGamePaused, which reads the
+    -- minigame manager global qword_A597D28 and derefs it at +0x181. That global
+    -- has exactly ONE writer in the binary — R22cInit — so it is NULL in every
+    -- room except the shooting range, and spawning a mark anywhere else is an
+    -- instant SIGSEGV (tombstone_29: armIsShootingGamePaused+24 <- cEmMark::move+20).
+    --
+    -- I built this pool from the ArmEmCallProlog jump table, treating "has an init"
+    -- as "is an enemy". It is not: the cEm family also covers PROPS (cEmBarrel,
+    -- cEmBox, cEmDoor, cEmWall, cEmWindow, cEmTree, cEmRock, cEmTorch, cEmSwitch,
+    -- cEmMark...). Emmark is the only prop that the emId prolog table reaches, so
+    -- it is the only one that leaked into the pool — but it is why the "more
+    -- variety" change started crashing rooms.
+    -- (CutContentRestorer also installs a native guard on that LDRB, so a mark
+    -- spawned by anything else reads "not paused" instead of killing the game.)
     {"em3f  [em/em3f.das]", {63,0,0,0,0,0,0,232,3}, nil, "More Enemies", false, true},
     {"em40  [em/em40.das]", {64,0,0,0,0,0,0,232,3}, nil, "em4x Ganados", false, true},
     {"em41  [em/em41.das]", {65,0,0,0,0,0,0,232,3}, nil, "em4x Ganados", false, true},

@@ -177,6 +177,12 @@ void set_minethrower_enabled(bool on);
 // patching. NOT a crash guard — install_safe_call_guard is INERT (see below).
 bool install_laser_sight_fix(uintptr_t add_x1_site);
 
+// cEmMark (shooting-gallery target) spawned outside the gallery: its move() reads
+// the minigame manager global, which only R22cInit ever sets, then derefs the NULL
+// at +0x181. Pass the address of `LDRB W8,[X8,#0x181]` in armIsShootingGamePaused
+// (0x60D1B18); a NULL is redirected to a zeroed buffer => "not paused".
+bool install_shootgame_paused_guard(uintptr_t ldrb_site);
+
 // U3 "It" (emId 50 = 0x32 = cEm32) is INVULNERABLE outside its scripted level —
 // same root as the fault-0x180 crash. sub_5E49AA0 builds U3's parts model with
 // SetObj00 using the GLOBAL/stage archive at pG+0x68 for the skeleton param; away

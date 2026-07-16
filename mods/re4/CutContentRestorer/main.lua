@@ -229,6 +229,34 @@ do
         LogWarn(TAG .. ": InstallLaserSightFix missing — rebuild the modloader")
     end
 
+    -- ── cEmMark (shooting-gallery target) in a normal room — fault 0x181 ─────
+    -- tombstone_29: armIsShootingGamePaused()+24 <- cEmMark::move()+20 <- cEmMgr::move.
+    --     60d1b10  ADRP X8, #qword_A597D28@PAGE
+    --     60d1b14  LDR  X8, [X8,#qword_A597D28@PAGEOFF]  ; shooting-minigame mgr
+    --     60d1b18  LDRB W8, [X8,#0x181]                  ; <== NULL -> fault 0x181
+    --     60d1b1c  CMP  W8, #0
+    --     60d1b20  CSET W0, NE                           ; return (paused != 0)
+    --
+    -- Two facts from IDA make this surgical rather than a guess:
+    --   * qword_A597D28 has exactly ONE writer in the entire binary — R22cInit —
+    --     so the manager only exists while the shooting range is loaded and is
+    --     NULL in every other room. The randomizer putting a mark anywhere else
+    --     therefore ALWAYS hits this.
+    --   * armIsShootingGamePaused has exactly ONE caller (cEmMark::move), so
+    --     neutralising it cannot touch any other enemy.
+    -- Zeroing the pointer makes the byte read 0 => W0 = 0 = "not paused", which is
+    -- the truthful answer when the minigame is not running, and the mark then
+    -- moves like a normal enemy instead of killing the process.
+    if InstallShootGamePausedGuard then
+        pcall(function()
+            local site = Offset(GetLibBase(), 0x60D1B18)   -- LDRB W8,[X8,#0x181]
+            local ok = InstallShootGamePausedGuard(site)
+            Log(TAG .. ": cEmMark shooting-game null guard: " .. (ok and "installed" or "FAILED"))
+        end)
+    else
+        LogWarn(TAG .. ": InstallShootGamePausedGuard missing — rebuild the modloader")
+    end
+
     -- NOTE: IKInit and ArmLoadSoundBlockEnemy had InstallCrashGuard here too. They
     -- were removed, not kept "just in case" — they are inert for the same reason
     -- and only served to make the log claim protection that does not exist. Both
