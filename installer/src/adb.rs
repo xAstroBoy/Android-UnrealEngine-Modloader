@@ -267,32 +267,159 @@ pub fn backup_game_dirs(serial: &str, package: &str) -> Result<Vec<(String, Stri
         }
     }
 
-    // Internal data (settings). Root-only, best-effort — never fail the install.
+    // ── INTERNAL DATA — this is where the SAVE actually lives ──────────────
+    // It is NOT in /sdcard/Android/data. Verified on-device:
+    //     /data/data/<pkg>/files/UE4Game/VR4/VR4/Saved/SaveGames/System.sav
+    // and a search of /sdcard/Android/data/<pkg> finds no save at all. This code
+    // used to log "the progress save lives in /sdcard/Android/data and IS
+    // preserved" and skip internal entirely without root — so the uninstall wiped
+    // the save and the installer reported success. That is what ate people's
+    // progress (and the shader cache in /data/data/<pkg>/cache, which is why the
+    // "one time optimization" screen came back).
+    //
+    // Two ways in, in order:
+    //   1. root (su)     — works on any install.
+    //   2. run-as        — NO ROOT NEEDED, but only if the installed APK is
+    //                      DEBUGGABLE. Stock RE4 is not; OUR PATCHED APK IS
+    //                      (fix_manifest sets debuggable="true"), so every
+    //                      re-install after the first one can preserve the save.
+    // If neither works (stock APK, no root) the save genuinely cannot be read —
+    // that is an Android guarantee, not something we can code around. Say so
+    // LOUDLY instead of lying.
     let internal = format!("/data/data/{}", package);
     let bak = format!("/data/local/tmp/{}.internal_bak", package);
-    let probe = shell(serial, &format!(
+
+    let has_root = shell(serial, &format!(
         "su -c \"[ -d '{}' ] && echo Y || echo N\" 2>/dev/null", internal
-    )).unwrap_or_default();
-    if probe.contains('Y') {
+    )).unwrap_or_default().contains('Y');
+
+    if has_root {
         let _ = shell(serial, &format!("su -c \"rm -rf '{}'\" 2>/dev/null", bak));
         let r = shell(serial, &format!(
             "su -c \"cp -a '{}' '{}' && echo OK\" 2>/dev/null", internal, bak
         )).unwrap_or_default();
         if r.contains("OK") {
-            log::info!("Backed up internal data (settings) → {}", bak);
+            log::info!("Backed up the SAVE + settings (root) → {}", bak);
             backed.push((internal, bak));
-        } else {
-            log::warn!("Could not back up {} — settings will reset (progress save is safe)", internal);
+            return Ok(backed);
         }
-    } else {
-        log::info!("No root: skipping internal-data backup (settings only; the \
-                    progress save lives in /sdcard/Android/data and IS preserved)");
+        log::warn!("root backup of {} failed — trying run-as", internal);
     }
+
+    // run-as: no root required, needs a debuggable (= already patched) APK.
+    if can_run_as(serial, package) {
+        match backup_internal_via_runas(serial, package) {
+            Ok(true) => {
+                log::info!("Backed up the SAVE + settings via run-as (no root needed)");
+                backed.push((internal, RUNAS_BAK.to_string()));
+                return Ok(backed);
+            }
+            Ok(false) | Err(_) => log::warn!("run-as backup produced nothing"),
+        }
+    }
+
+    log::warn!("╔══════════════════════════════════════════════════════════════════╗");
+    log::warn!("║  SAVE GAME CANNOT BE BACKED UP ON THIS DEVICE                     ║");
+    log::warn!("╚══════════════════════════════════════════════════════════════════╝");
+    log::warn!("The save lives in INTERNAL storage:");
+    log::warn!("    /data/data/{}/files/UE4Game/VR4/VR4/Saved/SaveGames/", package);
+    log::warn!("Reading that needs EITHER root OR a debuggable app. This device has");
+    log::warn!("no root and the CURRENTLY INSTALLED apk is not debuggable (= it is");
+    log::warn!("the stock store build), so Android will not let us read it.");
+    log::warn!("");
+    log::warn!("=> Installing WILL ERASE your save and re-show the one-time");
+    log::warn!("   optimization screen. Back it up in-game / via Meta cloud first.");
+    log::warn!("=> This is a ONE-TIME cost: the patched apk IS debuggable, so every");
+    log::warn!("   FUTURE re-install preserves the save automatically via run-as.");
     Ok(backed)
+}
+
+/// Where a run-as backup is stashed on the PC side of the install.
+pub const RUNAS_BAK: &str = "<runas-tar>";
+
+/// Can we read the app's private data with no root? Only if the installed APK is
+/// debuggable — our patched one is, the stock store build is not.
+pub fn can_run_as(serial: &str, package: &str) -> bool {
+    shell(serial, &format!("run-as {} echo RUNAS_OK 2>&1", package))
+        .map(|s| s.contains("RUNAS_OK") && !s.contains("not debuggable"))
+        .unwrap_or(false)
+}
+
+fn runas_tar_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("uml_internal_bak.tar")
+}
+
+/// tar the app's private data straight to the PC. `exec-out` (not `shell`) so the
+/// binary stream isn't mangled by the shell's line-ending translation.
+fn backup_internal_via_runas(serial: &str, package: &str) -> Result<bool> {
+    let bin = crate::tools_setup::find_adb()
+        .ok_or_else(|| anyhow::anyhow!("adb not found"))?;
+    let out = Command::new(&bin)
+        .args([
+            "-s", serial, "exec-out",
+            &format!("run-as {} tar -cf - files shared_prefs databases 2>/dev/null", package),
+        ])
+        .output()?;
+    // A failed run-as still "succeeds" with an empty/whining stream — require real bytes.
+    if !out.status.success() || out.stdout.len() < 1024 {
+        return Ok(false);
+    }
+    std::fs::write(runas_tar_path(), &out.stdout)?;
+    log::info!("Save backup: {} KB → {}", out.stdout.len() / 1024, runas_tar_path().display());
+    Ok(true)
+}
+
+/// Push the tar back and unpack it as the app uid. /data/local/tmp is 0771
+/// shell:shell — "others" get --x, so the app can TRAVERSE it and open a file
+/// inside as long as the file itself is world-readable. Hence the chmod 644.
+fn restore_internal_via_runas(serial: &str, package: &str) -> Result<bool> {
+    let tar = runas_tar_path();
+    if !tar.exists() { return Ok(false); }
+    if !can_run_as(serial, package) {
+        log::warn!("Save restore: the new APK is not debuggable — cannot run-as. \
+                    Backup kept at {}", tar.display());
+        return Ok(false);
+    }
+    let remote = "/data/local/tmp/uml_internal_bak.tar";
+    push(serial, &tar, remote)?;
+    let _ = shell(serial, &format!("chmod 644 {}", remote));
+    let r = shell(serial, &format!(
+        "run-as {} tar -xf {} -C /data/data/{} && echo RESTORE_OK 2>&1",
+        package, remote, package
+    )).unwrap_or_default();
+    let _ = shell(serial, &format!("rm -f {}", remote));
+    if r.contains("RESTORE_OK") {
+        // Verify the save is actually back — never report a restore we didn't check.
+        let chk = shell(serial, &format!(
+            "run-as {} ls files/UE4Game/VR4/VR4/Saved/SaveGames 2>/dev/null", package
+        )).unwrap_or_default();
+        if chk.contains(".sav") {
+            log::info!("✓ Save restored and VERIFIED (SaveGames/*.sav present)");
+        } else {
+            log::warn!("tar unpacked but no *.sav found — the app may not have had a save yet");
+        }
+        let _ = std::fs::remove_file(&tar);
+        return Ok(true);
+    }
+    log::warn!("Save restore via run-as failed: {} (backup kept at {})", r.trim(), tar.display());
+    Ok(false)
 }
 
 pub fn restore_game_dirs(serial: &str, backups: &[(String, String)]) -> Result<()> {
     for (orig, bak) in backups {
+        // A run-as backup lives in a tar on the PC, not in a device dir.
+        if bak == RUNAS_BAK {
+            let pkg = orig.trim_start_matches("/data/data/");
+            match restore_internal_via_runas(serial, pkg) {
+                Ok(true) => {}
+                _ => log::warn!(
+                    "SAVE NOT RESTORED — the tar is kept at {}. Re-run the installer \
+                     once the patched (debuggable) app is installed and it will go back.",
+                    std::env::temp_dir().join("uml_internal_bak.tar").display()
+                ),
+            }
+            continue;
+        }
         // Internal data lives under /data — needs root and must keep the NEW
         // install's uid ownership, so it is merged via su + restorecon instead.
         if orig.starts_with("/data/data/") {

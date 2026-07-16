@@ -2131,9 +2131,15 @@ if SharedAPI and SharedAPI.DebugMenu then
                 api.Refresh()
             end)
 
-            -- Stats
+            -- Stats. An empty pool means nothing swaps — say so loudly instead of
+            -- looking broken. getEnabledPool() also drops emIds the engine cannot
+            -- construct, so solo-ing one of those legitimately lands here.
             local pool = getEnabledPool()
-            api.AddItem("Pool: " .. #pool .. "/" .. #ENEMIES .. " enemies", nil)
+            if #pool == 0 then
+                api.AddItem("!! Pool EMPTY — nothing will spawn (enable an enemy)", nil)
+            else
+                api.AddItem("Pool: " .. #pool .. "/" .. #ENEMIES .. " enemies", nil)
+            end
             api.AddItem("Total Swaps: " .. state.swapCount, nil)
             api.AddItem("Level #" .. currentGen .. " | Swaps: " .. levelSwaps, nil)
 
@@ -2148,10 +2154,42 @@ if SharedAPI and SharedAPI.DebugMenu then
                 Notify(TAG, "Re-randomizing on next enemy read!")
                 api.Refresh()
             end)
+            -- ── ENEMY SELECTION ────────────────────────────────────────────
+            -- Was bulk-only: Enable All / Disable All, plus a group toggle that
+            -- flipped the WHOLE group. There was no way to say "only Dr. Salvador"
+            -- or "everything except the dogs". Now:
+            --   SOLO   — one tap, that enemy and nothing else
+            --   groups — open one and toggle its enemies individually
+            --   Invert — "everything EXCEPT what I picked"
+            api.AddItem("--- ENEMY SELECTION ---", nil)
+
+            api.AddItem(">> SOLO one enemy...", function()
+                api.NavigateTo({ populate = function()
+                    api.AddItem("Tap an enemy = ONLY that one spawns", nil)
+                    api.AddItem("--------------------------------", nil)
+                    for _, e in ipairs(ENEMIES) do
+                        local ent = e     -- capture per iteration, not the loop var
+                        local mark = state.enabledEnemies[ent.name] and "*" or " "
+                        api.AddItem(mark .. " " .. ent.name .. "  (" .. ent.group .. ")", function()
+                            for n, _ in pairs(state.enabledEnemies) do
+                                state.enabledEnemies[n] = false
+                            end
+                            state.enabledEnemies[ent.name] = true
+                            invalidatePool()
+                            saveConfig()
+                            Log(TAG .. ": SOLO — only " .. ent.name .. " will spawn")
+                            Notify(TAG, "Solo: " .. ent.name)
+                            api.Refresh()
+                        end)
+                    end
+                end })
+            end)
+
             api.AddItem("Enable All Enemies", function()
                 for name, _ in pairs(state.enabledEnemies) do
                     state.enabledEnemies[name] = true
                 end
+                invalidatePool()
                 saveConfig()
                 api.Refresh()
             end)
@@ -2159,12 +2197,22 @@ if SharedAPI and SharedAPI.DebugMenu then
                 for name, _ in pairs(state.enabledEnemies) do
                     state.enabledEnemies[name] = false
                 end
+                invalidatePool()
+                saveConfig()
+                api.Refresh()
+            end)
+            -- "Everything EXCEPT the ones I picked" in one tap.
+            api.AddItem("Invert Selection", function()
+                for name, on in pairs(state.enabledEnemies) do
+                    state.enabledEnemies[name] = not on
+                end
+                invalidatePool()
                 saveConfig()
                 api.Refresh()
             end)
 
-            -- Per-group toggles
-            api.AddItem("--- GROUPS ---", nil)
+            -- ── GROUPS — open one to pick individual enemies ───────────────
+            api.AddItem("--- GROUPS (open to pick) ---", nil)
             for _, g in ipairs(GROUPS) do
                 local groupName = g
                 local total, on = 0, 0
@@ -2174,16 +2222,46 @@ if SharedAPI and SharedAPI.DebugMenu then
                         if state.enabledEnemies[e.name] then on = on + 1 end
                     end
                 end
-                local allOn = (on == total)
-                api.AddItem("[" .. (allOn and "ALL" or on .. "/" .. total) .. "] " .. groupName, function()
-                    local newState = not allOn
-                    for _, e in ipairs(ENEMIES) do
-                        if e.group == groupName then
-                            state.enabledEnemies[e.name] = newState
+                api.AddItem("> " .. groupName .. "  [" .. on .. "/" .. total .. "]", function()
+                    api.NavigateTo({ populate = function()
+                        api.AddItem(groupName .. " — tap an enemy to toggle it", nil)
+                        api.AddItem("All ON", function()
+                            for _, e in ipairs(ENEMIES) do
+                                if e.group == groupName then state.enabledEnemies[e.name] = true end
+                            end
+                            invalidatePool(); saveConfig(); api.Refresh()
+                        end)
+                        api.AddItem("All OFF", function()
+                            for _, e in ipairs(ENEMIES) do
+                                if e.group == groupName then state.enabledEnemies[e.name] = false end
+                            end
+                            invalidatePool(); saveConfig(); api.Refresh()
+                        end)
+                        api.AddItem("ONLY this group", function()
+                            for n, _ in pairs(state.enabledEnemies) do
+                                state.enabledEnemies[n] = false
+                            end
+                            for _, e in ipairs(ENEMIES) do
+                                if e.group == groupName then state.enabledEnemies[e.name] = true end
+                            end
+                            invalidatePool(); saveConfig()
+                            Log(TAG .. ": ONLY group " .. groupName)
+                            api.Refresh()
+                        end)
+                        api.AddItem("--------------------------------", nil)
+                        for _, e in ipairs(ENEMIES) do
+                            if e.group == groupName then
+                                local ent = e
+                                local st2 = state.enabledEnemies[ent.name] and "ON " or "OFF"
+                                api.AddItem("[" .. st2 .. "] " .. ent.name, function()
+                                    state.enabledEnemies[ent.name] = not state.enabledEnemies[ent.name]
+                                    invalidatePool()
+                                    saveConfig()
+                                    api.Refresh()
+                                end)
+                            end
                         end
-                    end
-                    saveConfig()
-                    api.Refresh()
+                    end })
                 end)
             end
         end })

@@ -254,8 +254,17 @@ pub fn install(
     report(7, "Verifying full APK signature (v1+v2)...");
     signer::verify_apk_full_signature(&signed_apk)?;
 
-    // 8. Temporarily rename OBB/data, uninstall old, install new, restore dirs
-    report(8, "Temporarily renaming OBB/data...");
+    // 8. Back up OBB/data/save, uninstall old, install new, restore.
+    //
+    // Whether the SAVE survives is decided HERE, before anything is destroyed:
+    // it lives in /data/data/<pkg>/files/UE4Game/... (internal), so it needs root
+    // or a debuggable app. Work that out now so the report at the end can tell the
+    // truth instead of claiming a restore that never happened.
+    report(8, "Backing up OBB / data / save...");
+    let save_reachable = adb::can_run_as(serial, package)
+        || adb::shell(serial, &format!(
+               "su -c \"[ -d '/data/data/{}' ] && echo Y\" 2>/dev/null", package
+           )).unwrap_or_default().contains('Y');
     let backups = adb::backup_game_dirs(serial, package)?;
 
     report(9, "Installing patched APK...");
@@ -278,6 +287,23 @@ pub fn install(
     setup_game_dirs(serial, package)?;
 
     log::info!("✅ {} modloader installed successfully!", app_name);
+
+    // Report the SAVE honestly. This used to imply the save was preserved on every
+    // install; it wasn't, and people lost their progress while being told it was
+    // fine. Never claim a restore we didn't do.
+    if save_reachable {
+        log::info!("💾 Save game: backed up and restored.");
+    } else {
+        log::warn!("");
+        log::warn!("⚠  SAVE GAME WAS **NOT** PRESERVED — this was unavoidable here.");
+        log::warn!("   The save is in internal storage (/data/data/{}/files/UE4Game/...),", package);
+        log::warn!("   which Android only opens up to root or a DEBUGGABLE app. The build");
+        log::warn!("   you had installed was the stock one, so it could not be read.");
+        log::warn!("   Expect the one-time optimization screen on first launch.");
+        log::warn!("");
+        log::warn!("   This is a ONE-TIME cost: the patched APK is debuggable, so from now");
+        log::warn!("   on every re-install keeps your save automatically (via run-as).");
+    }
     Ok(())
 }
 
