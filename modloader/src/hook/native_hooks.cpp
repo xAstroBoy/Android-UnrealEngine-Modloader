@@ -18,6 +18,7 @@
 #include "modloader/symbols.h"
 #include "modloader/logger.h"
 #include "modloader/lua_ue4ss_globals.h"
+#include "modloader/reflection_walker.h"
 #include <dobby.h>
 #include <unordered_map>
 #include <mutex>
@@ -25,6 +26,8 @@
 #include <cstring>
 #include <setjmp.h>
 #include <exception>
+#include <sys/mman.h>
+#include <unistd.h>
 
 // ═══════════════════════════════════════════════════════════════════════
 // SAFE-CALL CRASH RECOVERY
@@ -55,19 +58,66 @@ namespace native_hooks {
 
 static std::atomic<HookId> s_next_id{1};
 
+// One registrant's callbacks on an address. Multiple mods can hook the same
+// address; each gets its own entry keyed by its identity (mod name).
+struct HookEntry {
+    std::string        key;   // registrant identity — same key replaces, new key appends
+    NativePreCallback  pre;
+    NativePostCallback post;
+};
+using HookChain = std::vector<HookEntry>;
+
 struct HookRecord {
     HookId          id;
     std::string     name;
     void*           address;
     void*           original;      // trampoline to original function
-    NativePreCallback  pre;
-    NativePostCallback post;
+    // The callback CHAIN is published as an IMMUTABLE snapshot behind an
+    // atomic pointer, so the game-thread thunk iterates it lock-free while
+    // registration (rare) swaps in a freshly-built snapshot. The previous
+    // snapshot is intentionally leaked on swap — a reader may still be
+    // iterating it and reloads are rare, so leaking a small vector beats a
+    // use-after-free. (RCU-style: publish-new, never-free-old.)
+    std::atomic<HookChain*> chain{nullptr};
+    std::mutex      chain_edit_mutex;   // serializes snapshot rebuilds
     std::atomic<uint64_t> call_count;
+    ~HookRecord() { delete chain.load(); }
 };
 
 static std::unordered_map<HookId, HookRecord*> s_hooks;
 static std::unordered_map<void*, HookRecord*> s_addr_to_hook;
 static std::mutex s_mutex;
+
+// Add-or-replace one registrant's entry by key, publishing a fresh immutable
+// snapshot. Same key => replace (hot-reload); new key => append (coexist).
+static void chain_upsert(HookRecord* rec, const std::string& key,
+                         NativePreCallback pre, NativePostCallback post) {
+    std::lock_guard<std::mutex> lk(rec->chain_edit_mutex);
+    HookChain* cur = rec->chain.load();
+    HookChain* next = new HookChain(cur ? *cur : HookChain{});
+    bool replaced = false;
+    for (auto& e : *next) {
+        if (e.key == key) { e.pre = std::move(pre); e.post = std::move(post); replaced = true; break; }
+    }
+    if (!replaced) next->push_back(HookEntry{ key, std::move(pre), std::move(post) });
+    rec->chain.store(next);   // publish; old snapshot leaked on purpose
+}
+
+// Remove one registrant's entry by key. Returns true if found+removed.
+static bool chain_remove(HookRecord* rec, const std::string& key) {
+    std::lock_guard<std::mutex> lk(rec->chain_edit_mutex);
+    HookChain* cur = rec->chain.load();
+    if (!cur) return false;
+    HookChain* next = new HookChain();
+    next->reserve(cur->size());
+    bool removed = false;
+    for (auto& e : *cur) {
+        if (e.key == key) { removed = true; continue; }
+        next->push_back(e);
+    }
+    rec->chain.store(next);   // publish; old snapshot leaked on purpose
+    return removed;
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // ARM64 FULL-REGISTER CAPTURE THUNK SYSTEM
@@ -122,7 +172,8 @@ extern "C" uint64_t dispatch_full(int slot,
     // Crash guards (nullptr callbacks) are unaffected — they only use
     // the sigsetjmp safe-call guard on the original function.
     bool on_game_thread = lua_ue4ss_globals::is_game_thread();
-    bool has_lua_callbacks = (rec->pre || rec->post);
+    HookChain* cb_chain = rec->chain.load();
+  bool has_lua_callbacks = (cb_chain && !cb_chain->empty());
 
     if (!on_game_thread && has_lua_callbacks) {
         // Off-thread call with Lua callbacks — skip callbacks, call original
@@ -201,17 +252,20 @@ extern "C" uint64_t dispatch_full(int slot,
     // Guarded: a Lua error inside the callback throws sol::error (a C++
     // exception). If it escaped here it would unwind through the C
     // trampoline and std::terminate the whole game. Swallow + log instead.
-    if (rec->pre) {
-        try {
-            rec->pre(ctx);
-        } catch (const std::exception& e) {
-            logger::log_error("NHOOK",
-                "Hook '%s' pre-callback threw: %s — ignored, game continues.",
-                rec->name.c_str(), e.what());
-        } catch (...) {
-            logger::log_error("NHOOK",
-                "Hook '%s' pre-callback threw a non-std exception — ignored.",
-                rec->name.c_str());
+    if (HookChain* chain = rec->chain.load()) {
+        for (const HookEntry& he : *chain) {
+            if (!he.pre) continue;
+            try {
+                he.pre(ctx);
+            } catch (const std::exception& e) {
+                logger::log_error("NHOOK",
+                    "Hook '%s' pre-callback (key '%s') threw: %s — ignored, game continues.",
+                    rec->name.c_str(), he.key.c_str(), e.what());
+            } catch (...) {
+                logger::log_error("NHOOK",
+                    "Hook '%s' pre-callback (key '%s') threw a non-std exception — ignored.",
+                    rec->name.c_str(), he.key.c_str());
+            }
         }
     }
 
@@ -301,17 +355,20 @@ extern "C" uint64_t dispatch_full(int slot,
 
     // Post callback — may modify ctx.ret_x0 / ctx.ret_d0. Guarded the same
     // way as the pre callback so a Lua error can never terminate the game.
-    if (rec->post) {
-        try {
-            rec->post(ctx);
-        } catch (const std::exception& e) {
-            logger::log_error("NHOOK",
-                "Hook '%s' post-callback threw: %s — ignored, game continues.",
-                rec->name.c_str(), e.what());
-        } catch (...) {
-            logger::log_error("NHOOK",
-                "Hook '%s' post-callback threw a non-std exception — ignored.",
-                rec->name.c_str());
+    if (HookChain* chain = rec->chain.load()) {
+        for (const HookEntry& he : *chain) {
+            if (!he.post) continue;
+            try {
+                he.post(ctx);
+            } catch (const std::exception& e) {
+                logger::log_error("NHOOK",
+                    "Hook '%s' post-callback (key '%s') threw: %s — ignored, game continues.",
+                    rec->name.c_str(), he.key.c_str(), e.what());
+            } catch (...) {
+                logger::log_error("NHOOK",
+                    "Hook '%s' post-callback (key '%s') threw a non-std exception — ignored.",
+                    rec->name.c_str(), he.key.c_str());
+            }
         }
     }
 
@@ -417,28 +474,37 @@ void init() {
     logger::log_info("NHOOK", "Native hook subsystem initialized (max %d hooks)", MAX_HOOKS);
 }
 
-HookId install(const std::string& symbol, NativePreCallback pre, NativePostCallback post) {
+HookId install(const std::string& symbol, NativePreCallback pre, NativePostCallback post,
+               const std::string& key) {
     void* addr = symbols::resolve(symbol);
     if (!addr) {
         logger::log_error("NHOOK", "Cannot hook '%s' — symbol not found", symbol.c_str());
         return 0;
     }
-    return install_at(addr, symbol, pre, post);
+    return install_at(addr, symbol, pre, post, key);
 }
 
 HookId install_at(void* addr, const std::string& name,
-                  NativePreCallback pre, NativePostCallback post) {
+                  NativePreCallback pre, NativePostCallback post,
+                  const std::string& key_in) {
     std::lock_guard<std::mutex> lock(s_mutex);
 
-    // Check if this address is already hooked — Dobby cannot hook the same address twice.
-    // This happens when two different search names resolve to the same overload
-    // (e.g. cItemMgr_bulletNum and cItemMgr_bulletNum_cItem both resolve to cItemMgr::bulletNum()).
+    // Registrant identity: distinguishes mods sharing an address. Defaults to
+    // the hook name so single-registrant callers keep working unchanged.
+    const std::string key = key_in.empty() ? name : key_in;
+
+    // Already hooked? Dobby can't re-hook the address, but the installed thunk
+    // dispatches through this record's atomic callback CHAIN, so we upsert this
+    // registrant's entry: SAME key replaces (hot-reload), NEW key appends
+    // (a second mod coexists on the same address).
     auto existing = s_addr_to_hook.find(addr);
     if (existing != s_addr_to_hook.end()) {
-        logger::log_warn("NHOOK", "Address 0x%lX already hooked as '%s' — skipping duplicate hook '%s'",
-                         reinterpret_cast<uintptr_t>(addr),
-                         existing->second->name.c_str(), name.c_str());
-        return existing->second->id;
+        HookRecord* rec = existing->second;
+        chain_upsert(rec, key, std::move(pre), std::move(post));
+        size_t n = 0; if (HookChain* c = rec->chain.load()) n = c->size();
+        logger::log_info("NHOOK", "Address 0x%lX re-hook — chain upsert key='%s' (hook '%s', %zu entrie(s))",
+                         reinterpret_cast<uintptr_t>(addr), key.c_str(), rec->name.c_str(), n);
+        return rec->id;
     }
 
     if (s_thunk_count >= 64) {
@@ -452,9 +518,8 @@ HookId install_at(void* addr, const std::string& name,
     rec->name = name;
     rec->address = addr;
     rec->original = nullptr;
-    rec->pre = pre;
-    rec->post = post;
     rec->call_count.store(0);
+    chain_upsert(rec, key, std::move(pre), std::move(post));   // initial chain entry
 
     s_thunk_table[slot] = rec;
 
@@ -528,6 +593,47 @@ void remove(HookId id) {
     delete rec;
 }
 
+bool remove_key(void* addr, const std::string& key) {
+    std::lock_guard<std::mutex> lock(s_mutex);
+    auto it = s_addr_to_hook.find(addr);
+    if (it == s_addr_to_hook.end()) return false;
+    bool removed = chain_remove(it->second, key);
+    if (removed) {
+        logger::log_info("NHOOK", "Chain entry key='%s' removed from hook '%s' at 0x%lX",
+                         key.c_str(), it->second->name.c_str(), reinterpret_cast<uintptr_t>(addr));
+    }
+    // NOTE: the Dobby hook stays installed even if the chain is now empty — an
+    // empty chain simply routes through the sigsetjmp guard with no callbacks
+    // (harmless), and DobbyDestroy while the game thread executes the trampoline
+    // would be unsafe. Full teardown is done via remove(HookId).
+    return removed;
+}
+
+int remove_keys_with_prefix(const std::string& prefix) {
+    if (prefix.empty()) return 0;
+    std::lock_guard<std::mutex> lock(s_mutex);
+    int removed = 0;
+    for (auto& pair : s_addr_to_hook) {
+        HookRecord* rec = pair.second;
+        // Collect matching keys first — chain_remove republishes the snapshot.
+        std::vector<std::string> keys;
+        if (HookChain* c = rec->chain.load()) {
+            for (const auto& e : *c) {
+                if (e.key.compare(0, prefix.size(), prefix) == 0)
+                    keys.push_back(e.key);
+            }
+        }
+        for (const auto& k : keys) {
+            if (chain_remove(rec, k)) {
+                logger::log_info("NHOOK", "Chain entry key='%s' removed from hook '%s' (mod unload)",
+                                 k.c_str(), rec->name.c_str());
+                removed++;
+            }
+        }
+    }
+    return removed;
+}
+
 bool is_hooked(const std::string& symbol) {
     std::lock_guard<std::mutex> lock(s_mutex);
     for (const auto& pair : s_hooks) {
@@ -545,8 +651,11 @@ std::vector<HookInfo> get_all_hooks() {
         hi.name = pair.second->name;
         hi.address = pair.second->address;
         hi.call_count = pair.second->call_count.load(std::memory_order_relaxed);
-        hi.has_pre = (bool)pair.second->pre;
-        hi.has_post = (bool)pair.second->post;
+        hi.has_pre = false;
+        hi.has_post = false;
+        if (HookChain* ch = pair.second->chain.load()) {
+            for (const auto& e : *ch) { if (e.pre) hi.has_pre = true; if (e.post) hi.has_post = true; }
+        }
         result.push_back(hi);
     }
     return result;
@@ -631,6 +740,677 @@ static const CrashGuardEntry s_crash_guards[] = {
         "APlayerController::TickActor"
     },
 };
+
+// ═══════════════════════════════════════════════════════════════════════
+// CLOTH BONE SANITIZER  (RE4 cut-content skeleton-mismatch guard)
+// ═══════════════════════════════════════════════════════════════════════
+// Cut enemies (Saddler-Ada / em3f, spider, etc.) were ported from RE4 UHD
+// with a DIFFERENT skeleton than the classic rig the VR engine's cloth code
+// expects. PenClothSet(cModel*, CLOTH_INFO*, float) walks the cloth's bone-
+// index arrays and calls cModel::getPartsPtr(model, boneIdx). When the ported
+// model's bone chain is SHORTER than the cloth expects, getPartsPtr walks off
+// the end and returns null → PenClothSet writes null+0x1d8 → crash
+// (tombstone_20: PenClothSet+172 ← cEm3f::move ← EmSetEvent).
+//
+// FIX: before the original runs, rewrite any bone index the model can't
+// resolve to 0xFF — the engine's universal "skip this point" sentinel, handled
+// gracefully in BOTH PenClothSet and PenClothMove3. Every cloth point that maps
+// to a REAL bone stays live; only the missing (cut) bones skip. No-op when the
+// rig is complete (all bones resolve). PenClothSet is SHARED across enemies, so
+// one hook covers every cut enemy's cloth.
+//
+// CLOTH_INFO layout (Em3fClothSet1/2 + PenClothSet/PenClothMove3):
+//   +0   u32  count            (cloth1=6, cloth2=10)
+//   +8   ptr  bone-idx array a2[1]  (primary — the cloth vertices themselves)
+//   +16  ptr  bone-idx array a2[2]
+//   +24  ptr  bone-idx array a2[3]
+//   +32  ptr  bone-idx array a2[4]  (null for em3f)
+//   +40  ptr  bone-idx array a2[5]  (null for em3f)
+//   +48  ptr  bone-idx array a2[6]  (connections — heavily used)
+//   +56  ptr  bone-idx array a2[7]
+//   (a2[8]+ = float/data arrays — NOT bone indices)
+// Each array holds `count` bytes; 0xFF already means "no bone".
+static inline bool cloth_addr_ok(const void* p) {
+    return p && reflection::is_readable_ptr(p);
+}
+
+// Replicate cModel::getPartsPtr(model, idx) with full null/mapped guards so it
+// NEVER faults — this runs in the pre-callback, OUTSIDE the sigsetjmp guard
+// that only wraps the ORIGINAL call. Returns the part ptr, or null if the index
+// does not resolve to a real, mapped part.
+static void* cloth_resolve_part(void* model, int idx) {
+    if (idx < 0 || idx >= 255) return nullptr;
+    if (!cloth_addr_ok(model)) return nullptr;
+    uint8_t f9 = *((const uint8_t*)model + 9);
+    void* head = *reinterpret_cast<void* const*>((const char*)model + 264);
+    if (!cloth_addr_ok(head)) return nullptr;
+    if (f9 & 0x20) {                                  // contiguous parts array
+        void* p = (char*)head + (int64_t)496 * idx;
+        return cloth_addr_ok(p) ? p : nullptr;
+    }
+    void* p = head;                                  // linked list: hop idx times
+    for (int a = idx; a > 0; --a) {
+        if (!cloth_addr_ok(p)) return nullptr;
+        p = *reinterpret_cast<void* const*>((const char*)p + 264);
+    }
+    return cloth_addr_ok(p) ? p : nullptr;
+}
+
+// Make a single byte writable (bone-index globals may live in .data.rel.ro /
+// .rodata) and store `val`. Leaves the page RW — harmless for a mod.
+static void cloth_write_byte(uint8_t* addr, uint8_t val) {
+    if (!addr || *addr == val) return;
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = 4096;
+    uintptr_t page = reinterpret_cast<uintptr_t>(addr) & ~(uintptr_t)(ps - 1);
+    mprotect(reinterpret_cast<void*>(page), (size_t)ps, PROT_READ | PROT_WRITE);
+    *addr = val;
+}
+
+static void cloth_sanitize(void* model, uint32_t* ci) {
+    if (!cloth_addr_ok(model) || !cloth_addr_ok(ci)) return;
+    uint32_t count = ci[0];
+    if (count == 0 || count > 128) return;           // sanity — real cloth is 6/10
+    static const int kBoneArrOffsets[] = { 8, 16, 24, 32, 40, 48, 56 };
+    int fixed = 0, total = 0;
+    for (int off : kBoneArrOffsets) {
+        uint8_t* arr = *reinterpret_cast<uint8_t* const*>((const char*)ci + off);
+        if (!cloth_addr_ok(arr)) continue;           // null / unmapped array ptr
+        for (uint32_t k = 0; k < count; ++k) {
+            uint8_t idx = arr[k];
+            if (idx == 0xFF) continue;
+            ++total;
+            if (!cloth_resolve_part(model, idx)) {
+                cloth_write_byte(arr + k, 0xFF);
+                ++fixed;
+            }
+        }
+    }
+    if (fixed > 0) {
+        logger::log_info("CLOTH",
+            "Sanitized model=%p ci=%p count=%u : %d/%d bone(s) -> skip (missing in ported rig)",
+            model, ci, count, fixed, total);
+    }
+}
+
+static void cloth_sanitize_pre(NativeCallContext& ctx) {
+    // Refresh the /proc/self/maps snapshot ONCE per spawn so freshly-allocated
+    // part pages read as mapped (avoids a false "missing bone").
+    reflection::refresh_memory_map();
+    cloth_sanitize(reinterpret_cast<void*>(ctx.x[0]),
+                   reinterpret_cast<uint32_t*>(ctx.x[1]));
+    // never block — let the (now-safe) original run
+}
+
+HookId install_cloth_bone_sanitizer(void* addr) {
+    if (!addr) {
+        logger::log_error("NHOOK", "cloth_bone_sanitizer: null addr");
+        return 0;
+    }
+    HookId id = install_at(addr, "__cloth_bone_sanitizer",
+                           cloth_sanitize_pre, nullptr, "ClothBoneSanitizer");
+    logger::log_info("NHOOK", "Cloth bone sanitizer @0x%lX : %s",
+                     (unsigned long)reinterpret_cast<uintptr_t>(addr),
+                     id ? "installed" : "FAILED");
+    return id;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CUT-ENEMY MODEL-LOAD RESTORE  (em3f / Saddler-Ada renders)
+// ═══════════════════════════════════════════════════════════════════════
+// Cut enemies (em3f) have a cEmXX::move whose init state runs the native
+// archive modelInit but NEVER the VR4ModelInit that spawns the visible UE
+// AVR4Model — working enemies (cEm21::init) do BOTH. So em3f gets a native
+// skeleton (cModel+384 = cModelInfo list) but no drawn actor (cModel+980=null,
+// +988=0) → invisible. This hook injects the missing
+//   VR4ModelInit(this, EmModelClassLookUp(this))
+// on the tick AFTER modelInit built the model (cModel+384 != 0) and only while
+// no UE model exists yet (cModel+988 == 0). Runs in the actor-tick context
+// (SpawnActor-safe) with NATIVE register-passed pointers — the MTE-tagged class
+// ptr from EmModelClassLookUp goes straight into VR4ModelInit, no Lua round-trip
+// to mangle the tag (that mangle is why the exec_lua test faulted in SpawnActor).
+// Self-guards on +988, so it is a no-op for enemies that already build their own
+// UE model — safe to install on any cEmXX::move.
+typedef void* (*cEm_EmModelClassLookUp_t)(void* cEm, const void* a2);
+// The POSEABLE model init (0x5F83A68): spawns the poseable actor from `uclass`,
+// then vtable[1584](actor, a3, cEm) loads the mesh (from the actor's MeshDataClass
+// / meshTable — the pak assets) and SetBaseSkeleton builds it. a3 = the archive
+// bin file (archive + *(uint32*)(archive + binOff)), matching em3d's sub_5EA06B0.
+typedef void* (*cModel_VR4PoseableModelInit_t)(void* cModel, void* uclass, void* a3);
+typedef void* (*FWeakObjectPtr_Get_t)(void* weakptr);
+// AVR4PoseableModel::AddOrSwapSkeletalMesh(this, FName bone(by value=u64), uint key,
+//                                          const cModelInfo*, UVR4MeshData*)
+typedef void  (*AddOrSwapSkeletalMesh_t)(void* poseableModel, uint64_t bone, uint32_t key,
+                                         const void* cModelInfo, void* meshData);
+typedef uint32_t (*poseable_meshload_t)(void* actor, void* a3, void* cEm);  // actor vtable[+1584]
+static cEm_EmModelClassLookUp_t       s_EmModelClassLookUp   = nullptr;
+static cModel_VR4PoseableModelInit_t  s_VR4PoseableModelInit = nullptr;
+static FWeakObjectPtr_Get_t           s_FWeakGet             = nullptr;
+static AddOrSwapSkeletalMesh_t        s_AddOrSwapSkeletalMesh = nullptr;
+// UVR4MeshData::TryCacheMap(this, char forceReload) — builds the cached key map
+// (meshData+80 TSet) from the meshTable DataTable rows, keyed by FMeshDataSet+8
+// (OffsetKey). At cEm3f::move hook time this map is EMPTY until this runs.
+typedef void (*UVR4MeshData_TryCacheMap_t)(void* meshData, char forceReload);
+// cModInfoMgr::create(&ModInfoMgr, archive+partOffset, archive+commonOffset) → cModelInfo*
+// Pool-allocates a node, relocates the archive part data in place (guarded by flag
+// 0x100000 so it is idempotent), stores partData @node+24 / commonData @node+32, and
+// returns null if the pool is exhausted. cModel::addModel appends it to the cEm+384
+// chain (linked via +40). This is verbatim what em3f's init (sub_5EA3678) does for
+// its four hand-coded parts.
+typedef void* (*cModInfoMgr_create_t)(void* mgr, void* partData, void* commonData);
+typedef void* (*cModel_addModel_t)(void* cModel, void* modelInfo);
+static cModInfoMgr_create_t s_ModInfoMgrCreate = nullptr;
+static cModel_addModel_t    s_addModel         = nullptr;
+static void*                s_ModInfoMgr       = nullptr;   // &ModInfoMgr, RVA 0xA578670
+// VR4CreateEmSubObject(bin, parentEm, subObj) [0x5D9136C] — the port's entry point for
+// giving a cObj SUB-OBJECT a renderer: runs the meshload on the PARENT's actor to get a
+// mesh key, then cModel::VR4ModelInit(subObj, key, parentActor->meshData), which spawns
+// the sub-object's actor from the PLAIN AVR4PoseableModel class (never a BP class).
+typedef void* (*VR4CreateEmSubObject_t)(void* bin, void* parentEm, void* subObj);
+static VR4CreateEmSubObject_t s_VR4CreateEmSubObject = nullptr;
+static UVR4MeshData_TryCacheMap_t     s_TryCacheMap = nullptr;
+// em3f_meshTable OffsetKeys decoded on PC from EnemyFixes_P.pak (7 poseable parts:
+// EM3F04..EM3F94 → em3f_004..094; 2190400 = em3f_094 tentacle). Fallback keys in
+// case the runtime cached-map enumeration comes up empty.
+static const uint32_t s_em3fMeshKeys[7] = { 311872, 452736, 638432, 661504, 684544, 745920, 2190400 };
+// ── em3f BROKEN SOFT-PATH FIXES ───────────────────────────────────────────────
+// em3f_meshTable ships WRONG MeshRefs for every part sourced from the plaga set:
+// rows em3f_008 / em3f_009 / em3f_094 all point at
+//   /Game/Characters/BIO4/EM/em25_plaga/Geometry/<mesh>
+// but those assets are actually packed (verified by decoding EnemyFixes_P.pak on
+// PC, and live: LoadAsset on the em25_plaga path fails, em30_Saddler loads) at
+//   /Game/Characters/BIO4/BOSS/em30_Saddler/Geometry/<mesh>
+// so FSoftObjectPath::TryLoad returns null → SetMesh assigns NO mesh → those
+// components render nothing (you only see the plaga attack's particles).
+// Per-spawn logging confirmed keys 684544/745920 dead and 2190400 fixed once
+// repointed. We rewrite each cached entry's AssetPathName FName to the correct
+// path right after TryCacheMap rebuilds it, so the game's own loader resolves the
+// mesh. Comparison indices come from Lua (FName(path):GetComparisonIndex()).
+struct Em3fPathFix { uint32_t key; int32_t fname_idx; };
+static Em3fPathFix s_em3fPathFixes[8] = {};
+static int         s_em3fPathFixCount = 0;
+// em3f's ETS_DATA header holds 4 model-part bin offsets: +32 (robe=base, done by
+// SetBaseSkeleton) then +36/+40/+44 (body/head/hands). sub_5EA3678 builds all 4 as
+// native cModelInfos (chained at cModel+384 via +40); we attach parts 1..3 to the UE
+// poseable actor with AddOrSwapSkeletalMesh so the whole Saddler-Ada renders.
+static const uint32_t s_partBinFields[4] = { 32, 36, 40, 44 };
+
+static void model_restore_pre(NativeCallContext& ctx) {
+    void* cEm = reinterpret_cast<void*>(ctx.x[0]);
+    if (!cEm) return;
+    // Read fields through the (MTE-tagged) this ptr exactly as the game does.
+    uint8_t initDone = *reinterpret_cast<volatile uint8_t*>((char*)cEm + 988);
+    if (initDone) return;                       // already has a UE model (or we ran)
+    void* modelInfo = *reinterpret_cast<void* const volatile*>((char*)cEm + 384);
+    if (!modelInfo) return;                     // native modelInit not done yet — wait a tick
+    if (!s_EmModelClassLookUp || !s_VR4PoseableModelInit) return;
+    void* archive = *reinterpret_cast<void* const volatile*>((char*)cEm + 1120);
+    if (!archive) return;                       // ETS_DATA archive not attached
+
+    // ── ONE-SHOT ARCHIVE PROBE ─────────────────────────────────────────────
+    // em3f.das uncompresses to 2,481,120 bytes in the base pak, and the largest
+    // meshTable key is 2,190,400 — so every key falls INSIDE the archive and the
+    // plaga/tentacle/knife data ships with the VR game. We only ever read 4 bin
+    // offsets (+32/36/40/44); dump the whole header so we can see how many the
+    // archive really declares, and which offsets they point at.
+    {
+        static bool probed = false;
+        if (!probed) {
+            probed = true;
+            const volatile uint32_t* h = reinterpret_cast<const volatile uint32_t*>(archive);
+            // h[0] = entry count (109); the offset table starts at h[4] (byte +16).
+            uint32_t count = h[0];
+            logger::log_info("EM3F", "archive: %u entries, table at +16", count);
+            if (count > 0 && count < 512) {
+                for (uint32_t i = 0; i < count; i += 8) {
+                    char line[256]; int p = 0;
+                    for (uint32_t j = i; j < i + 8 && j < count; ++j)
+                        p += snprintf(line + p, sizeof(line) - p, "%10u ", h[4 + j]);
+                    logger::log_info("EM3F", "  ent[%3u..]: %s", i, line);
+                }
+                // Which table index does each meshTable key correspond to?
+                static const uint32_t want[7] = { 311872, 452736, 638432, 661504,
+                                                  684544, 745920, 2190400 };
+                for (int k = 0; k < 7; ++k) {
+                    int found = -1;
+                    for (uint32_t j = 0; j < count; ++j)
+                        if (h[4 + j] == want[k]) { found = (int)j; break; }
+                    logger::log_info("EM3F", "  key %8u -> table idx %d (hdr byte +%d)%s",
+                                     want[k], found, found >= 0 ? 16 + found * 4 : -1,
+                                     found < 0 ? "   *** NOT AN ARCHIVE ENTRY ***" : "");
+                }
+            }
+            int n = 0;
+            for (void* ci = *reinterpret_cast<void* const volatile*>((char*)cEm + 384);
+                 ci && n < 24;
+                 ci = *reinterpret_cast<void* const volatile*>((char*)ci + 40), ++n) {
+                void* dp = *reinterpret_cast<void* const volatile*>((char*)ci + 24);
+                long long d = dp ? (long long)((uintptr_t)dp - (uintptr_t)archive) : -1;
+                logger::log_info("EM3F", "  cModelInfo[%d] = %p  data=%p  key(delta)=%lld", n, ci, dp, d);
+            }
+            logger::log_info("EM3F", "  chain length = %d node(s)", n);
+        }
+    }
+
+    // NOTE: em3f_008 (entry 8) and em3f_009 (entry 9) are NOT parts of this cModel.
+    // SetObj41(cEm, 0/1) builds each as its own cObj with its own cModel::modelInit
+    // (hence its own initJoint / 15- and 12-bone rig, and its own texture at entries
+    // 2/3), parents it at obj+1024, and drives it with its own motion stream. The
+    // game already creates both in em3f's init — they are invisible only because no
+    // UE actor was ever made for them, exactly like the body was. They are handled
+    // after the body below; do NOT add them to this chain as parts (that skins them
+    // onto the body's 54-bone hierarchy = the deformed heap).
+    void* cls = s_EmModelClassLookUp(cEm, nullptr);   // → GetEmModelClass(emId @cEm+0x118)
+    if (!cls) return;                           // class not in EmModelData / not loaded yet
+    // Base part (robe) = archive bin at header +32.
+    uint32_t binOff0 = *reinterpret_cast<const uint32_t volatile*>((char*)archive + s_partBinFields[0]);
+    void* a3 = (char*)archive + binOff0;
+    s_VR4PoseableModelInit(cEm, cls, a3);       // spawn poseable actor + build BASE mesh, sets +988=1
+
+    // Attach ALL the OTHER meshTable parts (body/head/hands/tentacle) so the full
+    // model renders. The head/hands are pak-only meshes with no native archive bin,
+    // so their keys can't come from the archive — instead we ENUMERATE the meshData's
+    // cached key map (TryCacheMap built a TSet<TTuple<uint key, FVR4RawMeshData>> at
+    // meshData+80: Data ptr @+80, ArrayNum @+88, element stride 120, int key @elem+0)
+    // and AddOrSwapSkeletalMesh(actor, NAME_None, key, cModelInfo, meshData) each key.
+    // SetBaseSkeleton already placed the base key; AddOrSwap on it just swaps (no harm).
+    int attached = 0;
+    if (s_FWeakGet && s_AddOrSwapSkeletalMesh) {
+        void* actor = s_FWeakGet((char*)cEm + 980);
+        if (actor) {
+            void* meshData = *reinterpret_cast<void* const volatile*>((char*)actor + 560);
+            void* baseCi   = *reinterpret_cast<void* const volatile*>((char*)cEm + 384);  // base cModelInfo
+            if (meshData) {
+                // CRITICAL: build the cached key map from the DataTable FIRST. At hook
+                // time it is empty (TryCacheMap hasn't run) → enumeration found 0 parts,
+                // which is why only the base robe rendered. Force-rebuild it now.
+                if (s_TryCacheMap) s_TryCacheMap(meshData, 1);
+                void* elems  = *reinterpret_cast<void* const volatile*>((char*)meshData + 80);   // TSparseArray Data
+                int32_t num  = *reinterpret_cast<const int32_t volatile*>((char*)meshData + 88);  // ArrayNum
+                // Repoint every broken MeshRef (em25_plaga -> em30_Saddler) in the
+                // freshly-rebuilt cache, BEFORE the attach loop asks SetMesh to load them.
+                // Element: {uint key @+0, FSoftObjectPath @+8}; AssetPathName FName =
+                // {ComparisonIndex @+8, Number @+12}. Stride 120.
+                if (s_em3fPathFixCount && elems && num > 0 && num < 64) {
+                    for (int i = 0; i < num; ++i) {
+                        char* e = (char*)elems + 120 * i;
+                        uint32_t k = *reinterpret_cast<const uint32_t volatile*>(e);
+                        for (int fx = 0; fx < s_em3fPathFixCount; ++fx) {
+                            if (s_em3fPathFixes[fx].key != k) continue;
+                            int32_t want = s_em3fPathFixes[fx].fname_idx;
+                            if (*reinterpret_cast<const int32_t volatile*>(e + 8) != want) {
+                                *reinterpret_cast<int32_t volatile*>(e + 8)  = want;
+                                *reinterpret_cast<int32_t volatile*>(e + 12) = 0;
+                                logger::log_info("EM3F", "MeshRef repointed key=%u em25_plaga -> em30_Saddler (FName idx %d)",
+                                                 k, want);
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Each part MUST get a distinct component-slot FName: FindOrCreateComponent
+                // keys its TSet<TTuple<FName,FMeshPartData>> by the bone FName (a2), so a
+                // shared NAME_None collapsed all 7 onto ONE component (each swapped the last,
+                // leaving only the tentacle). Parts attach to the master via
+                // SetMasterPoseComponent at identity, so the FName is purely a unique key —
+                // {ComparisonIndex=None, Number=i+1} gives 7 distinct slots.
+                // Map OffsetKey -> its OWN cModelInfo. Each chain node's data pointer
+                // (node+24) lives at archiveBase + OffsetKey, so the key is just the
+                // delta — verified from a live dump: the node deltas (140864, 185696,
+                // 23072) exactly match the meshTable key deltas (311872 -> 452736 ->
+                // 638432 -> 661504). Handing every part the BASE node made SetMesh's
+                // TSet<cModelInfo*,component> (this+848) treat all 7 as ONE part, so
+                // they inherited the base transform and piled up unanimated.
+                // The chain now has 7 nodes: em3f's init builds 4 and we build the
+                // three entries it skips (8/9/94) just above, so every meshTable key
+                // resolves to its OWN node here. A key with no node would still be
+                // skipped below rather than wrongly bound to the base part.
+                struct CiEntry { uint32_t key; void* ci; };
+                CiEntry cimap[16];
+                int cimapN = 0;
+                {
+                    void* ci = *reinterpret_cast<void* const volatile*>((char*)cEm + 384);
+                    for (int n = 0; ci && n < 16; ++n) {
+                        void* dp = *reinterpret_cast<void* const volatile*>((char*)ci + 24);
+                        if (dp && archive) {
+                            uintptr_t d = (uintptr_t)dp - (uintptr_t)archive;
+                            if (d < 0x8000000u) cimap[cimapN++] = { (uint32_t)d, ci };
+                        }
+                        ci = *reinterpret_cast<void* const volatile*>((char*)ci + 40);
+                    }
+                }
+                // Attach every part that has a cModelInfo — now all 7, since we build
+                // the three nodes em3f's init skips. Each part carries its OWN node, so
+                // SetMesh's TSet<cModelInfo*,component> (this+848) keeps them distinct
+                // and the native rig drives each one from its own archive joint data.
+                //
+                // This is what the earlier master-pose attempt got wrong: em3f_008/009/094
+                // are separate armatures (15/12/own bones) that reuse the same `bone_N`
+                // names as em3f_skeleton in a different order, so SetMasterPoseComponent
+                // matched by name and wrenched the tentacle onto the torso joints = the
+                // heap at the model centre. With their own nodes they no longer need the
+                // master's rig at all.
+                if (elems && num > 0 && num < 64) {
+                    for (int i = 0; i < num; ++i) {
+                        uint32_t key = *reinterpret_cast<const uint32_t volatile*>((char*)elems + 120 * i);
+                        void* partCi = nullptr;
+                        for (int m = 0; m < cimapN; ++m)
+                            if (cimap[m].key == key) { partCi = cimap[m].ci; break; }
+                        if (!partCi) {
+                            // Expected for 684544/745920 (obj41 sub-objects, own cModel
+                            // + own rig — see below) and 2190400 (em3f_094, the knife:
+                            // no em3f code references archive entry 94 at all).
+                            logger::log_info("EM3F", "  skip key=%u (not a part of this cModel)", key);
+                            continue;
+                        }
+                        uint64_t slotName = (uint64_t)(i + 1) << 32;   // FName{None, i+1}
+                        s_AddOrSwapSkeletalMesh(actor, slotName, key, partCi, meshData);
+                        logger::log_info("EM3F", "  attach key=%u ci=%p (own node)", key, partCi);
+                        ++attached;
+                    }
+                }
+                // Fallback: if the cached map was still empty/unreadable, attach the 7
+                // OffsetKeys decoded from the pak so the parts render regardless.
+                if (attached == 0) {
+                    for (int i = 0; i < 7; ++i) {
+                        void* partCi = nullptr;
+                        for (int m = 0; m < cimapN; ++m)
+                            if (cimap[m].key == s_em3fMeshKeys[i]) { partCi = cimap[m].ci; break; }
+                        if (!partCi) continue;          // separate rig — leave it to the game
+                        uint64_t slotName = (uint64_t)(i + 1) << 32;
+                        s_AddOrSwapSkeletalMesh(actor, slotName, s_em3fMeshKeys[i], partCi, meshData);
+                        ++attached;
+                    }
+                }
+            }
+        }
+    }
+    logger::log_info("EM3F", "restored POSEABLE model: cEm=%p cls=%p +988=%d meshTableParts=%d",
+                     cEm, cls, *reinterpret_cast<volatile uint8_t*>((char*)cEm + 988), attached);
+
+    // (The per-node head-word dump that used to live here has served its purpose:
+    // the part offset is node+24's delta from the archive base = the meshTable
+    // OffsetKey. That mapping is now built into `cimap` above.)
+
+    // Report what ACTUALLY landed per part, so one spawn tells us which links
+    // resolved a mesh and which came back empty — no live poking needed.
+    // Component map @ actor+688 (Data) / +696 (Num); 32B elems {FName@0, comp@8,
+    // key@16}. USkeletalMeshComponent::SkeletalMesh lives at comp+0x430
+    // (confirmed via USkeletalMeshComponent::SetSkeletalMesh's `LDR X8,[X0,#0x430]`).
+    if (s_FWeakGet) {
+        void* actor2 = s_FWeakGet((char*)cEm + 980);
+        if (actor2) {
+            void* mapData = *reinterpret_cast<void* const volatile*>((char*)actor2 + 688);
+            int32_t mapNum = *reinterpret_cast<const int32_t volatile*>((char*)actor2 + 696);
+            if (mapData && mapNum > 0 && mapNum < 32) {
+                for (int i = 0; i < mapNum; ++i) {
+                    char* e = (char*)mapData + 32 * i;
+                    void* comp = *reinterpret_cast<void* const volatile*>(e + 8);
+                    if (!comp) continue;
+                    uint32_t k    = *reinterpret_cast<const uint32_t volatile*>(e + 16);
+                    void*    mesh = *reinterpret_cast<void* const volatile*>((char*)comp + 0x430);
+                    logger::log_info("EM3F", "  part key=%u comp=%p mesh=%p %s",
+                                     k, comp, mesh, mesh ? "OK" : "<-- NO MESH (link dead)");
+                }
+            }
+        }
+    }
+
+    // ── obj41 SUB-OBJECTS: em3f_008 + em3f_009 (THE TENTACLE) ──────────────
+    // These are NOT parts of Saddler's cModel — they are separate cObj objects that
+    // em3f's init already creates and the native code already animates every frame:
+    //
+    //   init:  *(cEm+1373) = SetObj41(cEm, 0);   // em3f_008, archive entry 8
+    //          *(cEm+1381) = SetObj41(cEm, 1);   // em3f_009, archive entry 9
+    //
+    // SetObj41 runs a full cModel::modelInit on each (bin = archive + hdr[+48/+52],
+    // tex = archive + hdr[+24/+28] = entries 2/3), so each gets its OWN initJoint and
+    // therefore its own rig — which is exactly why they have 15/12 bones and could
+    // never be master-posed onto the body's 54-bone hierarchy without deforming.
+    // Placement is a hardcoded tie in sub_5FA35BC via obj+1032:
+    //   obj41 #0 -> 36  : MTXConcat onto parent bone 36's matrix
+    //   obj41 #1 -> -1  : follows the parent's root transform
+    // and MotSetObj41 feeds each its own motion (archive +320 / +384 = entries 76/92).
+    //
+    // So the whole system works natively already, and they are invisible for the SAME
+    // reason the body was: no UE actor.
+    //
+    // Use the port's PURPOSE-BUILT sub-object entry point — do NOT hand a cObj its own
+    // BP actor. em38 (sub_5E74AF0) shows the sanctioned pattern for exactly this case:
+    //     SetObj00(...); OyaSetObj00(obj, this, 0x3A);
+    //     VR4CreateEmSubObject(archive + hdr[+324], this, obj);
+    // VR4CreateEmSubObject(bin, parentEm, subObj) [0x5D9136C]:
+    //     actor = FWeakGet(parentEm + 980);              // the PARENT's actor
+    //     key   = actor->vtable[1584](actor, bin, parentEm);   // meshload on the PARENT
+    //     cModel::VR4ModelInit(subObj, key, actor->meshData@+560);
+    // and that VR4ModelInit overload [0x5F83668] spawns the sub-object's actor from
+    // AVR4PoseableModel::GetPrivateStaticClass() — the PLAIN ENGINE CLASS.
+    //
+    // That distinction is the whole bug in the previous attempt: passing
+    // EmModelClassLookUp(cEm) (= the EM3F_Poseable_BP Blueprint, whose tick logic
+    // expects a real cEm) to VR4PoseableModelInit and SetBio4Model'ing it onto a cObj
+    // corrupted state far away — the pPL player global went NULL (killing SndWatcher,
+    // which derefs it unguarded) plus a RenderThread FMeshBatch::Add crash.
+    // Sub-objects get the plain AVR4PoseableModel; only cEm gets the BP class.
+    if (s_VR4CreateEmSubObject) {
+        struct Obj41 { uint32_t emOff; uint32_t entry; const char* what; };
+        static const Obj41 kObj41[2] = {
+            { 1373, 8, "em3f_008 (plaga, tied to bone 36)" },
+            { 1381, 9, "em3f_009 (TENTACLE, follows root)" },
+        };
+        const volatile uint32_t* h = reinterpret_cast<const volatile uint32_t*>(archive);
+        uint32_t count = h[0];
+        for (int i = 0; i < 2 && count > 0 && count < 512; ++i) {
+            if (kObj41[i].entry >= count) continue;
+            // cEm+1373 / +1381 are UNALIGNED qwords — copy, don't deref.
+            void* obj = nullptr;
+            __builtin_memcpy(&obj, (char*)cEm + kObj41[i].emOff, sizeof(obj));
+            if (!obj) continue;                                   // SetObj41 failed/not run
+            if (*reinterpret_cast<volatile uint8_t*>((char*)obj + 988)) continue;  // has one
+            uint32_t binOff = h[4 + kObj41[i].entry];
+            if (!binOff || binOff >= 0x4000000u) continue;
+            // Needs the PARENT's actor to already exist — VR4PoseableModelInit above.
+            s_VR4CreateEmSubObject((char*)archive + binOff, cEm, obj);
+            void* oactor = s_FWeakGet ? s_FWeakGet((char*)obj + 980) : nullptr;
+            logger::log_info("EM3F", "obj41 sub-object: %s  obj=%p bin=+%u actor=%p %s",
+                             kObj41[i].what, obj, binOff, oactor,
+                             oactor ? "OK" : "<-- no actor (mesh key unresolved?)");
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CUT VILLAGER GANADOS (em ids 6/7/8/0xA/0xB/0xD/0x33/0x37) — REAL SPAWN FIX
+// ═══════════════════════════════════════════════════════════════════════
+// Engine defect, fully traced. `ArmEmCallProlog(id)` [0x617E62C] is
+// `v1 = id-3; switch (v1)` and every prolog is ONE line, e.g.
+//     void _prologEm09() { EmInitFunc = Em09Init; }     // EmInitFunc is a GLOBAL
+// An id with no case hits `default:`, returns 0, and NEVER touches the global.
+// `EmReadSearch` [0x617E904] then nulls only its CACHED copy
+// (`if ((v39 & 1) == 0) v41 = nullptr;`) but leaves the global STALE and still
+// returns the loaded archive; `cEmMgr::construct` only guards `if (!result)`.
+// => it calls the PREVIOUS enemy's init. When that was a Pl11-family sub-char
+// (Ashley/Luis, ids 3/5/12), Pl11Init -> cSubAshley::modelSet ran over ganado
+// data -> cModInfoMgr::create's `*a2 = (int64)a2 + *a2` fixup -> ~0xaf..15ec ->
+// cModel::initJoint+144 -> SIGSEGV (tombstones 27/30). Guarding modelInit does
+// NOT help (tombstone_30 has the guard in the stack and the game still died):
+// by then the wrong function is already running on the wrong data.
+//
+// THESE IDS ARE VILLAGER GANADOS AND THEIR ARCHIVE MAPPING WAS ALWAYS CORRECT.
+// EmFileTbl (RVA 0xA4672CC, 8B stride {u16 dasIdx, u16 relIdx, u16, u16}) maps
+// ids 0x06-0x0B/0x0D/0x10/0x33/0x37 -> idx 24 = "em/em10.das". That is NOT a
+// placeholder: they are variants that SHARE the ganado archive. Proof from
+// EnemyFixes_P.pak — em07/em08/em09/em10_meshTable are all 132 rows and
+// IDENTICAL (same keys 1900896/3921440/4007616..., same em1000/em1001/em10rh00
+// meshes), and the pak ships Em07_Poseable/Em08_Poseable under Ganado/Villager.
+// (Do NOT repoint EmFileTbl[7] at pl07.das: pl07 is a SEPARATE cutscene cop with
+// its own Player/pl07_Police_MeshTable and an 11-entry archive. Forcing id 7
+// there needs Ashley's layout and dies in EspDataLoad/setHand.)
+//
+// So the ONLY missing piece is the prolog. Ids 9 (_prologEm09) and 0x10
+// (_prologEm10set) use the SAME em10.das and work — same archive == same layout,
+// so a cut id can take the same init and gets REAL ganado AI for free.
+// Pure DATA patch, no hook:
+//   jpt_617E658 (RVA 0x4326B50, .rodata byte table): BR = loc_617E65C + jpt[id-3]*4
+//   jpt[id-3] = jpt[6]   (id 9 -> _prologEm09, byte 0x04)
+//
+// NEVER HOOK ArmEmCallProlog: its body is `ADRL X9, jpt / ADR X10, case0 /
+// LDRB W11,[X9,X8] / BR X10`; the trampoline relocates those PC-relative ops ->
+// X9 wrong -> BR jumps into the stack (tombstone_02: SEGV_ACCERR, pc==lr==fault,
+// single [anon:stack_and_tls] frame) — and it fires on EVERY enemy load.
+static const uint32_t kEmFileTblRva = 0xA4672CC;
+static const uint32_t kJptRva       = 0x4326B50;  // jpt_617E658
+static const int      kJptIdx_id9   = 6;          // id 9 -> _prologEm09 (byte 0x04)
+// Cut ids that map to em10.das but have no prolog. (id 9 = _prologEm09 and
+// id 0x10 = _prologEm10set already work — deliberately not touched.)
+static const uint8_t  kCutVillagerIds[] = { 0x06, 0x07, 0x08, 0x0A, 0x0B, 0x0D, 0x33, 0x37 };
+
+// Write through a possibly read-only page (.rodata / .data.rel.ro). Leaves it RW.
+static void patch_ro(void* addr, const void* src, size_t n) {
+    if (!addr || !n) return;
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = 4096;
+    uintptr_t a     = reinterpret_cast<uintptr_t>(addr);
+    uintptr_t first = a & ~(uintptr_t)(ps - 1);
+    uintptr_t last  = (a + n - 1) & ~(uintptr_t)(ps - 1);
+    mprotect(reinterpret_cast<void*>(first), (size_t)(last - first + ps),
+             PROT_READ | PROT_WRITE);
+    __builtin_memcpy(addr, src, n);
+}
+
+bool install_cut_villager_fix() {
+    uintptr_t base = symbols::lib_base();
+    if (!base) {
+        logger::log_error("CUTEM", "lib_base unavailable — cut-villager fix skipped");
+        return false;
+    }
+    const volatile uint16_t* emft = reinterpret_cast<const volatile uint16_t*>(base + kEmFileTblRva);
+    uint8_t* jpt  = reinterpret_cast<uint8_t*>(base + kJptRva);
+    uint8_t  want = jpt[kJptIdx_id9];     // id 9's case byte -> _prologEm09
+    uint16_t das9 = emft[(9 * 8) / 2];    // id 9's file idx (24 = em10.das) = the family marker
+    int done = 0, total = (int)sizeof(kCutVillagerIds);
+    for (int i = 0; i < total; ++i) {
+        uint8_t id = kCutVillagerIds[i];
+        // Only touch ids that genuinely share id 9's archive — never guess.
+        uint16_t das = emft[(id * 8) / 2];
+        if (das != das9) {
+            logger::log_warn("CUTEM", "em id 0x%02X -> file idx %u, not id 9's %u — skipped (different archive)",
+                             id, das, das9);
+            continue;
+        }
+        int idx = (int)id - 3;            // jump-table index
+        if (idx < 0 || idx > 0x4C) continue;
+        if (jpt[idx] == want) { ++done; continue; }
+        uint8_t old = jpt[idx];
+        patch_ro(&jpt[idx], &want, 1);
+        logger::log_info("CUTEM", "em id 0x%02X: prolog 0x%02X (none) -> 0x%02X (_prologEm09) — shares em10.das with id 9",
+                         id, old, jpt[idx]);
+        ++done;
+    }
+    logger::log_info("CUTEM", "cut villager ganados wired to the id-9 ganado init: %d/%d (real AI; no stale EmInitFunc)",
+                     done, total);
+    return done > 0;
+}
+
+// ── Targeted safe-call guard ───────────────────────────────────────────────
+// install_builtin_crash_guards() is SKIPPED on this title (guarding the render
+// path black-screens VR), so guarding a single known-crashy function needs its
+// own opt-in entry point. Installs a hook with NO callbacks: dispatch_full()
+// then runs the original inside the sigsetjmp safe-call guard, so a SIGSEGV in
+// it recovers and returns 0 instead of killing the game.
+//
+// Primary user: cModel::initJoint. Spawning the CUT police NPC (em07/PL07) goes
+//   EmSetEvent → cEmMgr::construct → Pl11Init → cSubAshley::modelSet
+//     → cModel::modelInit → cModel::initJoint   ← SIGSEGV
+// initJoint+144 derefs joint/parts data that was never populated for the cut NPC:
+//     v10 = **(_QWORD**)(*(this+0x180) + 0x18);
+//     v11 = *(uint8*)(v10 + 1);        // ← fault (tombstone_27, 0x6fe1444c10)
+// That chain is built by makePartsList INSIDE initJoint, so a pre-hook can't
+// validate it up-front — routing the whole call through the guard is the fix.
+HookId install_safe_call_guard(void* addr, const char* name) {
+    if (!addr) {
+        logger::log_error("NHOOK", "safe-call guard '%s': null addr", name ? name : "?");
+        return 0;
+    }
+    const char* n = (name && *name) ? name : "unnamed";
+    HookId id = install_at(addr, std::string("__guard_") + n, nullptr, nullptr);
+    logger::log_info("NHOOK", "safe-call guard '%s' @0x%lX : %s",
+                     n, (unsigned long)reinterpret_cast<uintptr_t>(addr),
+                     id ? "installed (sigsetjmp active)" : "FAILED");
+    return id;
+}
+
+void add_em3f_mesh_path_fix(uint32_t key, int32_t comparison_index) {
+    const int cap = (int)(sizeof(s_em3fPathFixes) / sizeof(s_em3fPathFixes[0]));
+    for (int i = 0; i < s_em3fPathFixCount; ++i) {          // update in place
+        if (s_em3fPathFixes[i].key == key) {
+            s_em3fPathFixes[i].fname_idx = comparison_index;
+            logger::log_info("EM3F", "mesh path-fix updated: key=%u -> FName idx %d", key, comparison_index);
+            return;
+        }
+    }
+    if (s_em3fPathFixCount >= cap) {
+        logger::log_warn("EM3F", "mesh path-fix table full (%d) — key=%u dropped", cap, key);
+        return;
+    }
+    s_em3fPathFixes[s_em3fPathFixCount++] = { key, comparison_index };
+    logger::log_info("EM3F", "mesh path-fix armed: key=%u -> FName idx %d (%d total)",
+                     key, comparison_index, s_em3fPathFixCount);
+}
+
+HookId install_model_restore(void* move_addr) {
+    if (!move_addr) {
+        logger::log_error("EM3F", "model_restore: null move addr");
+        return 0;
+    }
+    if (!s_EmModelClassLookUp)
+        s_EmModelClassLookUp = reinterpret_cast<cEm_EmModelClassLookUp_t>(
+            symbols::resolve("_ZN3cEm18EmModelClassLookUpEPKS_"));
+    if (!s_VR4PoseableModelInit)
+        s_VR4PoseableModelInit = reinterpret_cast<cModel_VR4PoseableModelInit_t>(
+            symbols::resolve("_ZN6cModel20VR4PoseableModelInitEP6UClassPv"));
+    if (!s_FWeakGet)
+        s_FWeakGet = reinterpret_cast<FWeakObjectPtr_Get_t>(
+            symbols::resolve("_ZNK14FWeakObjectPtr3GetEv"));
+    if (!s_AddOrSwapSkeletalMesh)
+        s_AddOrSwapSkeletalMesh = reinterpret_cast<AddOrSwapSkeletalMesh_t>(
+            symbols::resolve("_ZN17AVR4PoseableModel21AddOrSwapSkeletalMeshE5FNamejPK10cModelInfoP12UVR4MeshData"));
+    if (!s_TryCacheMap)
+        s_TryCacheMap = reinterpret_cast<UVR4MeshData_TryCacheMap_t>(
+            symbols::resolve("_ZN12UVR4MeshData11TryCacheMapEb"));
+    if (!s_VR4CreateEmSubObject)
+        s_VR4CreateEmSubObject = reinterpret_cast<VR4CreateEmSubObject_t>(
+            symbols::resolve("_Z20VR4CreateEmSubObjectPvP3cEmP6cModel"));
+    if (!s_ModInfoMgrCreate)
+        s_ModInfoMgrCreate = reinterpret_cast<cModInfoMgr_create_t>(
+            symbols::resolve("_ZN11cModInfoMgr6createEmm"));
+    if (!s_addModel)
+        s_addModel = reinterpret_cast<cModel_addModel_t>(
+            symbols::resolve("_ZN6cModel8addModelEP10cModelInfo"));
+    if (!s_ModInfoMgr) {
+        // `ModInfoMgr` is a static object; the em3f init takes its address
+        // (adrp 0xa3c2000 + ldr #0x8a8 -> GOT slot holding &ModInfoMgr @ 0xA578670).
+        s_ModInfoMgr = symbols::resolve("ModInfoMgr");
+        if (!s_ModInfoMgr) {
+            uintptr_t b = symbols::lib_base();
+            if (b) s_ModInfoMgr = reinterpret_cast<void*>(b + 0xA578670);
+        }
+    }
+    if (!s_EmModelClassLookUp || !s_VR4PoseableModelInit) {
+        logger::log_error("EM3F", "model_restore: unresolved EmModelClassLookUp=%p VR4PoseableModelInit=%p",
+                          (void*)s_EmModelClassLookUp, (void*)s_VR4PoseableModelInit);
+        return 0;
+    }
+    if (!s_FWeakGet || !s_AddOrSwapSkeletalMesh)
+        logger::log_warn("EM3F", "model_restore: multi-part attach unavailable (FWeakGet=%p AddOrSwap=%p) — base only",
+                         (void*)s_FWeakGet, (void*)s_AddOrSwapSkeletalMesh);
+    HookId id = install_at(move_addr, "__model_restore",
+                           model_restore_pre, nullptr, "ModelRestore");
+    logger::log_info("EM3F", "model-restore hook @0x%lX : %s",
+                     (unsigned long)reinterpret_cast<uintptr_t>(move_addr),
+                     id ? "installed" : "FAILED");
+    return id;
+}
 
 void install_builtin_crash_guards() {
     logger::log_info("NHOOK",
