@@ -554,23 +554,85 @@ impl App {
 
     fn ui_done(&mut self, ui: &mut egui::Ui) {
         let p = self.progress.lock().unwrap().clone();
-        ui.add_space(20.0);
-        ui.vertical_centered(|ui| {
-            ui.heading(egui::RichText::new("✅ Success!").color(egui::Color32::GREEN).size(24.0));
-            ui.add_space(8.0);
-            ui.label(&p.message);
-            ui.add_space(16.0);
-            ui.label("Next steps:");
-            ui.label("  • Launch the game on the Quest");
-            ui.label("  • First run generates the Lua SDK");
-            ui.label("  • Deploy mods: python tools/deploy.py mods");
-            ui.add_space(16.0);
+        let pkg = self
+            .installed_apps
+            .get(self.selected_app)
+            .map(|a| a.package.clone())
+            .unwrap_or_default();
+        let mods_dir = format!("/sdcard/UnrealModloader/{}/mods/", pkg);
+        let paks_dir = format!("/sdcard/UnrealModloader/{}/paks/", pkg);
 
+        ui.add_space(12.0);
+        ui.vertical_centered(|ui| {
+            ui.heading(egui::RichText::new("✅ Installed").color(egui::Color32::GREEN).size(24.0));
+            ui.add_space(6.0);
+            ui.label(&p.message);
+        });
+        ui.add_space(12.0);
+
+        // Your data survived — say so. Uninstall would have wiped both, and the
+        // OBB can be ~8 GB, so this is the first thing people want to know.
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Your data was preserved").strong());
+            ui.label("  • OBB moved aside and restored (not re-downloaded)");
+            ui.label("  • Save data restored (savegame00.sav)");
+            ui.label(
+                egui::RichText::new("  No root needed — adb shell is in ext_obb_rw/ext_data_rw.")
+                    .size(10.0)
+                    .weak(),
+            );
+            ui.label(
+                egui::RichText::new("  (Rooted only: in-app settings are kept too.)")
+                    .size(10.0)
+                    .weak(),
+            );
+        });
+        ui.add_space(8.0);
+
+        // The grant is done for you here, but say it plainly: without it the
+        // modloader silently falls back to scoped storage.
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Storage permission").strong());
+            ui.label("  Granted automatically (MANAGE_EXTERNAL_STORAGE).");
+            ui.label("  If mods don't load, re-apply it:");
+            ui.horizontal(|ui| {
+                let cmd = format!("adb shell appops set {} MANAGE_EXTERNAL_STORAGE allow", pkg);
+                ui.monospace(egui::RichText::new(&cmd).size(10.0));
+                if ui.small_button("copy").clicked() {
+                    ui.output_mut(|o| o.copied_text = cmd.clone());
+                }
+            });
+        });
+        ui.add_space(8.0);
+
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Put your files here").strong());
+            ui.horizontal(|ui| {
+                ui.monospace(egui::RichText::new(&mods_dir).size(10.0));
+                if ui.small_button("copy").clicked() {
+                    ui.output_mut(|o| o.copied_text = mods_dir.clone());
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.monospace(egui::RichText::new(&paks_dir).size(10.0));
+                if ui.small_button("copy").clicked() {
+                    ui.output_mut(|o| o.copied_text = paks_dir.clone());
+                }
+            });
+            ui.label("  Plain /sdcard — visible over USB/MTP/SideQuest. One mod per");
+            ui.label("  folder, each with a main.lua. Log lands next to them.");
+        });
+        ui.add_space(12.0);
+
+        ui.vertical_centered(|ui| {
             ui.horizontal(|ui| {
                 if ui.button("🚀 Launch Game").clicked() {
-                    let serial = &self.devices[self.selected_device].serial;
-                    let pkg = &self.installed_apps[self.selected_app].package;
-                    let _ = adb::launch(serial, pkg);
+                    if let (Some(dev), Some(app)) = (
+                        self.devices.get(self.selected_device),
+                        self.installed_apps.get(self.selected_app),
+                    ) {
+                        let _ = adb::launch(&dev.serial, &app.package);
+                    }
                 }
                 if ui.button("↩ Back").clicked() {
                     self.phase = Phase::Ready;

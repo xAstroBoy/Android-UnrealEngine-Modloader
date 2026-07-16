@@ -281,6 +281,35 @@ pub fn get_tools_status() -> ToolsStatus {
 //  HTTP Download — simple blocking download using std::net
 // ═══════════════════════════════════════════════════════════════════════
 
+// ── libmodloader.so from the latest GitHub release ──────────────────────
+// `releases/latest/download/<asset>` is a stable redirect — no API call, no
+// token, no rate limit. curl -L / wget / Invoke-WebRequest all follow it.
+pub const MODLOADER_SO_URL: &str =
+    "https://github.com/xAstroBoy/arm64-ue-modloader/releases/latest/download/libmodloader.so";
+
+/// Fetch libmodloader.so from the latest release. Used when no local build
+/// exists — end users have no NDK, so `build.bat` can never work for them.
+pub fn download_modloader_so(dest: &Path) -> Result<PathBuf> {
+    log::info!("Fetching libmodloader.so from the latest GitHub release...");
+    download_with_system_tool(MODLOADER_SO_URL, dest)?;
+    // A 404/HTML error page would still "download" — sanity-check it is an ELF.
+    let mut f = fs::File::open(dest).context("opening downloaded .so")?;
+    let mut magic = [0u8; 4];
+    use std::io::Read;
+    f.read_exact(&mut magic).context("reading downloaded .so")?;
+    if magic != [0x7f, b'E', b'L', b'F'] {
+        let _ = fs::remove_file(dest);
+        bail!(
+            "Downloaded file is not an ELF shared library — the release asset may be \
+             missing. Check {}",
+            MODLOADER_SO_URL
+        );
+    }
+    let kb = fs::metadata(dest).map(|m| m.len() / 1024).unwrap_or(0);
+    log::info!("✓ Downloaded libmodloader.so ({} KB) → {}", kb, dest.display());
+    Ok(dest.to_path_buf())
+}
+
 /// Download a file from URL to local path
 fn download_file(url: &str, dest: &Path) -> Result<()> {
     log::info!("Downloading: {}", url);

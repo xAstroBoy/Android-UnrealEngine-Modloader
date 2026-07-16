@@ -2,7 +2,7 @@
 //  Pipeline — the full install flow, used by both CLI and GUI
 // ═══════════════════════════════════════════════════════════════════════
 
-use crate::{adb, game_db, signer, smali};
+use crate::{adb, game_db, signer, smali, tools_setup};
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 /// Progress callback: (step_number, total_steps, message)
@@ -71,9 +71,32 @@ pub fn find_modloader_so(override_path: Option<&str>) -> Result<PathBuf> {
     let p = PathBuf::from("../modloader/build/libmodloader.so");
     if p.exists() { return Ok(p); }
 
+    // 7. Nothing local — fetch it from the latest GitHub release.
+    // This is the normal path for anyone who isn't a developer: they have no
+    // NDK, so the build.bat step above can never succeed for them, and asking
+    // them to hunt down a .so is how installers get called broken.
+    // Cache next to the installer so it's fetched once; fall back to a temp dir
+    // when that location isn't writable (Program Files, a read-only share, ...).
+    let cache = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("libmodloader.so")))
+        .filter(|p| {
+            p.parent()
+                .map(|d| d.metadata().map(|m| !m.permissions().readonly()).unwrap_or(false))
+                .unwrap_or(false)
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("libmodloader.so"));
+
+    match tools_setup::download_modloader_so(&cache) {
+        Ok(p) => return Ok(p),
+        Err(e) => log::warn!("Could not fetch libmodloader.so from the latest release: {}", e),
+    }
+
     bail!(
-        "libmodloader.so not found.\n\
-         Place it next to the installer or pass --modloader-so <path>"
+        "libmodloader.so not found and could not be downloaded.\n\
+         Fix your connection, or grab it manually from\n  {}\n\
+         and place it next to the installer (or pass --modloader-so <path>).",
+        tools_setup::MODLOADER_SO_URL
     )
 }
 
@@ -274,13 +297,29 @@ fn setup_game_dirs(serial: &str, pkg: &str) -> Result<()> {
     adb::shell(serial, &format!("mkdir -p /sdcard/UnrealModloader/{}/mods", pkg))?;
     adb::shell(serial, &format!("mkdir -p /sdcard/UnrealModloader/{}/paks", pkg))?;
 
-    // Clean up old scoped-storage leftovers from previous installer versions
-    let cleanup_paths = [
-        format!("/sdcard/Android/data/{}.modloader_bak", pkg),
+    // NEVER delete *.modloader_bak here.
+    // Those are not "leftovers" — they are the ONLY copy of the user's OBB and
+    // save while an install is in flight. backup_game_dirs() mv's
+    //   /sdcard/Android/obb/<pkg>  -> <pkg>.modloader_bak   (7.9 GB on RE4)
+    //   /sdcard/Android/data/<pkg> -> <pkg>.modloader_bak   (holds savegame00.sav)
+    // and restore_game_dirs() moves them back and removes them on success.
+    // install() intentionally continues when the restore fails (it only logs), so
+    // rm -rf'ing them here destroyed 8 GB of OBB and the save on exactly the run
+    // where the user still needed them. If a .bak survives, that is a RESTORE
+    // FAILURE, not garbage: surface it loudly and leave it alone so it can be
+    // recovered by hand.
+    for dir in [
         format!("/sdcard/Android/obb/{}.modloader_bak", pkg),
-    ];
-    for path in &cleanup_paths {
-        adb::shell(serial, &format!("rm -rf '{}' 2>/dev/null", path))?;
+        format!("/sdcard/Android/data/{}.modloader_bak", pkg),
+    ] {
+        if adb::path_exists(serial, &dir).unwrap_or(false) {
+            log::warn!(
+                "LEFTOVER BACKUP STILL PRESENT: {} — the restore did not complete. \
+                 Your data is safe THERE. Move it back manually before re-running:\n    \
+                 adb shell mv '{}' '{}'",
+                dir, dir, dir.trim_end_matches(".modloader_bak")
+            );
+        }
     }
 
     log::info!("Modloader dirs created at /sdcard/UnrealModloader/{}/", pkg);
