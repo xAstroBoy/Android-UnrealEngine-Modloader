@@ -52,6 +52,20 @@
 --   24-byte struct — verified in IDA — so freeing the temp buffer is safe);
 --   SetWeaponNo(clone, distinctId) unbinds it so it arms independently instead
 --   of sharing the original's armed weapon.
+--
+--   BE CLEAR ABOUT WHAT THE CLONE IS. RE4 arms ONE cItem per weapon-no —
+--   cItemMgr::ArmSearchWeaponNo scans your INVENTORY for the item whose
+--   WeaponId2WeaponNo == wno. So a weapon-no IS a specific weapon you own, and
+--   two guns sharing an id means only ONE ever fires (confirmed live). The clone
+--   therefore MUST be armed as a different weapon from your inventory — that is
+--   an engine limit, not something a hook can fix.
+--   What WAS a bug: taking the first free id, which handed a cloned pistol the
+--   ROCKET LAUNCHER — so it fired explosives and then crashed:
+--       cObjLauncher::launch()+372 -> fault 0x78   (rocket[264] model == NULL)
+--   Launchers are now excluded, asked the way the game asks it (GetGunProp +
+--   AVR4GamePlayerRocketLauncher::GetPrivateStaticClass), not by guessing at
+--   WeaponId2WeaponType — that field is only 0/1/2, a variant TIER, and 34 of 45
+--   weapons share type 0.
 -- =====================================================================
 local TAG = "DualWield"
 local VERBOSE = false
@@ -194,22 +208,83 @@ local function findPawn()
   return nil
 end
 
--- NOTE — why there is no "pick a distinct weapon-id" any more.
+-- ── THE CLONE'S WEAPON-ID: an engine limit, not a bug we can code away ──
 --
--- The old clone called SetWeaponNo(clone, someUnusedId) to "unbind" it, because
--- RE4 arms ONE weapon per weapon-id and two guns sharing an id meant only one
--- fired. But a weapon-id IS THE WEAPON: hand the clone id 12 and your cloned
--- handgun mechanically BECOMES whatever weapon 12 is. That is why a cloned pistol
--- fired EXPLOSIVES — and it is the same bug as the launcher crash:
---     cObjLauncher::launch()+372 -> fault 0x78
---     cObjLauncher::moveFire()+96
--- a clone that got the rocket launcher's id fires rockets through a launcher that
--- was never set up. Wrong bullets and that tombstone are ONE bug.
+-- RE4 arms ONE cItem per weapon-no. Verified in cItemMgr::ArmSearchWeaponNo: it
+-- scans the player's INVENTORY for an item where WeaponId2WeaponNo(itemId) == wno.
+-- A weapon-no IS a specific weapon you own. There is no "same gun, second
+-- instance" for the engine to arm — so:
+--     same id      -> correct bullets, but only ONE gun fires   (confirmed live)
+--     different id -> both fire, but the clone IS that other weapon
+-- The clone is necessarily ANOTHER WEAPON FROM YOUR INVENTORY. That is the whole
+-- truth of this cheat, and no amount of hooking changes it.
 --
--- It is unnecessary now: [2] Simultaneous Fire arms each gun inside its OWN
--- TryFire, so two guns with the SAME id both pass `armed_wno == gun->wno` and both
--- fire — with the correct bullets, from the correct weapon. The clone keeps the
--- source's id, which is the only id that is actually right for it.
+-- What WAS a real bug: picking the first free id 1..60. That handed a cloned
+-- pistol the ROCKET LAUNCHER's id, so it fired explosives — and crashed:
+--     cObjLauncher::launch()+372 -> fault 0x78   (rocket[264] model == NULL)
+-- Wrong bullets and that tombstone were one thing.
+--
+-- So: pick a weapon of the SAME TYPE as the source (handgun -> handgun) using the
+-- game's own WeaponId2WeaponType, and never a launcher/explosive. A cloned Red9
+-- may come out as a Blacktail — same class, sane bullets, no explosives, no
+-- crash. If no same-type weapon is free we say so instead of silently handing you
+-- a grenade launcher.
+RG("GetGunProp", "_ZN17AVR4GamePlayerGun10GetGunPropEh", 0x62E0668)
+RG("RocketLauncherClass", "_ZN28AVR4GamePlayerRocketLauncher21GetPrivateStaticClassEv", 0x6494D28)
+
+-- Is this weapon-no a rocket launcher? Asked the way the GAME asks it — launch()
+-- itself does exactly this:
+--     GunProp = AVR4GamePlayerGun::GetGunProp(armed_wno, a2);
+--     PrivateStaticClass = AVR4GamePlayerRocketLauncher::GetPrivateStaticClass(GunProp);
+-- (Not via WeaponId2WeaponType: that field is only ever 0/1/2 — a variant TIER,
+-- with 34 of 45 weapons sharing type 0 — so it says nothing about the class.)
+--
+-- A clone armed as a launcher fires rockets through a cObjLauncher that was never
+-- set up, which is both the EXPLOSIVES you saw and this crash:
+--     cObjLauncher::launch()+372 -> fault 0x78   (rocket[264] model == NULL)
+local function isRocketLauncher(wno)
+  local ok, res = pcall(function()
+    local prop = CallNative(G.GetGunProp, "ppi", wno, 0)
+    if IsNull(prop) then return false end
+    local cls = ReadPtr(Offset(A2(prop), CLS_OFF))
+    local rl  = CallNative(G.RocketLauncherClass, "p")
+    if IsNull(cls) or IsNull(rl) then return false end
+    return ToHex(cls) == ToHex(rl)   -- no ptr-compare binding; ToHex is exact
+  end)
+  if not ok then return true end   -- can't tell => assume it is, and skip it
+  return res
+end
+
+-- Pick an id that (a) no held gun / additional prop is using, (b) the player
+-- actually owns (ArmSearchWeaponNo finds it in the inventory), and (c) is NOT a
+-- rocket launcher.
+--
+-- Why a DIFFERENT id at all: RE4 arms ONE cItem per weapon-no, so two guns
+-- sharing an id means only one ever fires — that is an engine limit, confirmed
+-- live. The clone is therefore necessarily another weapon you own. What was
+-- broken before was taking the FIRST free id, which handed a cloned pistol the
+-- rocket launcher.
+local function pickDistinctWeapon(pawn, srcW)
+  local used = { [srcW] = true }
+  for i = 0, 9 do
+    local g = ReadPtr(Offset(pawn, SLOTS_BASE + 8 * i))
+    if not IsNull(g) then used[ReadU8(Offset(g, WNO_OFF))] = true end
+  end
+  local n = ReadU32(Offset(pawn, ADDL_COUNT)); local arr = ReadPtr(Offset(pawn, ADDL_ARR))
+  if n > 0 and not IsNull(arr) then
+    for i = 0, math.min(n, 16) - 1 do
+      local g = ReadPtr(Offset(arr, 24 * i))
+      if not IsNull(g) then used[ReadU8(Offset(g, WNO_OFF))] = true end
+    end
+  end
+  for w = 1, 60 do
+    if not used[w] then
+      local it = CallNative(G.ArmSearchWeaponNo, "ppi", ItemMgr, w)
+      if not IsNull(it) and not isRocketLauncher(w) then return w end
+    end
+  end
+  return nil
+end
 
 local function cloneSlot(slot)
   local pawn = findPawn()
@@ -236,20 +311,27 @@ local function cloneSlot(slot)
   WritePtr(buf, gun); WritePtr(Offset(buf, 8), holA); WritePtr(Offset(buf, 16), holB)
   CallNative(G.RegAddProp, "ppp", pawn, buf)
   pcall(function() CallNative(G.Free, "vp", buf) end)
-  -- Keep the SOURCE's weapon-id: the clone must be the same weapon, firing the
-  -- same bullets. Simultaneous Fire is what lets both of them shoot.
-  local cloneW = ReadU8(Offset(gun, WNO_OFF))
-  if cloneW ~= W then
-    CallNative(G.SetWeaponNo, "ipi", gun, W)
-    cloneW = ReadU8(Offset(gun, WNO_OFF))
+  -- The clone needs its OWN weapon-id or the engine only ever arms one of the two
+  -- (one cItem per weapon-no — see the note above). Same TYPE as the source,
+  -- never explosive.
+  local newW = pickDistinctWeapon(pawn, W)
+  local note
+  if newW then
+    CallNative(G.SetWeaponNo, "ipi", gun, newW)
+    note = "armed as weapon id=" .. newW .. " (never a launcher). RE4 arms ONE weapon per id, "
+           .. "so the clone MUST be a different weapon you own — that is an engine limit, not a bug."
+  else
+    -- Nothing safe and free: keep the source id. Only one will fire, but it fires
+    -- the RIGHT bullets and cannot reach the launcher crash.
+    note = "no safe free weapon id — kept id=" .. W .. ", so only ONE of the two will fire "
+           .. "(carry another non-launcher weapon and re-clone)."
   end
   local warn = ""
   if not fireHookOK then
     warn = " | WARNING: Simultaneous Fire is not active, so only ONE of the two will fire."
   end
-  local msg = (slot == 1 and "2H" or "1H") .. " clone ready (id=" .. cloneW ..
-              ", same weapon as the original" ..
-              ", addl=" .. ReadU32(Offset(pawn, ADDL_COUNT)) .. "). Draw it from the holster & fire." .. warn
+  local msg = (slot == 1 and "2H" or "1H") .. " clone ready — " .. note ..
+              " | addl=" .. ReadU32(Offset(pawn, ADDL_COUNT)) .. ". Draw it from the holster & fire." .. warn
   Log(TAG .. ": " .. msg)
   pcall(function() Notify(TAG, msg) end)
   return msg
