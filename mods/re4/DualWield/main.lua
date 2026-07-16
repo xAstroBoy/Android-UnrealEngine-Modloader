@@ -194,29 +194,22 @@ local function findPawn()
   return nil
 end
 
--- Pick a weapon-id no held gun / additional prop is using, so the clone can't
--- double-bind to an existing armed weapon (= only one would fire).
-local function pickDistinctWeapon(pawn, srcW)
-  local used = { [srcW] = true }
-  for i = 0, 9 do
-    local g = ReadPtr(Offset(pawn, SLOTS_BASE + 8 * i))
-    if not IsNull(g) then used[ReadU8(Offset(g, WNO_OFF))] = true end
-  end
-  local n = ReadU32(Offset(pawn, ADDL_COUNT)); local arr = ReadPtr(Offset(pawn, ADDL_ARR))
-  if n > 0 and not IsNull(arr) then
-    for i = 0, math.min(n, 16) - 1 do
-      local g = ReadPtr(Offset(arr, 24 * i))
-      if not IsNull(g) then used[ReadU8(Offset(g, WNO_OFF))] = true end
-    end
-  end
-  for w = 1, 60 do
-    if not used[w] then
-      local it = CallNative(G.ArmSearchWeaponNo, "ppi", ItemMgr, w)
-      if not IsNull(it) then return w end
-    end
-  end
-  return nil
-end
+-- NOTE — why there is no "pick a distinct weapon-id" any more.
+--
+-- The old clone called SetWeaponNo(clone, someUnusedId) to "unbind" it, because
+-- RE4 arms ONE weapon per weapon-id and two guns sharing an id meant only one
+-- fired. But a weapon-id IS THE WEAPON: hand the clone id 12 and your cloned
+-- handgun mechanically BECOMES whatever weapon 12 is. That is why a cloned pistol
+-- fired EXPLOSIVES — and it is the same bug as the launcher crash:
+--     cObjLauncher::launch()+372 -> fault 0x78
+--     cObjLauncher::moveFire()+96
+-- a clone that got the rocket launcher's id fires rockets through a launcher that
+-- was never set up. Wrong bullets and that tombstone are ONE bug.
+--
+-- It is unnecessary now: [2] Simultaneous Fire arms each gun inside its OWN
+-- TryFire, so two guns with the SAME id both pass `armed_wno == gun->wno` and both
+-- fire — with the correct bullets, from the correct weapon. The clone keeps the
+-- source's id, which is the only id that is actually right for it.
 
 local function cloneSlot(slot)
   local pawn = findPawn()
@@ -243,11 +236,20 @@ local function cloneSlot(slot)
   WritePtr(buf, gun); WritePtr(Offset(buf, 8), holA); WritePtr(Offset(buf, 16), holB)
   CallNative(G.RegAddProp, "ppp", pawn, buf)
   pcall(function() CallNative(G.Free, "vp", buf) end)
-  local newW = pickDistinctWeapon(pawn, W)
-  if newW then CallNative(G.SetWeaponNo, "ipi", gun, newW) end
-  local msg = (slot == 1 and "2H" or "1H") .. " clone ready (src id=" .. W ..
-              " -> clone id=" .. ReadU8(Offset(gun, WNO_OFF)) ..
-              ", addl=" .. ReadU32(Offset(pawn, ADDL_COUNT)) .. "). Draw it from the holster & fire."
+  -- Keep the SOURCE's weapon-id: the clone must be the same weapon, firing the
+  -- same bullets. Simultaneous Fire is what lets both of them shoot.
+  local cloneW = ReadU8(Offset(gun, WNO_OFF))
+  if cloneW ~= W then
+    CallNative(G.SetWeaponNo, "ipi", gun, W)
+    cloneW = ReadU8(Offset(gun, WNO_OFF))
+  end
+  local warn = ""
+  if not fireHookOK then
+    warn = " | WARNING: Simultaneous Fire is not active, so only ONE of the two will fire."
+  end
+  local msg = (slot == 1 and "2H" or "1H") .. " clone ready (id=" .. cloneW ..
+              ", same weapon as the original" ..
+              ", addl=" .. ReadU32(Offset(pawn, ADDL_COUNT)) .. "). Draw it from the holster & fire." .. warn
   Log(TAG .. ": " .. msg)
   pcall(function() Notify(TAG, msg) end)
   return msg
