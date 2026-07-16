@@ -153,6 +153,35 @@ do
     -- dies building an argument that would have been discarded. The guard makes the
     -- two loads read a scratch buffer and zeroes the cEm arg so the callee opts out
     -- at its first `if` — no-op when the pointer isn't null.
+    -- Null-`this` guards — the check the game forgot.
+    --
+    -- A whole family of crashes is ONE bug repeated per enemy: a NULL
+    -- sub-object/model (normal for cut or unsupported content whose data the room
+    -- never loaded) dereferenced with no null check. They all die as
+    -- NULL+fieldOffset, reached via EmSetFromList2 -> cEmXX::move:
+    --   cObjChain::setChain  -> fault 0x438   (cEm2b)
+    --   cEm2d::setReset      -> fault 0x0d    (Novistador)
+    -- setChain is the proof; the ENTIRE function is:
+    --   *((_QWORD*)this + 135) = a2;  if (a2) return PenClothSet(this);  return this;
+    -- 135*8 = 0x438 — it writes through `this` without ever checking it.
+    -- Guarding the ENTRY means the enemy loses its cloth instead of the game dying.
+    -- Entry hooks only: two inline hooks <16 bytes apart shred each other.
+    for _, g in ipairs({
+        { sym = "_ZN9cObjChain8setChainEP10CLOTH_INFO", rva = 0x5FA18F0, name = "cObjChain::setChain" },
+        { sym = "_ZN5cEm2d8setResetEP3VecS1_",          rva = 0x5E2452C, name = "cEm2d::setReset"     },
+    }) do
+        if InstallNullThisGuard then
+            pcall(function()
+                local a = Resolve(g.sym, g.rva)
+                local ok = InstallNullThisGuard(a, g.name)
+                Log(TAG .. ": null-this guard " .. g.name .. ": " .. (ok and "installed" or "FAILED"))
+            end)
+        end
+    end
+    if not InstallNullThisGuard then
+        LogWarn(TAG .. ": InstallNullThisGuard missing — rebuild the modloader")
+    end
+
     if InstallEm32SubObjectGuard then
         pcall(function()
             local ok = InstallEm32SubObjectGuard()
@@ -370,7 +399,10 @@ local tyrants = { instances = {}, count = 0, logTransitions = true, verbose = fa
 
 local function trackTyrant(ptr)
     if not tyrants.instances[ptr] then
-        tyrants.instances[ptr] = { ptr=ptr, lastState=-1, spawnTime=os.clock(), moveCount=0, transitions=0 }
+        -- no moveCount: counting move() calls needs a per-frame hook, and a Lua
+        -- callback on cEm09::move is what corrupted the heap. transitions is kept
+        -- and maintained by the poll instead.
+        tyrants.instances[ptr] = { ptr=ptr, lastState=-1, spawnTime=os.clock(), transitions=0 }
         tyrants.count = tyrants.count + 1
         Log(TAG .. string.format(": Tyrant SPAWNED @ 0x%X (total %d)", ptr, tyrants.count))
     end
@@ -379,8 +411,8 @@ end
 local function untrackTyrant(ptr)
     local inst = tyrants.instances[ptr]
     if inst then
-        Log(TAG .. string.format(": Tyrant DESTROYED @ 0x%X (lived %.1fs moves=%d)",
-            ptr, os.clock()-inst.spawnTime, inst.moveCount))
+        Log(TAG .. string.format(": Tyrant DESTROYED @ 0x%X (lived %.1fs transitions=%d)",
+            ptr, os.clock()-inst.spawnTime, inst.transitions or 0))
         tyrants.instances[ptr] = nil
         tyrants.count = tyrants.count - 1
     end
@@ -401,25 +433,45 @@ pcall(function()
     Log(TAG .. ": Hook — Em09Init (Tyrant spawn)")
 end)
 
+-- Tyrant state monitor — POLLED, never hooked.
+--
+-- This used to be a Lua callback on cEm09::move. That is the single thing we must
+-- never do: move() runs on the game thread ONCE PER ENEMY PER FRAME, and the
+-- callback did Lua table inserts and string.format allocations on every call,
+-- racing the shared lua_State against the mod loop and bridge thread. It got far
+-- worse once install_cut_villager_fix() wired ids 6/7/8/A/B/D/33/37 to
+-- _prologEm09: cEm09::move then fires for EVERY VILLAGER in the room, not just a
+-- Tyrant, so a whole room's worth of enemies each allocated Lua every frame. The
+-- corruption showed up as SIGSEGV/SEGV_ACCERR with the PC executing INSIDE THE
+-- STACK (a BR through a smashed pointer) — nowhere near this code.
+--
+-- The giveaway that it was reading nonsense: it logged
+--   "Tyrant S255:255 -> INIT [HP=196611000 dist=8833]"
+-- i.e. Tyrant offsets (hp @0x3F0) read off a villager cEm that has no such field.
+--
+-- This was only ever DIAGNOSTICS — it drives no AI. tyrant_status already reads
+-- state live on demand, so polling loses nothing but the moveCount counter, and
+-- the poll runs on the modloader's own timer instead of the render-critical path.
+local TYRANT_POLL_SEC = 0.25
 pcall(function()
-    RegisterNativeHook("cEm09_move",
-        function(emPtr)
-            if emPtr == 0 then return emPtr end
-            local inst = tyrants.instances[emPtr] or trackTyrant(emPtr)
-            inst.moveCount = inst.moveCount + 1
-            local packed = tGetState(emPtr)
-            if packed ~= inst.lastState then
-                if tyrants.logTransitions then
-                    Log(TAG .. string.format(": Tyrant %s -> %s [HP=%s dist=%.0f]",
-                        stateName(inst.lastState), stateName(packed), tostring(tGetHP(emPtr)),
-                        math.sqrt(math.max(0, tGetDistSq(emPtr) or 0))))
-                end
+    LoopAsync(math.floor(TYRANT_POLL_SEC * 1000), function()
+        if not tyrants.logTransitions then return false end
+        for ptr, inst in pairs(tyrants.instances) do
+            local ok, packed = pcall(tGetState, ptr)
+            if ok and packed and packed ~= inst.lastState then
+                local hp   = select(2, pcall(tGetHP, ptr))
+                local dsq  = select(2, pcall(tGetDistSq, ptr))
+                Log(TAG .. string.format(": Tyrant %s -> %s [HP=%s dist=%.0f]",
+                    stateName(inst.lastState), stateName(packed), tostring(hp),
+                    math.sqrt(math.max(0, tonumber(dsq) or 0))))
                 inst.transitions = inst.transitions + 1
                 inst.lastState = packed
             end
-            return emPtr
-        end, nil)
-    Log(TAG .. ": Hook — cEm09::move (Tyrant AI monitor)")
+        end
+        return false   -- keep polling
+    end)
+    Log(TAG .. ": Tyrant AI monitor — polled every " .. TYRANT_POLL_SEC
+        .. "s (NOT hooked on cEm09::move; a per-frame Lua hook there corrupts the heap)")
 end)
 
 pcall(function()
@@ -433,10 +485,11 @@ end)
 
 RegisterCommand("tyrant_status", function()
     forEachTyrant(function(ptr, inst)
-        Log(string.format("── Tyrant @ 0x%X ── %s HP=%s dist=%.0f anim=%s moves=%d",
+        -- Read live, on demand — no per-frame hook needed to answer this.
+        Log(string.format("── Tyrant @ 0x%X ── %s HP=%s dist=%.0f anim=%s transitions=%d",
             ptr, stateName(tGetState(ptr)), tostring(tGetHP(ptr)),
             math.sqrt(math.max(0, tGetDistSq(ptr) or 0)),
-            string.format("0x%X", tGetAnim(ptr) or 0), inst.moveCount))
+            string.format("0x%X", tGetAnim(ptr) or 0), inst.transitions or 0))
     end)
 end)
 RegisterCommand("tyrant_idle",   function() forEachTyrant(function(p) tSetState(p,0x0001); tSetPhase(p,0); tSetParam(p,0); Log(TAG..": Tyrant → IDLE") end) end)

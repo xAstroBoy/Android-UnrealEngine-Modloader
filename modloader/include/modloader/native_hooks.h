@@ -115,13 +115,26 @@ HookId install_safe_call_guard(void* addr, const char* name);
 bool install_cut_villager_fix();
 // em32's init (sub_5E49AA0) null-checks SetObj00's result and then dereferences
 // it anyway 4 instructions later — SIGSEGV, fault addr 0x180 — whenever a
-// sub-object model is missing from the archive, i.e. for cut content. The callee
-// (VR4CreateEmSubObject) null-checks both pointers and returns, so the crash is
-// purely in COMPUTING AN ARGUMENT IT DISCARDS. Feeds the two loads a self-pointing
-// scratch buffer and zeroes the cEm arg so the callee opts out at its first `if`.
-// No-op whenever the pointer isn't null. The other 105 call sites take X0 from the
-// cEm's archive and never deref the model, so they were never at risk.
+// sub-object model is missing from the archive, i.e. for cut content that retail
+// never spawns. Installs a callback-less safe-call guard on that init: the fault
+// is caught and the init returns 0 instead of killing the game.
+//
+// Do NOT "improve" this back into mid-function DobbyInstruments that patch the
+// registers. That was tried and made it WORSE — two of the sites were 4 bytes
+// apart, and with libmodloader ~251MB from libUE4 (past ARM64's +/-128MB branch
+// range) Dobby must write a 16-byte absolute sequence, so the patches overlapped
+// and shredded the code: the clean `fault addr 0x180` became `pc = 0x512c662204`,
+// a BR into garbage. Never place two inline hooks within 16 bytes.
 bool install_em32_subobject_guard();
+// Add the null-`this` check the game forgot. A whole family of RE4 crashes is one
+// bug per enemy: a NULL sub-object/model (routine for cut/unsupported content the
+// room never loaded) dereferenced with no check, dying as NULL+fieldOffset —
+// cObjChain::setChain 0x438, em32 init 0x180, cEm2d::setReset 0x0d, all reached
+// via EmSetFromList2 -> cEmXX::move. Hooks `addr` at its ENTRY and returns 0 when
+// x0 is NULL, so the enemy loses that feature instead of the game dying.
+// ENTRY hooks only — two inline hooks <16 bytes apart shred each other (see the
+// em32 note above). Max 8 guards; forwards x0-x7, leaves v0-v7 alone.
+bool install_null_this_guard(uintptr_t addr, const char* name);
 // Dual-fire: arm the gun inside its OWN AVR4GamePlayerGun::TryFire so both guns
 // pass the "am I the armed weapon?" check and fire the same frame. MUST be pure
 // C++: TryFire is HOT (every trigger pull, per gun, continuously under

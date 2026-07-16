@@ -53,6 +53,15 @@ local hookOK = false
 if InstallDualFireArm then
   local ok, res = pcall(InstallDualFireArm, A.TryFire, ItemMgr, A.ArmSearchWeaponNo, A.Arm, WNO_OFF)
   hookOK = ok and res or false
+  -- Say WHY on failure. A bare pcall hid a type error here once and the mod
+  -- happily reported "loaded" with the hook silently absent (nativeHook=false).
+  if not ok then
+    LogWarn(TAG .. ": InstallDualFireArm ERRORED: " .. tostring(res)
+      .. " | tryFire=" .. tostring(A.TryFire) .. " itemMgr=" .. tostring(ItemMgr)
+      .. " armSearch=" .. tostring(A.ArmSearchWeaponNo) .. " arm=" .. tostring(A.Arm))
+  elseif not res then
+    LogWarn(TAG .. ": InstallDualFireArm returned false — see the [DUALFIRE] log line for which address was bad")
+  end
   if hookOK and SetDualFireEnabled then pcall(SetDualFireEnabled, state.enabled) end
 else
   LogWarn(TAG .. ": InstallDualFireArm missing — rebuild/redeploy the modloader. "
