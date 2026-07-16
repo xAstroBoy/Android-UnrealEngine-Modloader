@@ -8,16 +8,52 @@ use std::path::{Path, PathBuf};
 /// Progress callback: (step_number, total_steps, message)
 pub type ProgressFn = Box<dyn Fn(u32, u32, &str) + Send>;
 
-/// Where the modloader .so comes from
+/// Where the modloader .so comes from.
+///
+/// ALWAYS fetches the latest release first. The .so and the Lua mods ship as a
+/// matched set — a mod calling a binding that a stale .so doesn't export just
+/// silently does nothing (that is exactly how DualFire shipped with its hook
+/// never installed). Whatever is lying around next to the installer, or in a
+/// build/ dir on a dev box, is the ONE thing most likely to be out of date, so it
+/// must never win by accident.
+///
+/// Local copies are the FALLBACK, for offline use. Developers who want to install
+/// their own build pass --modloader-so explicitly.
 pub fn find_modloader_so(override_path: Option<&str>) -> Result<PathBuf> {
-    // 1. Explicit override
+    // 1. Explicit override always wins — this is the developer's "use MY build".
     if let Some(p) = override_path {
         let pb = PathBuf::from(p);
         if pb.exists() { return Ok(pb); }
         bail!("Specified modloader .so not found: {}", p);
     }
 
-    // 2. Try to rebuild from source if build script exists
+    // 2. The latest release — the default for everyone.
+    // Cache next to the installer so repeat runs are cheap; fall back to a temp
+    // dir when that location isn't writable (Program Files, a read-only share...).
+    let cache = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("libmodloader.so")))
+        .filter(|p| {
+            p.parent()
+                .map(|d| d.metadata().map(|m| !m.permissions().readonly()).unwrap_or(false))
+                .unwrap_or(false)
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("libmodloader.so"));
+
+    match tools_setup::download_modloader_so(&cache) {
+        Ok(p) => {
+            log::info!("Using the latest released libmodloader.so");
+            return Ok(p);
+        }
+        Err(e) => log::warn!(
+            "Could not fetch the latest libmodloader.so ({}) — falling back to a local copy. \
+             It may be OUT OF DATE; if mods misbehave, get back online and re-run.",
+            e
+        ),
+    }
+
+    // ── Everything below is the offline fallback ────────────────────────────
+    // 3. Try to rebuild from source if build script exists
     let build_dirs: &[&str] = &[
         "modloader",
         "../modloader",
@@ -71,29 +107,10 @@ pub fn find_modloader_so(override_path: Option<&str>) -> Result<PathBuf> {
     let p = PathBuf::from("../modloader/build/libmodloader.so");
     if p.exists() { return Ok(p); }
 
-    // 7. Nothing local — fetch it from the latest GitHub release.
-    // This is the normal path for anyone who isn't a developer: they have no
-    // NDK, so the build.bat step above can never succeed for them, and asking
-    // them to hunt down a .so is how installers get called broken.
-    // Cache next to the installer so it's fetched once; fall back to a temp dir
-    // when that location isn't writable (Program Files, a read-only share, ...).
-    let cache = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(|d| d.join("libmodloader.so")))
-        .filter(|p| {
-            p.parent()
-                .map(|d| d.metadata().map(|m| !m.permissions().readonly()).unwrap_or(false))
-                .unwrap_or(false)
-        })
-        .unwrap_or_else(|| std::env::temp_dir().join("libmodloader.so"));
-
-    match tools_setup::download_modloader_so(&cache) {
-        Ok(p) => return Ok(p),
-        Err(e) => log::warn!("Could not fetch libmodloader.so from the latest release: {}", e),
-    }
-
+    // The latest-release fetch already ran at the top; if we got here it failed
+    // AND nothing local exists.
     bail!(
-        "libmodloader.so not found and could not be downloaded.\n\
+        "libmodloader.so could not be downloaded and no local copy was found.\n\
          Fix your connection, or grab it manually from\n  {}\n\
          and place it next to the installer (or pass --modloader-so <path>).",
         tools_setup::MODLOADER_SO_URL
