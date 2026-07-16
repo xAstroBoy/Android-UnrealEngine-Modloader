@@ -162,15 +162,51 @@ pcall(function()
     end
 end)
 
-pcall(function()
-    RegisterNativeHook("cObjWep_reloadable", nil,
-        function(retval)
-            if not state.enabled then return retval end
-            V("Native cObjWep_reloadable -> 1")
-            return 1
-        end)
-    Log(TAG .. ": Native hook — cObjWep_reloadable → true")
-end)
+-- ── cObjWep::reloadable — BYTE PATCH, not a Lua hook ────────────────────
+-- This was a Lua post-hook that unconditionally `return 1`. Two problems in one:
+-- the decision is STATIC (always 1 when the mod is on), and `reloadable` is a
+-- per-frame weapon query, so the callback ran Lua on the game thread every frame
+-- and raced the shared lua_State. That corruption never crashes where it happens —
+-- it surfaced as FMallocBinned2 in GC, pc=lr=0x1, a fault inside atan2f, and a
+-- jump to pc=0x24cc. Same class as the ScoreControl / DualFire / Tyrant /
+-- NoVignette hot-hook crashes.
+--
+-- The whole function is a tail call:
+--     __int64 cObjWep::reloadable(cObjWep *this) { return cItemMgr::reloadable(&ItemMgr); }
+-- so "always reloadable" is 2 instructions. Decide it once, run at full speed,
+-- nothing to race. Original saved so the toggle restores it exactly.
+local ARM64_MOV_W0_1 = 0x52800020   -- mov w0, #1
+local ARM64_RET      = 0xD65F03C0   -- ret
+
+local RELOADABLE = { name = "cObjWep::reloadable",
+                     mangled = "_ZN7cObjWep10reloadableEv", fb = 0x5FC0F04 }
+local reloadablePatched = false
+
+local function applyReloadablePatch(on)
+    if on == reloadablePatched then return end
+    pcall(function()
+        if not RELOADABLE.addr then
+            local a = Resolve(RELOADABLE.mangled, RELOADABLE.fb)
+            if a and not IsNull(a) then
+                RELOADABLE.addr = a
+                RELOADABLE.orig = { ReadU32(a), ReadU32(Offset(a, 4)) }
+            end
+        end
+        if not RELOADABLE.addr then return end
+        if on then
+            WriteU32(RELOADABLE.addr, ARM64_MOV_W0_1)
+            WriteU32(Offset(RELOADABLE.addr, 4), ARM64_RET)
+        else
+            WriteU32(RELOADABLE.addr, RELOADABLE.orig[1])
+            WriteU32(Offset(RELOADABLE.addr, 4), RELOADABLE.orig[2])
+        end
+        reloadablePatched = on
+        Log(TAG .. ": " .. RELOADABLE.name .. " byte-patch " .. (on and "APPLIED (always reloadable)" or "reverted")
+            .. " @ " .. ToHex(RELOADABLE.addr))
+    end)
+end
+
+applyReloadablePatch(state.enabled and true or false)
 
 if sym_InstantReload then
     pcall(function()
@@ -191,6 +227,7 @@ end
 
 RegisterCommand("norecharge", function()
     state.enabled = not state.enabled
+    applyReloadablePatch(state.enabled and true or false)
     V("toggle: enabled=%s", tostring(state.enabled))
     ModConfig.Save("NoRecharge", state)
     Log(TAG .. ": " .. (state.enabled and "ON" or "OFF"))
@@ -221,7 +258,11 @@ end)
 if SharedAPI and SharedAPI.DebugMenu then
     SharedAPI.DebugMenu.RegisterToggle("NoRecharge", "Instant Reload",
         function() return state.enabled end,
-        function(v) state.enabled = v; ModConfig.Save("NoRecharge", state) end)
+        function(v)
+            state.enabled = v
+            applyReloadablePatch(v and true or false)
+            ModConfig.Save("NoRecharge", state)
+        end)
 end
 
 Log(TAG .. ": v3.0 loaded — UE4SS PostHook reload overrides + native InstantReload redirect + ammo inspection")
