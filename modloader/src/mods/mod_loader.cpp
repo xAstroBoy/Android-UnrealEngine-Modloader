@@ -185,13 +185,48 @@ namespace mod_loader
                 continue;
 
             std::string main_lua = mod_path + "/main.lua";
-            if (!file_exists(main_lua))
+            if (file_exists(main_lua))
             {
-                logger::log_warn("MOD", "Skipping '%s' — no main.lua found", entry->d_name);
+                mod_dirs.push_back(entry->d_name);   // flat: mods/<Mod>/main.lua
                 continue;
             }
 
-            mod_dirs.push_back(entry->d_name);
+            // ── CATEGORY FOLDER: mods/<category>/<Mod>/main.lua ────────────
+            // One level of nesting, so mods can be filed by what they DO —
+            // qol/ vs cheats/ vs fixes/ — and you can install just the set you
+            // want instead of dropping 23 folders in and hoping. Requested
+            // because "cheese" and "QOL" being mixed makes it impossible to hand
+            // someone an improved-but-not-cheated setup. Purely additive: a flat
+            // mods/<Mod>/main.lua still loads exactly as before, so nobody's
+            // existing layout breaks.
+            DIR *sub = opendir(mod_path.c_str());
+            if (!sub)
+            {
+                logger::log_warn("MOD", "Skipping '%s' — no main.lua and not readable", entry->d_name);
+                continue;
+            }
+            int found_here = 0;
+            struct dirent *se;
+            while ((se = readdir(sub)) != nullptr)
+            {
+                if (se->d_name[0] == '.')
+                    continue;
+                std::string child = std::string(entry->d_name) + "/" + se->d_name;
+                std::string child_path = mods_path + "/" + child;
+                if (!dir_exists(child_path))
+                    continue;
+                if (!file_exists(child_path + "/main.lua"))
+                    continue;
+                mod_dirs.push_back(child);       // e.g. "qol/HeadBlocker"
+                ++found_here;
+            }
+            closedir(sub);
+
+            if (found_here)
+                logger::log_info("MOD", "category '%s': %d mod(s)", entry->d_name, found_here);
+            else
+                logger::log_warn("MOD", "Skipping '%s' — no main.lua, and no mods inside it either",
+                                 entry->d_name);
         }
         closedir(dir);
 
