@@ -169,12 +169,21 @@ do
     for _, g in ipairs({
         { sym = "_ZN9cObjChain8setChainEP10CLOTH_INFO", rva = 0x5FA18F0, name = "cObjChain::setChain" },
         { sym = "_ZN5cEm2d8setResetEP3VecS1_",          rva = 0x5E2452C, name = "cEm2d::setReset"     },
+        -- cModel::setParent — `this` is VALID here; the NULL is a FIELD:
+        --     LDR X8, [X0,#0x108]     ; x0 fine
+        --     STR X1, [X8,#0x78]      ; X8 == NULL -> fault addr 0x78
+        -- Seen as: cObjLauncher::loadRocket -> cModel::setParent, i.e. the rocket
+        -- launcher whose rocket model never loaded. Testing x0 alone misses it, so
+        -- this one guards the field at +0x108.
+        { sym = "_ZN6cModel9setParentEP6cCoordR3VecS3_", rva = 0x5F8245C,
+          name = "cModel::setParent", field = 0x108 },
     }) do
         if InstallNullThisGuard then
             pcall(function()
                 local a = Resolve(g.sym, g.rva)
-                local ok = InstallNullThisGuard(a, g.name)
-                Log(TAG .. ": null-this guard " .. g.name .. ": " .. (ok and "installed" or "FAILED"))
+                local ok = InstallNullThisGuard(a, g.name, g.field)
+                Log(TAG .. ": null guard " .. g.name .. (g.field and (" (field +0x" .. string.format("%X", g.field) .. ")") or "")
+                    .. ": " .. (ok and "installed" or "FAILED"))
             end)
         end
     end

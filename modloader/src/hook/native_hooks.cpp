@@ -1544,6 +1544,12 @@ using NgFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
                           uint64_t, uint64_t, uint64_t, uint64_t);
 static NgFn s_ng_orig[kMaxNullGuards] = {};
 static uintptr_t s_ng_addr[kMaxNullGuards] = {};
+// Which pointer to test: -1 = `this` (x0) itself, >=0 = the FIELD at
+// x0+off. cModel::setParent needs the latter — `this` is valid there and it
+// is *(this+0x108) that is NULL:
+//     LDR X8, [X0,#0x108]      ; x0 fine
+//     STR X1, [X8,#0x78]       ; X8 == NULL -> fault 0x78
+static int64_t s_ng_field[kMaxNullGuards] = {};
 // OWN the name. The Lua binding hands us a std::string::c_str() that dies the
 // moment the call returns, and the thunk logs it much later, from another thread.
 static char s_ng_name[kMaxNullGuards][48] = {};
@@ -1553,12 +1559,20 @@ static int  s_ng_count = 0;
 template <int N>
 static uint64_t ng_thunk(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                          uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
-    if (!a0) {
+    bool bad = (a0 == 0);
+    if (!bad && s_ng_field[N] >= 0) {
+        // a0 is valid; the NULL is a FIELD inside it.
+        uint64_t f = 0;
+        __builtin_memcpy(&f, reinterpret_cast<void*>(a0 + (uint64_t)s_ng_field[N]), sizeof(f));
+        bad = (f == 0);
+    }
+    if (bad) {
         // First hit only — this can fire per-frame, so never log in a loop.
         if (s_ng_hits[N].fetch_add(1, std::memory_order_relaxed) == 0)
-            logger::log_warn("NULLGUARD", "%s called with NULL `this` — returning 0 instead of "
-                                          "faulting (missing model/sub-object; further hits silent)",
-                             s_ng_name[N]);
+            logger::log_warn("NULLGUARD", "%s: %s is NULL — returning 0 instead of faulting "
+                                          "(missing model/sub-object; further hits silent)",
+                             s_ng_name[N],
+                             s_ng_field[N] >= 0 ? "a required field" : "`this`");
         return 0;
     }
     return s_ng_orig[N](a0, a1, a2, a3, a4, a5, a6, a7);
@@ -1569,7 +1583,7 @@ static NgFn s_ng_thunks[kMaxNullGuards] = {
     ng_thunk<4>, ng_thunk<5>, ng_thunk<6>, ng_thunk<7>,
 };
 
-bool install_null_this_guard(uintptr_t addr, const char* name) {
+bool install_null_this_guard(uintptr_t addr, const char* name, int64_t field_off) {
     if (!addr) {
         logger::log_error("NULLGUARD", "null address for '%s'", name ? name : "?");
         return false;
@@ -1585,6 +1599,7 @@ bool install_null_this_guard(uintptr_t addr, const char* name) {
     __builtin_strncpy(s_ng_name[n], name ? name : "?", sizeof(s_ng_name[n]) - 1);
     s_ng_name[n][sizeof(s_ng_name[n]) - 1] = 0;   
     s_ng_hits[n].store(0, std::memory_order_relaxed);
+    s_ng_field[n] = field_off;
     if (DobbyHook(reinterpret_cast<void*>(addr),
                   reinterpret_cast<dobby_dummy_func_t>(s_ng_thunks[n]),
                   reinterpret_cast<dobby_dummy_func_t*>(&s_ng_orig[n])) != RT_SUCCESS) {

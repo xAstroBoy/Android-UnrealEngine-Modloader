@@ -134,7 +134,10 @@ bool install_em32_subobject_guard();
 // x0 is NULL, so the enemy loses that feature instead of the game dying.
 // ENTRY hooks only — two inline hooks <16 bytes apart shred each other (see the
 // em32 note above). Max 8 guards; forwards x0-x7, leaves v0-v7 alone.
-bool install_null_this_guard(uintptr_t addr, const char* name);
+// field_off: -1 = test `this` (x0) itself; >=0 = test the pointer FIELD at
+// x0+field_off, for functions where `this` is valid but an inner pointer is
+// NULL (cModel::setParent: LDR X8,[X0,#0x108] / STR X1,[X8,#0x78] -> 0x78).
+bool install_null_this_guard(uintptr_t addr, const char* name, int64_t field_off = -1);
 // U3 "It" (emId 50 = 0x32 = cEm32) is INVULNERABLE outside its scripted level —
 // same root as the fault-0x180 crash. sub_5E49AA0 builds U3's parts model with
 // SetObj00 using the GLOBAL/stage archive at pG+0x68 for the skeleton param; away

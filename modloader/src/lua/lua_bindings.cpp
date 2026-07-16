@@ -2148,8 +2148,13 @@ namespace lua_bindings
         // Guards the function ENTRY and returns 0 when `this` is NULL, so the enemy
         // loses that one feature (e.g. cloth) instead of killing the process.
         // Sig: InstallNullThisGuard(addr, name) -> bool
-        lua.set_function("InstallNullThisGuard", [](void* addr, const std::string& name) -> bool {
-            return native_hooks::install_null_this_guard(reinterpret_cast<uintptr_t>(addr), name.c_str());
+        // fieldOff (optional): omit to test `this`; pass an offset to test the
+        // pointer FIELD at this+off — cModel::setParent has a valid `this` and a
+        // NULL *(this+0x108), so testing x0 alone would miss it entirely.
+        lua.set_function("InstallNullThisGuard", [](void* addr, const std::string& name,
+                                                    sol::optional<int64_t> field_off) -> bool {
+            return native_hooks::install_null_this_guard(reinterpret_cast<uintptr_t>(addr),
+                                                         name.c_str(), field_off.value_or(-1));
         });
 
         // ── InstallU3KillableFix — U3 (em32) killable outside its level ─────
