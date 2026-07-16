@@ -65,7 +65,7 @@
 -- v9.0 — Architecture rewrite (EmSetEvent only — was correct all along).
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "Randomizer"
-local VERBOSE = true
+local VERBOSE = false
 -- v12.5 safety default:
 -- Room-load full-list rewrites are the crash-correlated path in live sessions.
 -- Keep manual rewrite command available for testing, but disable automatic room
@@ -573,8 +573,8 @@ local sym_OnSceEventBegin  = nil    -- Cutscene begin marker
 local sym_OnSceEventEnd    = nil    -- Cutscene end marker
 
 -- pcall Resolve calls — these compute (lib_base + offset), should be safe
-pcall(function() sym_readEmList       = Resolve("readEmList",        0x065E4278) end)
-pcall(function() sym_GetEmPtrFromList = Resolve("GetEmPtrFromList",  0x062EA154) end)
+pcall(function() sym_readEmList       = Resolve("readEmList",        0x061E4278) end)
+pcall(function() sym_GetEmPtrFromList = Resolve("GetEmPtrFromList",  0x05EEA154) end)
 pcall(function() sym_EmSetFromList    = Resolve("_Z13EmSetFromListv", 0x05EE9610) end)
 if not sym_EmSetFromList then
     pcall(function() sym_EmSetFromList = Resolve("EmSetFromList", 0x05EE9610) end)
@@ -587,8 +587,8 @@ pcall(function() sym_EmListSetAlive   = Resolve("_Z14EmListSetAlivejb", 0x05EEA2
 if not sym_EmListSetAlive then
     pcall(function() sym_EmListSetAlive = Resolve("EmListSetAlive", 0x05EEA224) end)
 end
-pcall(function() sym_OnSceEventBegin = Resolve("OnSceEventBegin", 0x0644680C) end)
-pcall(function() sym_OnSceEventEnd = Resolve("OnSceEventEnd", 0x064468D4) end)
+pcall(function() sym_OnSceEventBegin = Resolve("OnSceEventBegin", 0x0644080C) end)
+pcall(function() sym_OnSceEventEnd = Resolve("OnSceEventEnd", 0x064408D4) end)
 
 V("Resolve: readEmList=" .. ptrfmt(sym_readEmList)
     .. " GetEmPtrFromList=" .. ptrfmt(sym_GetEmPtrFromList)
@@ -959,9 +959,9 @@ local function initNativePointers()
     if base and addr_pG then return end
     pcall(function() base = GetLibBase() end)
     -- Prefer symbol (safer across builds), then fallback offset.
-    pcall(function() addr_pG = Resolve("pG", 0x0A856E48) end)
+    pcall(function() addr_pG = Resolve("pG", 0x0A456E48) end)
     if (not addr_pG or ptrval(addr_pG) == 0) and base then
-        pcall(function() addr_pG = Offset(base, 0x0A856E48) end)
+        pcall(function() addr_pG = Offset(base, 0x0A456E48) end)
     end
 end
 
@@ -1370,9 +1370,9 @@ installPathMarkerHooks()
 -- single-hook assumption caused room arrays and crows to slip through.
 local sym_EmSetEvent = nil
 -- Use mangled C++ name for reliable dlsym resolution (plain "EmSetEvent" may fall back to wrong offset)
-pcall(function() sym_EmSetEvent = Resolve("_Z10EmSetEventP7EM_LIST", 0x062E9E8C) end)
+pcall(function() sym_EmSetEvent = Resolve("_Z10EmSetEventP7EM_LIST", 0x05EE9E8C) end)
 if not sym_EmSetEvent then
-    pcall(function() sym_EmSetEvent = Resolve("EmSetEvent", 0x062E9E8C) end)
+    pcall(function() sym_EmSetEvent = Resolve("EmSetEvent", 0x05EE9E8C) end)
 end
 Log(TAG .. ": Resolve: EmSetEvent=" .. ptrfmt(sym_EmSetEvent))
 

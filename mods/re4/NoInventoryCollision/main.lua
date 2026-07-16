@@ -11,7 +11,7 @@
 --   Native hooks for collision bypass
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "NoInventoryCollision"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local function isDefaultObject(obj)
@@ -128,7 +128,7 @@ Log(TAG .. ": NotifyOnNewObject — VR4ItemPickup (item spawn tracking)")
 -- NATIVE HOOKS — Item collision bypass
 -- ═══════════════════════════════════════════════════════════════════════
 
-local sym_intersect = Resolve("ItemRegionsIntersect", 0x06735678)
+local sym_intersect = Resolve("ItemRegionsIntersect", 0x06335678)
 if sym_intersect then
     pcall(function()
     RegisterNativeHookAt(sym_intersect, "ItemRegionsIntersect", nil,

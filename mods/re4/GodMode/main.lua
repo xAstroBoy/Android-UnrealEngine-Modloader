@@ -19,7 +19,7 @@
 --   - OnStunnedChanged blocking (prevented grab/stun animations)
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "GodMode"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local function isDefaultObject(obj)
@@ -52,6 +52,46 @@ local saved = ModConfig.Load("GodMode")
 if saved then
     if saved.enabled ~= nil then state.enabled = saved.enabled end
 end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- INSTA-KILL / COLLISION PROTECTION (v9) — block the NATIVE player-damage
+-- entries that bypass the UBio4Utils::HurtPlayer UFunctions
+-- ═══════════════════════════════════════════════════════════════════════
+-- Verified in IDA v2.3: enemy grabs/chainsaw/contact insta-kills and scripted
+-- insta-kill events reach the player through native damage entries, NOT
+-- UBio4Utils::HurtPlayer (which is why God Mode "didn't stop insta-kills"):
+--   SetPlDamage(cEm*, ...)  — enemy → player damage (grabs, chainsaw, contact)
+--   PlSetDamage(...)        — generic/const player damage (scripted events)
+-- Both are PLAYER-ONLY (enemies lose HP via LifeDownSet2 with their OWN target,
+-- a shared function we deliberately do NOT touch — so enemies stay killable).
+-- Patch each to a bare `ret` while God Mode is on: no enemy hit, including
+-- insta-kills, ever reduces the player's HP. Restored when God Mode is off.
+local ARM64_RET = 0xD65F03C0
+local INSTAKILL_PATCHES = {
+    { name = "SetPlDamage (enemy→player)", mangled = "_Z11SetPlDamageP3cEmPFvP7cPlayerE17EActionCameraType", fb = 0x06009A68 },
+    { name = "PlSetDamage (const/event)",  mangled = "_Z11PlSetDamageiij17EActionCameraType",               fb = 0x05EEEE70 },
+}
+
+local function applyInstaKillPatch()
+    for _, p in ipairs(INSTAKILL_PATCHES) do
+        pcall(function()
+            local sym = Resolve(p.mangled, p.fb)
+            if not sym or IsNull(sym) then Log(TAG .. ": [WARN] " .. p.name .. " not resolved"); return end
+            p.addr = sym
+            if not p.orig then p.orig = ReadU32(sym) end
+            WriteU32(sym, ARM64_RET)
+            Log(TAG .. ": PATCHED " .. p.name .. " → ret (insta-kill blocked) @ " .. ToHex(sym))
+        end)
+    end
+end
+
+local function restoreInstaKillPatch()
+    for _, p in ipairs(INSTAKILL_PATCHES) do
+        if p.addr and p.orig then pcall(function() WriteU32(p.addr, p.orig) end) end
+    end
+end
+
+if state.enabled then applyInstaKillPatch() end
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- LAYER 1: bCanBeDamaged = false (UE4 engine-level damage gate)
@@ -178,7 +218,7 @@ local function onToggle(newState)
             pawnProtected = newState
         end)
     end
-    if newState then refreshProtection() end
+    if newState then applyInstaKillPatch(); refreshProtection() else restoreInstaKillPatch() end
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -216,5 +256,6 @@ if SharedAPI and SharedAPI.DebugMenu then
         function(v) onToggle(v) end)
 end
 
-Log(TAG .. ": v8.0 loaded — damage prevention only (bCanBeDamaged + PreHook + KillZ)")
+Log(TAG .. ": v9.0 loaded — bCanBeDamaged + HurtPlayer PreHook + KillZ"
+    .. " + NATIVE insta-kill block (SetPlDamage/PlSetDamage → ret, player-only)")
 Log(TAG .. ": Death menu, game-over, and stun animations are NOT blocked (no softlock)")

@@ -29,7 +29,7 @@
 -- v8.0 — Direct EmSetEvent() spawning (replaces broken ESL-write approach)
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "EnemySpawner"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 -- ── HP presets (LE uint16 → {lo, hi}) ───────────────────────────────
@@ -429,29 +429,41 @@ local function initNative()
     end
     V("initNative: base=%s", tostring(base))
 
-    -- Resolve EmSetEvent — try mangled C++ name, then plain, then raw offset
+    -- Resolve EmSetEvent — mangled C++ name resolves directly (nothing stripped);
+    -- fallback offset corrected to the current binary (was stale +0x400000).
     pcall(function()
-        sym_EmSetEvent = Resolve("_Z10EmSetEventP7EM_LIST", 0x062E9E8C)
+        sym_EmSetEvent = Resolve("_Z10EmSetEventP7EM_LIST", 0x05EE9E8C)
     end)
     if not sym_EmSetEvent or IsNull(sym_EmSetEvent) then
         pcall(function()
-            sym_EmSetEvent = Resolve("EmSetEvent", 0x062E9E8C)
+            sym_EmSetEvent = Resolve("EmSetEvent", 0x05EE9E8C)
         end)
     end
     if not sym_EmSetEvent or IsNull(sym_EmSetEvent) then
         pcall(function()
-            sym_EmSetEvent = Offset(base, 0x062E9E8C)
+            sym_EmSetEvent = Offset(base, 0x05EE9E8C)
         end)
     end
     V("initNative: EmSetEvent resolved=%s", tostring(sym_EmSetEvent ~= nil))
 
-    -- pPL: BSS variable holding cPlayer* (player position source)
-    -- pPL+0xa4 = posX (float), pPL+0xa8 = posY (float), pPL+0xac = posZ (float)
-    pcall(function() addr_pPL = Offset(base, 0x0A94AB40) end)
+    -- pPL: exported data symbol holding the cPlayer struct (player position source).
+    -- Resolve by NAME (dlsym works for data globals) — the old raw offset
+    -- 0x0A94AB40 was stale; verified current address is 0x0A54AB40 (IDA: EmSetEvent
+    -- reads pPL+164 for the same-space distance calc). pPL+0xa4 = posX, +0xa8 = posY,
+    -- +0xac = posZ (float).
+    pcall(function() addr_pPL = Resolve("pPL", 0x0A54AB40) end)
+    if not addr_pPL or IsNull(addr_pPL) then
+        pcall(function() addr_pPL = Offset(base, 0x0A54AB40) end)
+    end
     V("initNative: pPL=%s", tostring(addr_pPL))
 
-    -- errEm: BSS variable holding cEm* sentinel returned on spawn failure
-    pcall(function() addr_errEm = Offset(base, 0x0A954FF0) end)
+    -- errEm: exported data symbol holding the cEm* sentinel returned on spawn
+    -- failure. Resolve by NAME; old raw offset 0x0A954FF0 was stale, verified
+    -- current address is 0x0A554FF0.
+    pcall(function() addr_errEm = Resolve("errEm", 0x0A554FF0) end)
+    if not addr_errEm or IsNull(addr_errEm) then
+        pcall(function() addr_errEm = Offset(base, 0x0A554FF0) end)
+    end
     V("initNative: errEm=%s", tostring(addr_errEm))
 
     -- Allocate reusable 32-byte EM_LIST buffer (calloc -> zero-initialized)
@@ -663,35 +675,50 @@ local function getPlayerPawn()
     return nil
 end
 
+-- Read the player position straight from the native pPL struct — this is the
+-- EXACT struct + coordinate space EmSetEvent itself uses (verified in IDA:
+-- EmSetEvent computes the spawn distance from *(pPL+0xA4) and *(pPL+0xAC), and
+-- writes the enemy world pos to cEm+0xA4/A8/AC = EM_LIST.pos*10). Using it means
+-- spawns land relative to the player in the same space with no scale/axis guess.
+--   pPL+0xA4 = X, pPL+0xA8 = Y (height), pPL+0xAC = Z.
+local function readNativePlayerPos()
+    if not addr_pPL or IsNull(addr_pPL) then return nil end
+    local pPL = nil
+    pcall(function() pPL = ReadPtr(addr_pPL) end)
+    if not pPL or IsNull(pPL) then return nil end
+    local x, y, z
+    pcall(function() x = ReadFloat(Offset(pPL, 0xa4)) end)
+    pcall(function() y = ReadFloat(Offset(pPL, 0xa8)) end)
+    pcall(function() z = ReadFloat(Offset(pPL, 0xac)) end)
+    if x and z and (x ~= 0 or y ~= 0 or z ~= 0) then
+        return x, y or 0, z
+    end
+    return nil
+end
+
 local function getPlayerPosition()
+    -- PRIMARY: native pPL (ground truth — the space EmSetEvent uses). This is
+    -- what fixes "enemies always spawn super far away": the SDK methods below
+    -- return a different coordinate space/scale, so enemies were placed relative
+    -- to a mismatched origin.
+    if not nativeReady then pcall(initNative) end
+    local x, y, z = readNativePlayerPos()
+    if x then
+        lastCoordSystem = "re4"
+        V("getPlayerPosition: native pPL RE4=(%.1f, %.1f, %.1f)", x, y, z)
+        return x, y, z
+    end
+
+    -- FALLBACK: debug/game pawn SDK methods (only if pPL is unavailable).
     local debugPawn = getDebugPlayerPawn()
     if debugPawn then
-        local x, y, z = getPawnPositionFromMethods(debugPawn, "debugPawn")
+        x, y, z = getPawnPositionFromMethods(debugPawn, "debugPawn")
         if x then return x, y, z end
     end
-
     local pawn = getPlayerPawn()
     if pawn then
-        local x, y, z = getPawnPositionFromMethods(pawn, "playerPawn")
+        x, y, z = getPawnPositionFromMethods(pawn, "playerPawn")
         if x then return x, y, z end
-    end
-
-    -- Fallback: native pPL (cPlayer struct) — RE4 internal coords (Y-up)
-    -- pPL+0xa4 = RE4 X, pPL+0xa8 = RE4 Y (height), pPL+0xac = RE4 Z
-    if addr_pPL then
-        local pPL = nil
-        pcall(function() pPL = ReadPtr(addr_pPL) end)
-        if pPL and not IsNull(pPL) then
-            local x, y, z
-            pcall(function() x = ReadFloat(Offset(pPL, 0xa4)) end)
-            pcall(function() y = ReadFloat(Offset(pPL, 0xa8)) end)
-            pcall(function() z = ReadFloat(Offset(pPL, 0xac)) end)
-            if x and z and (x ~= 0 or z ~= 0) then
-                V("getPlayerPosition: native pPL RE4=(%.1f, %.1f, %.1f)", x, y or 0, z)
-                lastCoordSystem = "re4"
-                return x, y or 0, z
-            end
-        end
     end
 
     V("getPlayerPosition: all methods returned nil/zero")
@@ -959,7 +986,17 @@ local function spawnSingle(enemy, offsetX, offsetZ)
     return true, result
 end
 
+-- Debounce: the VR debug-menu confirm re-fires a single click several times
+-- (a trigger press spans many frames), so one "Spawn X" tap was producing 6+
+-- enemies. Collapse repeat calls within 500ms into ONE spawn batch.
+local _lastSpawnClock = -1
 local function spawnEnemy(enemy, count)
+    local now = os.clock()
+    if now - _lastSpawnClock < 0.5 then
+        V("spawnEnemy: DEBOUNCED (%.3fs since last click) — ignoring repeat", now - _lastSpawnClock)
+        return 0
+    end
+    _lastSpawnClock = now
     count = count or state.spawnCount
     V("spawnEnemy: name=%s count=%d diff=%s dist=%d", enemy.name, count, state.difficulty, state.spawnDistance)
 

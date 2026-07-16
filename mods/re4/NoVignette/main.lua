@@ -15,7 +15,7 @@
 -- v3.0: Full UE4SS API with native hooks
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "NoVignette"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = {
@@ -133,49 +133,16 @@ else
     Log(TAG .. ": Native hook: IsAnyVignetteActive skipped (symbol not found)")
 end
 
--- ActivateVignette — block activation
-ok = RegisterNativeHook("ActivateVignette", function(self)
-    if state.vignetteOff then
-        V("Native BLOCK ActivateVignette")
-        return "BLOCK"
-    end
-end, nil, "p")
-if ok then
-    nativeHookCount = nativeHookCount + 1
-    Log(TAG .. ": Native hook: ActivateVignette (BLOCK)")
-else
-    Log(TAG .. ": Native hook: ActivateVignette skipped (symbol not found)")
-end
+-- NOTE: v4.0 also tried to hook "ActivateVignette", "UpdateVignette" and
+-- "ApplyVignetteEffect". Verified against the full libUE4.so .dynsym: none of
+-- those functions exist on AVR4Vignette (or anywhere). The real per-frame
+-- driver is AVR4Vignette::Tick(float), but blocking SetVignetteActive above
+-- (native + the UFunction PreHook) already prevents the vignette from ever
+-- activating, so those dead registrations were removed. The 3 native hooks
+-- kept above (SetVignetteActive / IsVignetteActive / IsAnyVignetteActive) all
+-- resolve to real AVR4Vignette methods.
 
--- UpdateVignette — block vignette tick updates
-ok = RegisterNativeHook("UpdateVignette", function(self, dt)
-    if state.vignetteOff then
-        V("Native BLOCK UpdateVignette")
-        return "BLOCK"
-    end
-end, nil, "pf")
-if ok then
-    nativeHookCount = nativeHookCount + 1
-    Log(TAG .. ": Native hook: UpdateVignette (BLOCK)")
-else
-    Log(TAG .. ": Native hook: UpdateVignette skipped (symbol not found)")
-end
-
--- ApplyVignetteEffect — block vignette rendering
-ok = RegisterNativeHook("ApplyVignetteEffect", function(self)
-    if state.vignetteOff then
-        V("Native BLOCK ApplyVignetteEffect")
-        return "BLOCK"
-    end
-end, nil, "p")
-if ok then
-    nativeHookCount = nativeHookCount + 1
-    Log(TAG .. ": Native hook: ApplyVignetteEffect (BLOCK)")
-else
-    Log(TAG .. ": Native hook: ApplyVignetteEffect skipped (symbol not found)")
-end
-
-Log(TAG .. ": " .. nativeHookCount .. "/6 native hooks installed (UE4SS hooks always active)")
+Log(TAG .. ": " .. nativeHookCount .. "/3 native hooks installed (UE4SS hooks always active)")
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- COMMANDS
@@ -215,4 +182,4 @@ if SharedAPI and SharedAPI.DebugMenu then
         function(v) state.vignetteOff = v; ModConfig.Save("NoVignette", state) end)
 end
 
-Log(TAG .. ": v4.0 loaded — UE4SS hooks + native hooks restored (modloader crash guard active)")
+Log(TAG .. ": v4.1 loaded — UE4SS hooks + 3 real native hooks (dead Activate/Update/Apply removed)")

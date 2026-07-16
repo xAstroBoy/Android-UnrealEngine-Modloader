@@ -89,16 +89,25 @@ Log(TAG .. ": 4 UE4SS RegisterPostHook on VR4GamePlayerAmmo/Arrow reload UFuncti
 local sym_InstantReload = Resolve("InstantReload", 0x062DCA7C)
 
 -- ═══════════════════════════════════════════════════════════════════════
--- RIFLE / MINE-THROWER AUTO-BOLT — kill the manual "recharge each shot"
+-- RIFLE AUTO-BOLT — NOT the Mine Thrower fix. Kept for bolt-action QoL only.
 -- ═══════════════════════════════════════════════════════════════════════
--- Verified in IDA v2.3: AVR4GamePlayerRifle::IsAutoBoltAllowed() only returns
--- true when the game setting FVR4GamePlayerSettings::Get()[0x3D] (ReloadStyle)
--- == 1. With the default (manual) style, bolt-action weapons — including the
--- Mine Thrower / "grenade launcher" (a Rifle subclass) — force you to cycle the
--- bolt after EVERY shot (the "recharge each shot" the ammo/reload hooks can't
--- touch). We patch the setting compare (IsAutoBoltAllowed+0x60,
--- `ldrb w8,[x0,#0x3d]` → `mov w8,#1`) so auto-bolt is always ALLOWED for capable
--- weapons — without changing the shared setting byte.
+-- HISTORY, so nobody re-derives this: the auto-bolt was a RED HERRING. This
+-- patch was written believing IsAutoBoltAllowed was what forced the Mine
+-- Thrower's per-shot recharge. It is NOT — it changed nothing, and the actual
+-- cause was the spent-chamber gate in Rifle::IsReadyToFire plus the chamber
+-- count from GetCurrentAmmo (both patched below; THOSE are the fix).
+--
+-- What it does do: AVR4GamePlayerRifle::IsAutoBoltAllowed() returns true only
+-- when the ReloadStyle setting FVR4GamePlayerSettings::Get()[0x3D] == 1.
+-- Patching the compare (IsAutoBoltAllowed+0x60, `ldrb w8,[x0,#0x3d]` →
+-- `mov w8,#1`) makes auto-bolt always allowed for bolt-action rifles without
+-- writing the shared setting byte. That is a real (if unrequested) QoL change
+-- and it applies to EVERY rifle, not just the Mine Thrower.
+--
+-- Retained because it was present in the build that was confirmed working, and
+-- removing it would be an untested behaviour change to a shipped fix — not
+-- because it is required. Drop it if bolt-action rifles should keep manual
+-- cycling; the Mine Thrower fix does not depend on it.
 pcall(function()
     local sym = Resolve("_ZNK19AVR4GamePlayerRifle17IsAutoBoltAllowedEv", 0x0631632C)
     if sym and not IsNull(sym) then
