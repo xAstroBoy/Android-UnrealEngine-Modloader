@@ -62,6 +62,14 @@ GAMES = {
         "label": "Hand Boi",
         "aliases": ["hb", "hand", "capricia"],
     },
+    "puzzling": {
+        "pkg": "com.RealitiesIO.puzzlingPlaces",
+        "src": "puzzling",
+        "label": "Puzzling Places",
+        "aliases": ["puzzlingplaces", "puzzle", "realities"],
+        # UE game (libUnreal.so); VR app -> explicit GameActivity like PFX.
+        "activity": "com.epicgames.unreal.GameActivity",
+    },
 }
 
 # Storage model (see memory: lsposed-storage-appop-gotcha).
@@ -313,17 +321,44 @@ def _mirror_script(pkg):
 
 
 def ensure_mirror(game=None):
-    """Idempotently (re)establish the public→scoped bind in the global mount
-    namespace (su -M) so a running game sees the public store. Returns a short
-    status string ('ALREADY-BOUND' / 'BOUND-NOW' / 'BIND-FAILED: ...')."""
+    """Idempotently (re)establish the public→scoped bind so the modloader's scoped
+    data dir IS /sdcard/UnrealModloader/<pkg>. Returns 'ALREADY-BOUND' /
+    'BOUND-NOW' / 'BIND-FAILED: ...'.
+
+    Use a PLAIN root mount (su -c), not `su -M`. Verified on-device: binding
+    /data/media/0/UnrealModloader/<pkg> over /data/media/0/Android/data/<pkg>/
+    files/modloader works because those are the REAL ext4 paths (not the FUSE
+    /sdcard view), and the kernel propagates the mount to the other namespaces
+    (/mnt/installer/0/..., /mnt/androidwritable/0/...) on its own — so the app
+    sees it through FUSE with no mount-master trickery. `su -M` was only ever
+    needed to reach an already-running app and is what used to HANG, which is why
+    a previous pass replaced this bind with a copy (sync_scoped) and let the two
+    stores silently diverge. Bind while the game is STOPPED (game_launch
+    force-stops first) and it is reliable; keep su -M purely as a last resort for
+    a live process.
+    """
     _, info = resolve_game(game)
-    r = run_device_script(_mirror_script(info["pkg"]), magic_mount=True, timeout=60)
-    out = (r["stdout"] or "").strip()
+    try:
+        r = run_device_script(_mirror_script(info["pkg"]), root=True, timeout=60)
+        out = (r["stdout"] or "").strip()
+    except AdbError as e:
+        out = ""
     if "ALREADY-BOUND" in out:
         return "ALREADY-BOUND"
     if "BOUND-NOW" in out:
         return "BOUND-NOW"
-    return "BIND-FAILED: %s" % (out or (r["stderr"] or "").strip() or "unknown")
+    # Last resort: the game is live and holds its own mount namespace.
+    try:
+        r = run_device_script(_mirror_script(info["pkg"]), magic_mount=True, timeout=45)
+        out2 = (r["stdout"] or "").strip()
+        if "ALREADY-BOUND" in out2:
+            return "ALREADY-BOUND"
+        if "BOUND-NOW" in out2:
+            return "BOUND-NOW (su -M)"
+        out = out2 or out
+    except AdbError as e:
+        out = out or str(e)
+    return "BIND-FAILED: %s" % (out or "unknown")
 
 
 def _sync_script(pkg):
@@ -351,8 +386,15 @@ def _sync_script(pkg):
 
 
 def sync_scoped(game=None):
-    """Copy the public store's mods into the scoped path the modloader reads.
-    Fast (`su -c`, no bind, no hang). Returns e.g. 'SYNCED:13' or an error."""
+    """DEPRECATED — do not use. Kept only as an emergency fallback.
+
+    This copied public->scoped instead of binding, which means the two stores are
+    SEPARATE directories that silently diverge: the game writes its log/SDK into
+    scoped, deploys land in one or the other, and you end up debugging a stale
+    mod set (exactly what happened — public had a Dec-21 EnemyFixes_P.pak and 1
+    pak while scoped had the live 62). Use ensure_mirror(): the bind makes the
+    scoped path BE /sdcard/UnrealModloader/<pkg>, so there is only ever one store.
+    """
     _, info = resolve_game(game)
     try:
         r = run_device_script(_sync_script(info["pkg"]), root=True, timeout=60)
@@ -581,10 +623,28 @@ def _luaval(v):
     return "nil" if v is None else repr(float(v)) if isinstance(v, float) else str(v)
 
 
+def _native_or_lua(payload, lua_fallback, timeout=15):
+    """Prefer a native bridge command (runs on the socket thread — works even
+    while the game thread is frozen: headset off / cutscene stall). If the
+    running modloader is older and doesn't know the command, transparently fall
+    back to the exec_lua implementation so the tool still works either way."""
+    try:
+        reply = bridge_send(payload, timeout=timeout)
+    except AdbError as e:
+        return "ERROR: %s" % e
+    if isinstance(reply, dict) and not reply.get("ok"):
+        err = str(reply.get("error", ""))
+        if "unknown command" in err:
+            return bridge_exec_lua(lua_fallback, timeout=timeout)
+    return _fmt_bridge(reply)
+
+
 @mcp.tool()
 def mem_read(addr: str, type: str = "u64") -> str:
     """Read a typed value from memory (via /proc/self/mem — works on protected/
-    PROT_NONE pages). type: u8/u16/u32/u64/i32/f32."""
+    PROT_NONE pages). type: u8/u16/u32/u64/i32/f32. Runs NATIVELY on the bridge
+    socket thread, so it works even while the game thread is frozen (headset off
+    / cutscene stall)."""
     a = _addr(addr)
     lua = ("local a=" + str(a) + "; local t='" + type + "'; local v;"
            "if t=='u64' or t=='i64' then v=MemReadU64(a)"
@@ -595,12 +655,14 @@ def mem_read(addr: str, type: str = "u64") -> str:
            " elseif t=='f32' then v=MemReadFloat(a)"
            " else v=MemReadU64(a) end;"
            "return string.format('0x%X = %s (%s)', a, tostring(v), t)")
-    return bridge_exec_lua(lua)
+    return _native_or_lua({"cmd": "mem_read", "addr": str(a), "type": type}, lua)
 
 
 @mcp.tool()
 def mem_write(addr: str, value: float, type: str = "u64") -> str:
-    """Write a typed value to memory. type: u8/u16/u32/u64/f32. Returns ok/fail."""
+    """Write a typed value to memory. type: u8/u16/u32/u64/f32. Returns ok/fail.
+    Runs NATIVELY on the bridge socket thread (works while the game thread is
+    frozen)."""
     a = _addr(addr)
     lua = ("local a=" + str(a) + "; local t='" + type + "'; local v=" + str(value) + "; local ok;"
            "if t=='u32' or t=='i32' then ok=MemWriteU32(a,v)"
@@ -609,24 +671,29 @@ def mem_write(addr: str, value: float, type: str = "u64") -> str:
            " elseif t=='f32' then ok=MemWriteFloat(a,v)"
            " else ok=MemWriteU64(a,v) end;"
            "return string.format('write 0x%X = %s (%s) -> %s', a, tostring(v), t, tostring(ok))")
-    return bridge_exec_lua(lua)
+    return _native_or_lua(
+        {"cmd": "mem_write", "addr": str(a), "type": type, "value": str(value)}, lua)
 
 
 @mcp.tool()
 def mem_read_bytes(addr: str, length: int = 32) -> str:
-    """Read `length` bytes (max 4096) at addr → lowercase hex string."""
+    """Read `length` bytes (max 4096) at addr → lowercase hex string. Runs
+    NATIVELY (works while the game thread is frozen)."""
     a = _addr(addr)
-    return bridge_exec_lua("return MemReadBytes(" + str(a) + ", " + str(int(length)) + ")")
+    lua = "return MemReadBytes(" + str(a) + ", " + str(int(length)) + ")"
+    return _native_or_lua(
+        {"cmd": "mem_read_bytes", "addr": str(a), "len": int(length)}, lua)
 
 
 @mcp.tool()
 def mem_regions(filter: str = "") -> str:
     """List process memory regions (/proc/self/maps): start/end/size/perms/path.
-    Optional substring filter (e.g. 'libUnreal.so', 'heap')."""
+    Optional substring filter (e.g. 'libUnreal.so', 'heap'). Runs NATIVELY (works
+    while the game thread is frozen)."""
     lua = ("local r=MemRegions(" + ("'" + filter + "'" if filter else "nil") + "); local o={};"
            "for i,x in ipairs(r) do o[#o+1]=string.format('0x%X-0x%X %s %-9d %s', x.start, x['end'], x.perms, x.size, x.path) end;"
            "return tostring(#r)..' regions\\n'..table.concat(o,'\\n')")
-    return bridge_exec_lua(lua)
+    return _native_or_lua({"cmd": "mem_regions", "filter": filter}, lua)
 
 
 @mcp.tool()
@@ -641,8 +708,10 @@ def sym_addr(addr: str) -> str:
 
 @mcp.tool()
 def module_base(name: str = "libUnreal.so") -> str:
-    """Get a module's load base (lowest mapping). runtime_addr = base + IDA_RVA."""
-    return bridge_exec_lua("return string.format('0x%X', ModuleBase('" + name + "'))")
+    """Get a module's load base (lowest mapping). runtime_addr = base + IDA_RVA.
+    Runs NATIVELY (works while the game thread is frozen)."""
+    lua = "return string.format('0x%X', ModuleBase('" + name + "'))"
+    return _native_or_lua({"cmd": "module_base", "name": name}, lua)
 
 
 @mcp.tool()
@@ -1004,12 +1073,12 @@ def deploy_mods(game: str = "", mod: str = "", hot: bool = True) -> str:
     for name, err in failed:
         lines.append("  FAIL %s: %s" % (name, err))
 
-    # Copy the pushed mods from the public store INTO the scoped path the
-    # modloader actually reads (world-readable). Replaces the old `su -M` bind
-    # mirror, which is invisible to a running game and hangs.
+    # We pushed straight into the PUBLIC store. With the bind mirror active that
+    # IS the scoped path the modloader reads, so there is nothing to copy — just
+    # make sure the bind exists (idempotent; returns ALREADY-BOUND normally).
     if pushed:
-        mstat = sync_scoped(key)
-        lines.append("scoped-sync: %s" % mstat)
+        mstat = ensure_mirror(key)
+        lines.append("mirror: %s" % mstat)
 
     if hot and pushed:
         lines.append("--- hot-reload ---")
@@ -1098,9 +1167,9 @@ def install_mod(game: str = "", source: str = "", name: str = "", enable: bool =
     if r["rc"] != 0:
         return "%sERROR pushing mod: %s" % (warn, (r["stderr"] or r["stdout"] or "").strip())
 
-    mstat = sync_scoped(key)
+    mstat = ensure_mirror(key)
     lines = ["%sinstalled %s -> %s%s/" % (warn, mod_name, remote_mods, mod_name),
-             "scoped-sync: %s" % mstat]
+             "mirror: %s" % mstat]
     if enable:
         try:
             ensure_forward()
@@ -1141,8 +1210,9 @@ def uninstall_mod(game: str = "", name: str = "", purge_scoped: bool = True) -> 
         scoped_path = "%s/mods/%s" % (scoped_data_dir(key), name)
         adb_shell_root('rm -rf "%s"' % scoped_path)
         lines.append("purged scoped: %s" % scoped_path)
-    # Refresh scoped so the game's on-disk view matches the public store.
-    lines.append("scoped-sync: %s" % sync_scoped(key))
+    # With the bind mirror active the public store IS the game's view, so the
+    # removal above is already visible — just assert the bind is up.
+    lines.append("mirror: %s" % ensure_mirror(key))
     # Is it still loaded in memory?
     try:
         ensure_forward()
@@ -1198,9 +1268,12 @@ def game_launch(game: str = "") -> str:
     pkg = info["pkg"]
     adb_shell("am force-stop %s" % pkg, timeout=20)
     time.sleep(0.5)
-    # Refresh scoped <- public BEFORE the app starts so the modloader sees the
-    # latest mods (the bind mirror is unreliable for a running app / after boot).
-    sync_status = sync_scoped(key)
+    # (Re)establish the public->scoped BIND before the app starts. The game is
+    # stopped here, which is exactly when a plain root mount is reliable — so the
+    # modloader's scoped data dir literally IS /sdcard/UnrealModloader/<pkg>:
+    # one store, nothing to copy, nothing to go stale. Bind mounts do not survive
+    # a reboot, hence doing it on every launch.
+    sync_status = ensure_mirror(key)
     act = info.get("activity")
     if act:
         r = adb_shell("am start -n %s/%s" % (pkg, act), timeout=25)

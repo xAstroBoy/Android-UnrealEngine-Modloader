@@ -15,6 +15,7 @@
 #include "modloader/notification.h"
 #include "modloader/lua_dump_generator.h"
 #include "modloader/adb_bridge.h"
+#include "modloader/mod_tracker.h"
 #include "modloader/object_monitor.h"
 #include "modloader/logger.h"
 #include "modloader/paths.h"
@@ -80,6 +81,40 @@ namespace lua_bindings
                 result.arg_types.push_back('f');
         }
         return result;
+    }
+
+    // Derive a native-hook "registrant key" from the calling mod's environment.
+    // Each mod's Lua env carries MOD_NAME (see lua_engine::create_mod_environment),
+    // so native hooks from DIFFERENT mods on the same address get distinct keys
+    // and COEXIST (chain), while the SAME mod re-registering (hot-reload)
+    // REPLACES its own entry. Returns "" when there's no mod env (e.g. bridge
+    // exec_lua) — native_hooks then falls back to the hook name as the key.
+    // `name` is the hook's own label so a single mod can register SEVERAL hooks
+    // on the same address (distinct names) without them replacing each other,
+    // while a reload of the same (mod,name) still lands on the same key.
+    static std::string hook_key_from_env(const sol::this_environment &te, const std::string &name)
+    {
+        if (te.env)
+        {
+            sol::optional<std::string> mn = (*te.env)["MOD_NAME"];
+            if (mn && !mn->empty())
+                return *mn + ":" + name;
+        }
+        return std::string(); // no mod env → native_hooks falls back to `name`
+    }
+
+    // Just the MOD_NAME ("" when there is no mod env, e.g. bridge exec_lua).
+    // Used to attribute PE hooks / commands / code patches to a mod so
+    // disable/unload can tear them down via mod_tracker.
+    static std::string mod_from_env(const sol::this_environment &te)
+    {
+        if (te.env)
+        {
+            sol::optional<std::string> mn = (*te.env)["MOD_NAME"];
+            if (mn && !mn->empty())
+                return *mn;
+        }
+        return std::string();
     }
 
     // ═══ Path normalization helpers ═════════════════════════════════════════
@@ -618,7 +653,7 @@ namespace lua_bindings
         // This is dramatically faster than the old global post-hook approach which
         // fired Lua on EVERY single ProcessEvent call.
         // callback(newObject) — receives the newly created UObject.
-        lua.set_function("NotifyOnNewObject", [](sol::this_state ts, sol::object class_obj, sol::object cb_obj) -> uint64_t
+        lua.set_function("NotifyOnNewObject", [](sol::this_state ts, sol::this_environment te, sol::object class_obj, sol::object cb_obj) -> uint64_t
                          {
         // Validate arguments — MUST NOT crash on nil/wrong types
         if (!class_obj.is<std::string>()) {
@@ -672,7 +707,7 @@ namespace lua_bindings
 
         // Also hook native BeginPlay as fallback for C++ actors
         std::string native_path = cls_filter + ":BeginPlay";
-        pe_hook::register_post(native_path,
+        auto native_id = pe_hook::register_post(native_path,
             [cls_filter, callback](ue::UObject* self, ue::UFunction* func, void* parms) {
                 if (!self) return;
                 ue::UClass* cls = ue::uobj_get_class(self);
@@ -698,6 +733,9 @@ namespace lua_bindings
                 }
             });
 
+        std::string owning_mod = mod_from_env(te);
+        mod_tracker::track_pe_hook(owning_mod, bp_id);
+        mod_tracker::track_pe_hook(owning_mod, native_id);
         logger::log_info("LUA", "NotifyOnNewObject: %s -> targeted hooks on ReceiveBeginPlay + BeginPlay",
                          cls_filter.c_str());
         return bp_id; });
@@ -1321,9 +1359,10 @@ namespace lua_bindings
         // Registers BOTH pre and post hooks. Callback fires on POST.
         // Pre-hook is a no-op by default but can be accessed via the PreId.
         // Callback signature: function(Context, ...) where Context:get() → self UObject
-        lua.set_function("RegisterHook", [](sol::this_state ts, sol::object path_obj, sol::object cb_obj) -> std::tuple<uint64_t, uint64_t>
+        lua.set_function("RegisterHook", [](sol::this_state ts, sol::this_environment te, sol::object path_obj, sol::object cb_obj) -> std::tuple<uint64_t, uint64_t>
                          {
         sol::state_view lua(ts);
+        std::string owning_mod = mod_from_env(te);
 
         // Validate arguments — MUST NOT crash on nil/wrong types
         if (!path_obj.is<std::string>()) {
@@ -1373,6 +1412,8 @@ namespace lua_bindings
                 }
             });
 
+        mod_tracker::track_pe_hook(owning_mod, pre_id);
+        mod_tracker::track_pe_hook(owning_mod, post_id);
         logger::log_info("LUA", "RegisterHook: %s -> PreId=%lu PostId=%lu",
                          func_path.c_str(), (unsigned long)pre_id, (unsigned long)post_id);
         return std::make_tuple(pre_id, post_id); });
@@ -1383,11 +1424,13 @@ namespace lua_bindings
         // NOTE: Uses sol::object instead of sol::optional<sol::function> because sol2
         // misparses optional<function> when nil is passed before a valid function arg.
         // This was causing ALL post-only hooks to silently not register.
-        lua.set_function("RegisterProcessEventHook", [](const std::string &raw_class,
+        lua.set_function("RegisterProcessEventHook", [](sol::this_environment te,
+                                                        const std::string &raw_class,
                                                         const std::string &func_name,
                                                         sol::object pre_obj,
                                                         sol::object post_obj)
                          {
+        std::string owning_mod = mod_from_env(te);
         std::string class_name = normalize_class_name(raw_class);
         std::string func_path = class_name + ":" + func_name;
         if (class_name != raw_class) {
@@ -1397,7 +1440,7 @@ namespace lua_bindings
 
         if (pre_obj.is<sol::function>()) {
             sol::function pre_fn = pre_obj.as<sol::function>();
-            pe_hook::register_pre(func_path,
+            mod_tracker::track_pe_hook(owning_mod, pe_hook::register_pre(func_path,
                 [pre_fn, func_path](ue::UObject* self, ue::UFunction* func, void* parms) -> bool {
                     lua_uobject::LuaUObject wrapped;
                     wrapped.ptr = self;
@@ -1416,22 +1459,22 @@ namespace lua_bindings
                                           func_path.c_str(), err.what());
                     }
                     return false;
-                });
+                }));
         }
 
         if (post_obj.is<sol::function>()) {
             sol::function post_fn = post_obj.as<sol::function>();
-            pe_hook::register_post(func_path,
+            mod_tracker::track_pe_hook(owning_mod, pe_hook::register_post(func_path,
                 [post_fn, func_path](ue::UObject* self, ue::UFunction* func, void* parms) {
                     lua_uobject::LuaUObject wrapped;
                     wrapped.ptr = self;
                     post_fn(wrapped, sol::lightuserdata_value(parms));
-                });
+                }));
         }
 
         logger::log_info("LUA", "RegisterProcessEventHook: %s", func_path.c_str()); });
 
-        lua.set_function("RegisterPreHook", [](sol::this_state ts, sol::object path_obj, sol::object cb_obj) -> uint64_t
+        lua.set_function("RegisterPreHook", [](sol::this_state ts, sol::this_environment te, sol::object path_obj, sol::object cb_obj) -> uint64_t
                          {
         // Validate arguments — MUST NOT crash on nil/wrong types
         if (!path_obj.is<std::string>()) {
@@ -1471,11 +1514,12 @@ namespace lua_bindings
             }
             return false;
         });
+        mod_tracker::track_pe_hook(mod_from_env(te), id);
         logger::log_info("LUA", "RegisterPreHook: %s -> Id=%lu",
                          func_path.c_str(), (unsigned long)id);
         return id; });
 
-        lua.set_function("RegisterPostHook", [](sol::this_state ts, sol::object path_obj, sol::object cb_obj) -> uint64_t
+        lua.set_function("RegisterPostHook", [](sol::this_state ts, sol::this_environment te, sol::object path_obj, sol::object cb_obj) -> uint64_t
                          {
         // Validate arguments — MUST NOT crash on nil/wrong types
         if (!path_obj.is<std::string>()) {
@@ -1506,12 +1550,15 @@ namespace lua_bindings
                                   func_path.c_str(), err.what());
             }
         });
+        mod_tracker::track_pe_hook(mod_from_env(te), id);
         logger::log_info("LUA", "RegisterPostHook: %s -> Id=%lu",
                          func_path.c_str(), (unsigned long)id);
         return id; });
 
         lua.set_function("UnregisterHook", [](uint64_t id)
-                         { pe_hook::unregister(id); });
+                         {
+        pe_hook::unregister(id);
+        mod_tracker::untrack_pe_hook(id); });
 
         // ── Native hooks (Dobby) ────────────────────────────────────────────
         // Signature string format (optional 4th parameter):
@@ -1532,7 +1579,7 @@ namespace lua_bindings
         // Helper: parse signature into arg types and return type
         // (NativeHookSig struct and parse_native_hook_sig defined at namespace scope above)
 
-        lua.set_function("RegisterNativeHook", [](const std::string &symbol_name, sol::object pre_obj, sol::object post_obj, sol::optional<std::string> sig_str) -> bool
+        lua.set_function("RegisterNativeHook", [](sol::this_environment te, const std::string &symbol_name, sol::object pre_obj, sol::object post_obj, sol::optional<std::string> sig_str) -> bool
                          {
 
         // Parse signature if provided
@@ -1781,13 +1828,13 @@ namespace lua_bindings
             };
         }
 
-        return native_hooks::install(symbol_name, pre_cb, post_cb); });
+        return native_hooks::install(symbol_name, pre_cb, post_cb, hook_key_from_env(te, symbol_name)); });
 
         // ── RegisterNativeHookAt — hook at a resolved address (lightuserdata) ─
         // Same as RegisterNativeHook but first arg is a lightuserdata address
         // (e.g. from Resolve()) and second arg is a string label for logging.
         // Signature: RegisterNativeHookAt(addr, name, pre, post, sig?)
-        lua.set_function("RegisterNativeHookAt", [](void *addr, const std::string &hook_name, sol::object pre_obj, sol::object post_obj, sol::optional<std::string> sig_str) -> bool
+        lua.set_function("RegisterNativeHookAt", [](sol::this_environment te, void *addr, const std::string &hook_name, sol::object pre_obj, sol::object post_obj, sol::optional<std::string> sig_str) -> bool
                          {
         if (!addr) {
             logger::log_error("LUA", "RegisterNativeHookAt: null address for '%s'", hook_name.c_str());
@@ -1964,7 +2011,7 @@ namespace lua_bindings
             };
         }
 
-        return native_hooks::install_at(addr, hook_name, pre_cb, post_cb); });
+        return native_hooks::install_at(addr, hook_name, pre_cb, post_cb, hook_key_from_env(te, hook_name)); });
 
         // ── RegisterNativeArgFilter — a PURE-C++ hook (no Lua callback) ──────
         // On every call to `addr`, read a u32 field at (argN + field_off); if it
@@ -1977,7 +2024,7 @@ namespace lua_bindings
         // Sig: RegisterNativeArgFilter(addr, name, argIdx, fieldOff, matchVal,
         //                              clearOff, clearSize?, enablePtr?)
         lua.set_function("RegisterNativeArgFilter",
-            [](void* addr, const std::string& name, int arg_index, int64_t field_off,
+            [](sol::this_environment te, void* addr, const std::string& name, int arg_index, int64_t field_off,
                uint32_t match_value, int64_t clear_off, sol::optional<int> clear_size_opt,
                sol::optional<void*> enable_ptr_opt) -> bool
         {
@@ -2006,11 +2053,73 @@ namespace lua_bindings
                     default: *reinterpret_cast<uint8_t*>(cp)  = 0; break;
                 }
             };
-            bool ok = native_hooks::install_at(addr, name, pre, nullptr) != 0;
+            bool ok = native_hooks::install_at(addr, name, pre, nullptr, hook_key_from_env(te, name)) != 0;
             logger::log_info("LUA", "RegisterNativeArgFilter '%s' @%p arg%d (+%lld)==%u -> zero(+%lld) sz%d : %s",
                              name.c_str(), addr, arg_index, (long long)field_off, match_value,
                              (long long)clear_off, clear_size, ok ? "OK" : "FAIL");
             return ok;
+        });
+
+        // ── InstallClothBoneSanitizer — PURE-C++ cut-content cloth guard ────
+        // Hooks PenClothSet(cModel*, CLOTH_INFO*, float). Before each call it
+        // rewrites any cloth bone index the model can't resolve (getPartsPtr
+        // walks off a ported/short skeleton) to the 0xFF "skip" sentinel, so
+        // cut enemies (em3f/Saddler-Ada) render with live cloth on the bones
+        // they DO have instead of crashing at null+0x1d8. Pure C++ — safe on
+        // the game thread (no Lua callback to race the shared lua_State).
+        // Sig: InstallClothBoneSanitizer(penClothSetAddr) -> bool
+        lua.set_function("InstallClothBoneSanitizer", [](void* addr) -> bool {
+            return native_hooks::install_cloth_bone_sanitizer(addr) != 0;
+        });
+
+        // ── InstallModelRestore — cut-enemy visible-model restore ───────────
+        // Hooks a cEmXX::move (e.g. cEm3f::move) and injects the VR4ModelInit
+        // that the cut enemy's init omits, so it spawns a visible AVR4Model.
+        // Pure C++, native pointers (no MTE-tag mangle). Self-guards on cModel
+        // +988 → no-op for enemies that already build their own UE model.
+        // Sig: InstallModelRestore(cEmMoveAddr) -> bool
+        lua.set_function("InstallModelRestore", [](void* addr) -> bool {
+            return native_hooks::install_model_restore(addr) != 0;
+        });
+
+        // ── AddEm3fMeshPathFix — repair em3f_meshTable's broken MeshRefs ────
+        // Its plaga-sourced rows (em3f_008/009/094) point at
+        // .../EM/em25_plaga/Geometry/<mesh> but the assets are packed at
+        // .../BOSS/em30_Saddler/Geometry/<mesh>, so TryLoad returns null and those
+        // parts get NO mesh (only the plaga attack particles render). Register the
+        // row's OffsetKey + the FName comparison index of the CORRECT path;
+        // model_restore repoints the cached MeshRef after TryCacheMap so the game's
+        // own loader resolves it. Re-registering a key updates it.
+        // Sig: AddEm3fMeshPathFix(offsetKey, FName(correctPath):GetComparisonIndex())
+        lua.set_function("AddEm3fMeshPathFix", [](uint32_t key, int32_t idx) {
+            native_hooks::add_em3f_mesh_path_fix(key, idx);
+        });
+
+        // ── InstallCrashGuard — sigsetjmp safe-call guard on ONE function ───
+        // Installs a callback-less hook so dispatch_full() runs the original
+        // inside the sigsetjmp guard: a SIGSEGV in it recovers (returns 0)
+        // instead of killing the game. The built-in guard table is skipped on
+        // RE4 (guarding the render path black-screens VR), so crashy functions
+        // must be guarded individually. E.g. cModel::initJoint, which faults
+        // when the cut police NPC (em07/PL07) spawns with no native model data.
+        // Sig: InstallCrashGuard(addr, "name") -> bool
+        lua.set_function("InstallCrashGuard", [](void* addr, const std::string& name) -> bool {
+            return native_hooks::install_safe_call_guard(addr, name.c_str()) != 0;
+        });
+
+        // ── InstallCutVillagerFix — make the CUT GANADO VILLAGERS spawn ─────
+        // Not a guard — it repairs the one thing the port left unfinished.
+        // em ids 6/7/8/0xA/0xB/0xD/0x33/0x37 are villager variants that SHARE
+        // em10.das with id 9 (proof: em07/em08/em09/em10_meshTable in
+        // EnemyFixes_P.pak are all 132 rows and identical), but ArmEmCallProlog has
+        // no case for them, so it returns 0 and leaves the GLOBAL EmInitFunc stale;
+        // cEmMgr::construct then runs the PREVIOUS enemy's init over ganado data
+        // => cModel::initJoint SIGSEGV. Since ids 9/0x10 use the same archive and
+        // work, we patch the switch's jump table to give each cut id the id-9 case
+        // (_prologEm09) — same archive, same layout, and they get REAL ganado AI.
+        // Sig: InstallCutVillagerFix() -> bool
+        lua.set_function("InstallCutVillagerFix", []() -> bool {
+            return native_hooks::install_cut_villager_fix();
         });
 
         // ── RegisterNativeCapture — a PURE-C++ hook (no Lua callback) ───────
@@ -2028,7 +2137,7 @@ namespace lua_bindings
         // dereference of the captured object happens later, safely, on the game
         // thread. Sig: RegisterNativeCapture(addr,name,argIdx,destPtr,minHeap?,maxHeap?)
         lua.set_function("RegisterNativeCapture",
-            [](void* addr, const std::string& name, int arg_index, void* dest_ptr,
+            [](sol::this_environment te, void* addr, const std::string& name, int arg_index, void* dest_ptr,
                sol::optional<double> min_heap_opt, sol::optional<double> max_heap_opt) -> bool
         {
             if (!addr || arg_index < 0 || arg_index > 7 || !dest_ptr) {
@@ -2055,7 +2164,7 @@ namespace lua_bindings
                 if (max_heap && argp >= max_heap) return;
                 *reinterpret_cast<volatile uint64_t*>(dest) = argp;
             };
-            bool ok = native_hooks::install_at(addr, name, pre, nullptr) != 0;
+            bool ok = native_hooks::install_at(addr, name, pre, nullptr, hook_key_from_env(te, name)) != 0;
             logger::log_info("LUA", "RegisterNativeCapture '%s' @%p arg%d -> [%p] heap[0x%llx,0x%llx) : %s",
                              name.c_str(), addr, arg_index, dest,
                              (unsigned long long)min_heap, (unsigned long long)max_heap, ok ? "OK" : "FAIL");
@@ -2117,9 +2226,12 @@ namespace lua_bindings
         return sol::lightuserdata_value(val); });
 
         // ALL Write functions use msync page probe — prevents writes to junk/freed memory
-        lua.set_function("WriteU8", [](void *addr, int val)
+        // Writes landing in EXECUTABLE mappings are recorded (original bytes) in
+        // mod_tracker so disabling/unloading the mod restores the original code.
+        lua.set_function("WriteU8", [](sol::this_environment te, void *addr, int val)
                          {
         if (!ue::is_mapped_ptr(addr)) return;
+        mod_tracker::note_code_write(mod_from_env(te), addr, 1);
         void* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) & ~0xFFFULL);
         mprotect(page, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
         *reinterpret_cast<uint8_t*>(addr) = static_cast<uint8_t>(val);
@@ -2128,9 +2240,10 @@ namespace lua_bindings
             reinterpret_cast<char*>(addr) + 1
         ); });
 
-        lua.set_function("WriteU16", [](void *addr, int val)
+        lua.set_function("WriteU16", [](sol::this_environment te, void *addr, int val)
                          {
         if (!ue::is_mapped_ptr(addr)) return;
+        mod_tracker::note_code_write(mod_from_env(te), addr, 2);
         void* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) & ~0xFFFULL);
         mprotect(page, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
         *reinterpret_cast<uint16_t*>(addr) = static_cast<uint16_t>(val);
@@ -2139,9 +2252,10 @@ namespace lua_bindings
             reinterpret_cast<char*>(addr) + 2
         ); });
 
-        lua.set_function("WriteU32", [](void *addr, uint32_t val)
+        lua.set_function("WriteU32", [](sol::this_environment te, void *addr, uint32_t val)
                          {
         if (!ue::is_mapped_ptr(addr)) return;
+        mod_tracker::note_code_write(mod_from_env(te), addr, 4);
         // Need to make memory writable for code patches
         void* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) & ~0xFFFULL);
         mprotect(page, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
@@ -2152,9 +2266,10 @@ namespace lua_bindings
             reinterpret_cast<char*>(addr) + 4
         ); });
 
-        lua.set_function("WriteU64", [](void *addr, double val)
+        lua.set_function("WriteU64", [](sol::this_environment te, void *addr, double val)
                          {
         if (!ue::is_mapped_ptr(addr)) return;
+        mod_tracker::note_code_write(mod_from_env(te), addr, 8);
         void* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) & ~0xFFFULL);
         mprotect(page, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
         *reinterpret_cast<uint64_t*>(addr) = static_cast<uint64_t>(val);
@@ -2173,9 +2288,10 @@ namespace lua_bindings
         if (!ue::is_mapped_ptr(addr)) return;
         *reinterpret_cast<double*>(addr) = val; });
 
-        lua.set_function("WritePtr", [](void *addr, void *val)
+        lua.set_function("WritePtr", [](sol::this_environment te, void *addr, void *val)
                          {
         if (!ue::is_mapped_ptr(addr)) return;
+        mod_tracker::note_code_write(mod_from_env(te), addr, 8);
         void* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) & ~0xFFFULL);
         mprotect(page, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
         *reinterpret_cast<void**>(addr) = val;
@@ -2714,8 +2830,9 @@ namespace lua_bindings
         return sol::lightuserdata_value(mem); });
 
         // ── ADB command registration ────────────────────────────────────────
-        lua.set_function("RegisterCommand", [](const std::string &name, sol::function callback)
+        lua.set_function("RegisterCommand", [](sol::this_environment te, const std::string &name, sol::function callback)
                          {
+        mod_tracker::track_command(mod_from_env(te), name);
         adb_bridge::register_command(name, [callback](const std::string& args) -> std::string {
             sol::protected_function_result result;
             if (args.empty()) {
@@ -2732,6 +2849,77 @@ namespace lua_bindings
             return std::string("ok");
         });
         logger::log_info("LUA", "RegisterCommand: '%s'", name.c_str()); });
+
+        // ── RegisterBridgeCommand — like RegisterCommand, but the callback may
+        //    RETURN a table (serialized to JSON for the reply) and RECEIVE its
+        //    args as a parsed Lua table (from the request's JSON params) instead
+        //    of a raw string. Used by DebugMenuAPI (debugmenu_status/pages/toggle
+        //    etc.). Registers into the SAME bridge dispatch as RegisterCommand.
+        lua.set_function("RegisterBridgeCommand", [](sol::this_state /*ts*/, sol::this_environment te, const std::string &name, sol::function callback)
+                         {
+        mod_tracker::track_command(mod_from_env(te), name);
+        adb_bridge::register_command(name, [callback](const std::string& args) -> std::string {
+            sol::state_view L(callback.lua_state());
+
+            // JSON string → Lua value (nil/bool/number/string/array/object)
+            std::function<sol::object(const nlohmann::json&)> json_to_lua;
+            json_to_lua = [&](const nlohmann::json& v) -> sol::object {
+                if (v.is_boolean())        return sol::make_object(L, v.get<bool>());
+                if (v.is_number_integer()) return sol::make_object(L, v.get<int64_t>());
+                if (v.is_number())         return sol::make_object(L, v.get<double>());
+                if (v.is_string())         return sol::make_object(L, v.get<std::string>());
+                if (v.is_array())  { sol::table t = L.create_table(); int i = 1; for (auto& e : v) t[i++] = json_to_lua(e); return t; }
+                if (v.is_object()) { sol::table t = L.create_table(); for (auto it = v.begin(); it != v.end(); ++it) t[it.key()] = json_to_lua(it.value()); return t; }
+                return sol::make_object(L, sol::nil);
+            };
+
+            // Lua value → JSON (bool/number/string/table)
+            std::function<nlohmann::json(const sol::object&)> lua_to_json;
+            lua_to_json = [&](const sol::object& obj) -> nlohmann::json {
+                switch (obj.get_type()) {
+                    case sol::type::boolean: return obj.as<bool>();
+                    case sol::type::number: {
+                        double d = obj.as<double>(); int64_t i = static_cast<int64_t>(d);
+                        return (static_cast<double>(i) == d) ? nlohmann::json(i) : nlohmann::json(d);
+                    }
+                    case sol::type::string: return obj.as<std::string>();
+                    case sol::type::table: {
+                        sol::table t = obj.as<sol::table>();
+                        bool is_array = true; int expected = 1;
+                        for (auto& kv : t) { if (kv.first.get_type() != sol::type::number || kv.first.as<int>() != expected) { is_array = false; break; } expected++; }
+                        if (is_array && expected > 1) { nlohmann::json a = nlohmann::json::array(); for (auto& kv : t) a.push_back(lua_to_json(kv.second)); return a; }
+                        nlohmann::json o = nlohmann::json::object();
+                        for (auto& kv : t) {
+                            std::string key;
+                            if (kv.first.get_type() == sol::type::string) key = kv.first.as<std::string>();
+                            else if (kv.first.get_type() == sol::type::number) key = std::to_string(kv.first.as<int>());
+                            else continue;
+                            o[key] = lua_to_json(kv.second);
+                        }
+                        return o;
+                    }
+                    default: return nullptr;
+                }
+            };
+
+            sol::protected_function_result result;
+            if (!args.empty()) {
+                nlohmann::json j = nlohmann::json::parse(args, nullptr, false);
+                result = j.is_discarded() ? callback(args) : callback(json_to_lua(j));
+            } else {
+                result = callback();
+            }
+
+            if (!result.valid()) {
+                sol::error err = result;
+                return std::string("{\"ok\":false,\"error\":\"") + err.what() + "\"}";
+            }
+            if (result.return_count() == 0) return std::string("ok");
+            sol::object r0 = result[0];
+            if (r0.get_type() == sol::type::string) return r0.as<std::string>();
+            return lua_to_json(r0).dump();
+        });
+        logger::log_info("LUA", "RegisterBridgeCommand: '%s'", name.c_str()); });
 
         // ── Debug menu entries (basic implementation) ────────────────────────
         // Stores menu entries for DebugMenuAPI to query

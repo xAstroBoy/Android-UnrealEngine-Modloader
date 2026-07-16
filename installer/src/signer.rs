@@ -273,11 +273,15 @@ fn try_uber_sign(apk: &Path) -> Result<PathBuf> {
 fn run_uber_sign(jar: &Path, apk: &Path) -> Result<PathBuf> {
     let out_dir = apk.parent().unwrap_or(Path::new("."));
 
+    // NOTE: --out and --overwrite are MUTUALLY EXCLUSIVE. Passing both makes
+    // uber-apk-signer bail with "either provide out path or overwrite argument,
+    // cannot process both" — which silently demoted us to the jarsigner fallback
+    // and produced a v1-ONLY APK that Quest may refuse to install. We use --out
+    // and locate the produced *-debugSigned.apk below.
     let output = Command::new("java")
         .arg("-jar").arg(jar)
         .arg("--apks").arg(apk)
         .arg("--out").arg(out_dir)
-        .arg("--overwrite")
         .output()
         .context("uber-apk-signer")?;
 
