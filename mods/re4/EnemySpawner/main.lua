@@ -1321,7 +1321,29 @@ V("Init: nativeReady=%s", tostring(nativeReady))
 -- Applies from the NEXT level load, since that is when the pool is (re)allocated.
 -- The engine still has its own per-type AI/anim budgets — this raises the
 -- ceiling, it does not promise 100 ganados will path or render nicely.
-local POOL_MULT = 4
+-- ⚠️ DEFAULT 1 (OFF). It was 4, and that is very likely what has been killing the
+-- game. Two things I got wrong when I wrote the comment above:
+--
+-- 1. "scaling n scales the allocation AND the count together" is true of
+--    arrayAlloc ITSELF — and irrelevant. Look at its CALLER:
+--        5f43518  STR XZR, [X20,#(EmMgr+8)]    ; pool ptr = 0   <-- NULLED FIRST
+--        5f43524  BL  ConsGetRoomValue         ; n = the ROOM's authored count
+--        5f43530  BL  cEmMgr::arrayAlloc
+--    and arrayAlloc only frees the old pool `if (*((_QWORD*)this + 1))` — which
+--    gameRoomInit just zeroed. So the engine LEAKS the whole pool every room
+--    load, and x4 leaks four times as much. Death came on ROOM LOAD #4.
+--
+-- 2. `n` is not a generic cap — it is ConsGetRoomValue(), THIS room's authored
+--    enemy count. x4 lets the engine construct up to 240 enemies in a room built
+--    for 60, which also quadruples exposure to the missing-data crash family
+--    (every randomized enemy in a room lacking its data is a potential SIGSEGV).
+--
+-- The last log line before tombstone_00 (a SMASHED RETURN ADDRESS: pc inside the
+-- thread's own NX stack, ACCERR, single frame) was:
+--     [EMPOOL] cEmMgr::arrayAlloc: 60 -> 240 slots (x4)
+-- Set this back to 4 only if crashes persist with it at 1 — i.e. only once the
+-- evidence says it is innocent.
+local POOL_MULT = 1
 if SetEnemyPoolMultiplier then
     pcall(function()
         local ok = SetEnemyPoolMultiplier(POOL_MULT)
