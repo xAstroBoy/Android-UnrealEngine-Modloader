@@ -182,6 +182,24 @@ do
         LogWarn(TAG .. ": InstallNullThisGuard missing — rebuild the modloader")
     end
 
+    -- IKInit(cModel*, MOTION_INFO*) — the game forgot a null check here too:
+    --   PartsPtr = cModel::getPartsPtr(model, motion->partIdx[i]);
+    --   v11 = *(_DWORD *)(PartsPtr + 472);      // 472 = 0x1D8  → fault addr 0x1D8
+    -- getPartsPtr correctly returns NULL when the model has no such bone/part —
+    -- routine for a cut/crossover enemy whose rig doesn't match the motion it was
+    -- handed. Observed: cEm3c::move -> MotionSetCore -> IKInit -> SIGSEGV 0x1d8.
+    -- `this` is NOT null here, so the null-this guard can't help; route it through
+    -- the safe-call guard instead. The circuit breaker means a permanently broken
+    -- IK trips after 8 faults and stops being called — enemies lose IK (foot
+    -- placement), the game keeps its frame rate.
+    if InstallCrashGuard then
+        pcall(function()
+            local a = Resolve("_Z6IKInitP6cModelP11MOTION_INFO", 0x5F53D90)
+            local ok = InstallCrashGuard(a, "IKInit")
+            Log(TAG .. ": crash guard IKInit: " .. (ok and "installed" or "FAILED"))
+        end)
+    end
+
     if InstallEm32SubObjectGuard then
         pcall(function()
             local ok = InstallEm32SubObjectGuard()

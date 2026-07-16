@@ -2171,11 +2171,15 @@ namespace lua_bindings
         // Every other address-taking binding uses void* — match it.
         lua.set_function("InstallDualFireArm", [](void* tryfire, void* itemmgr,
                                                   void* armsearch, void* armfn,
-                                                  sol::optional<uint32_t> wno_off) -> bool {
+                                                  sol::optional<uint32_t> wno_off,
+                                                  sol::optional<void*> pg_addr,
+                                                  sol::optional<uint32_t> armed_off) -> bool {
             return native_hooks::install_dualfire_arm(
                 reinterpret_cast<uintptr_t>(tryfire), reinterpret_cast<uintptr_t>(itemmgr),
                 reinterpret_cast<uintptr_t>(armsearch), reinterpret_cast<uintptr_t>(armfn),
-                wno_off.value_or(3360));
+                wno_off.value_or(3360),
+                reinterpret_cast<uintptr_t>(pg_addr.value_or(nullptr)),
+                armed_off.value_or(0x504C));
         });
         // Sig: SetDualFireEnabled(bool) — flips an atomic; no hook churn.
         lua.set_function("SetDualFireEnabled", [](bool on) {

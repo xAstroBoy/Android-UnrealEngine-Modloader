@@ -344,6 +344,12 @@ local state = {
     -- so it's yours to choose. ON because it's what was asked for; flip it off in
     -- the menu if a specific cutscene misbehaves.
     randomizeCutscenes = true,
+    -- OFF by default: any enemy, anywhere. That is the point of the mod and it
+    -- works — the missing-data cases are handled natively now (null-`this` guards
+    -- on setChain/setReset + the crash-guard circuit breaker), not by refusing to
+    -- pick the enemy. Turn this ON only to restrict picks to the emIds this room
+    -- was authored with, if you ever want a guaranteed-vanilla-safe shuffle.
+    roomScopedCrossover = false,
     enabledEnemies = {},
     swapCount = 0,
 }
@@ -378,6 +384,7 @@ local function saveConfig()
         enabled = state.enabled,
         hpMode = state.hpMode,
         randomizeCutscenes = state.randomizeCutscenes,
+        roomScopedCrossover = state.roomScopedCrossover,
         enabledNames = names,
     })
     invalidatePool()  -- Rebuild cached pool on next pickRandom
@@ -401,6 +408,7 @@ local function loadConfig()
     end
     if cfg.hpMode then state.hpMode = cfg.hpMode end
     if cfg.randomizeCutscenes ~= nil then state.randomizeCutscenes = cfg.randomizeCutscenes end
+    if cfg.roomScopedCrossover ~= nil then state.roomScopedCrossover = cfg.roomScopedCrossover end
     if cfg.enabledNames then
         for name, _ in pairs(state.enabledEnemies) do state.enabledEnemies[name] = false end
         for _, name in ipairs(cfg.enabledNames) do
@@ -607,6 +615,34 @@ local function crossoverAllowed(e)
     return true
 end
 
+-- ── ROOM-SCOPED CROSSOVER — an OPTION, not the default ──────────────────
+--
+-- Any enemy anywhere is the point of this mod, and it works. Do not "fix" that by
+-- restricting the pool — I tried, and it was the wrong call.
+--
+-- The reasoning that led there, and why it was wrong: a room only ships data for
+-- the enemies it was authored with, so an enemy the room never loaded can hit an
+-- unchecked NULL in its per-frame setup —
+--     cEm2d  cEm2d::setReset          fault 0x0d
+--     cEm32  sub_5E49AA0 (SetObj00)   fault 0x180
+--     cEm2b  cObjChain::setChain      fault 0x438
+-- all of them EmSetFromList2 -> cEmXX::move -> NULL + field offset. Those are real
+-- bugs, but the fix belongs where the bug is — in native code:
+--   * InstallNullThisGuard adds the null check the game forgot, at the function
+--     entry (setChain/setReset today, one line for the next one);
+--   * the crash-guard circuit breaker stops calling anything that faults 8 times,
+--     so a permanently broken function can never cost frame rate.
+-- With those, the enemy loses one feature (its cloth, a sub-object) and everything
+-- else keeps working. That is a far better outcome than never spawning it.
+--
+-- CROSSOVER_BLOCK_EMIDS stays for genuinely placement-dependent enemies, and it
+-- should shrink as the native guards improve, not grow.
+--
+-- Turn roomScopedCrossover ON only if you specifically want picks restricted to
+-- the emIds a room was authored with.
+local roomEmIds, roomEmIdsGen = {}, -1
+local roomHasEmId, buildRoomEmIdSet   -- forward: need the EM_LIST helpers below
+
 local function chooseDirectListTarget(origEntry, origEmId, sourceSig)
     local avoidName = nil
     if sourceSig and sourceSig ~= "" then
@@ -615,10 +651,15 @@ local function chooseDirectListTarget(origEntry, origEmId, sourceSig)
 
     if FULL_CROSSOVER then
         local pool = getEnabledPool()
-        -- Drop placement-dependent targets (see CROSSOVER_BLOCK_EMIDS).
+        -- Drop placement-dependent targets (see CROSSOVER_BLOCK_EMIDS), and — by
+        -- default — anything this room never loaded data for (see the note above:
+        -- that is what crashes/lags, not the enemy itself).
         local ok = {}
         for _, e in ipairs(pool) do
-            if crossoverAllowed(e) then ok[#ok + 1] = e end
+            if crossoverAllowed(e)
+               and (not state.roomScopedCrossover or roomHasEmId(e.bytes[1])) then
+                ok[#ok + 1] = e
+            end
         end
         if #ok > 0 then
             -- nil plan => full emId + tail write in applyReplacementToEmListRow
@@ -1153,6 +1194,42 @@ local function getListPtrFromIndex(idx)
     return Offset(pG_ptr, (idx << 5) + 0x549c)
 end
 
+-- Collect the emIds this room was AUTHORED with = exactly the enemies whose data
+-- it loaded. Must run BEFORE we rewrite anything, or we'd read our own picks back
+-- and the set would grow to include enemies the room never had.
+buildRoomEmIdSet = function()
+    local set, n = {}, 0
+    for idx = 0, 254 do
+        pcall(function()
+            local p = getListPtrFromIndex(idx)
+            if p and ptrval(p) ~= 0 then
+                local row = castEmListRow(p)
+                local id = row and row.emId
+                if id and id ~= 0 and not set[id] then
+                    set[id] = true
+                    n = n + 1
+                end
+            end
+        end)
+    end
+    roomEmIds, roomEmIdsGen = set, currentGen
+    local ids = {}
+    for id in pairs(set) do ids[#ids + 1] = id end
+    table.sort(ids)
+    local names = {}
+    for _, id in ipairs(ids) do names[#names + 1] = tostring(id) end
+    Log(TAG .. ": room enemy set (gen " .. currentGen .. "): " .. n
+        .. " emId(s) = " .. (table.concat(names, ","))
+        .. " — crossover picks come from these only (room-scoped)")
+    return set
+end
+
+roomHasEmId = function(id)
+    if not id then return false end
+    if roomEmIdsGen ~= currentGen then buildRoomEmIdSet() end
+    return roomEmIds[id] == true
+end
+
 -- No settle period needed — EmSetEvent is sole randomization hook (no double-randomization risk)
 local SETTLE_CALLS = 0      -- No skip needed (was 5 in old eslPointers architecture)
 local settleCounter = 0     -- Counts down after level change detected (0 = ready)
@@ -1194,6 +1271,12 @@ local function runImmediateFullLevelRewrite(reason, force)
     fullRewriteInFlight = true
     fullLevelRewriteQueued = fullLevelRewriteQueued + 1
     fullRewriteGen = currentGen
+
+    -- Snapshot the room's ORIGINAL enemy set first — after the loop below starts
+    -- writing, the list no longer tells us what the room actually loaded.
+    if state.roomScopedCrossover then
+        pcall(buildRoomEmIdSet)
+    end
 
     local changed = 0
     for idx = 0, 254 do
@@ -1961,6 +2044,8 @@ if SharedAPI then
         getHPMode  = function() return state.hpMode end,
         setHPMode  = function(m) state.hpMode = m; saveConfig() end,
         getRandomizeCutscenes = function() return state.randomizeCutscenes end,
+        getRoomScopedCrossover = function() return state.roomScopedCrossover end,
+        setRoomScopedCrossover = function(v) state.roomScopedCrossover = v; invalidatePool(); saveConfig() end,
         setRandomizeCutscenes = function(v) state.randomizeCutscenes = v; saveConfig() end,
         scramble   = scrambleNow,
         rewriteLevel = function() return queueFullLevelRewrite("sharedapi", true) end,
@@ -2032,6 +2117,16 @@ if SharedAPI and SharedAPI.DebugMenu then
             -- specific scene misbehaves.
             api.AddItem("[" .. (state.randomizeCutscenes and "ON" or "OFF") .. "] Randomize Cutscene Enemies", function()
                 state.randomizeCutscenes = not state.randomizeCutscenes
+                saveConfig()
+                api.Refresh()
+            end)
+
+            -- OFF = pick any enemy anywhere. That is what crashes/lags: a room only
+            -- loads data for its own enemies, and anything else NULL-derefs every
+            -- frame in cEmXX::move.
+            api.AddItem("[" .. (state.roomScopedCrossover and "ON" or "OFF") .. "] Room-Safe Crossover", function()
+                state.roomScopedCrossover = not state.roomScopedCrossover
+                invalidatePool()
                 saveConfig()
                 api.Refresh()
             end)
