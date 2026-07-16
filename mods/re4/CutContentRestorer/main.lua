@@ -221,6 +221,16 @@ do
             -- <- PostBio4Tick, i.e. every frame the laser is on a bad target.
             { sym = "_Z15GetWepTargetPosP3VecS0_jjPP3cEmPj", rva = 0x5EEF4FC,
               name = "GetWepTargetPos (laser sight)" },
+            -- The enemy's SOUND BANK. cEmMgr::construct loads it per spawn:
+            --   ArmLoadSoundBlockEnemy(emId) -> CArmSoundBlock::TryLoadGenericFromDas
+            --   -> ExtractTracksFromXSB -> ExtractTrackIndex -> SEGV_ACCERR
+            -- ACCERR (not MAPERR) = it ran off the END of a buffer: the XSB parser
+            -- walking a sound bank that isn't in this room's archive, which is
+            -- exactly what a crossover enemy has. Sound is not essential — an
+            -- enemy with no voice beats a dead game — and the breaker means a
+            -- permanently missing bank stops being retried after 8 tries.
+            { sym = "_Z22ArmLoadSoundBlockEnemyi", rva = 0x61AAC50,
+              name = "ArmLoadSoundBlockEnemy (enemy sound bank)" },
         }) do
             pcall(function()
                 local a = Resolve(g.sym, g.rva)
