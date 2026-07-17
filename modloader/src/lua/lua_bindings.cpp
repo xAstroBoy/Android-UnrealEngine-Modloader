@@ -2209,6 +2209,24 @@ namespace lua_bindings
             return native_hooks::install_laser_sight_fix(reinterpret_cast<uintptr_t>(site));
         });
 
+        // ── InstallGetPartsPtrGuard — the ROOT of the crossover crash family ──
+        // A scan of every call site in libUE4 says cModel::getPartsPtr has 2420
+        // callers and 1101 of them deref the result with NO null check. That is the
+        // engine's house style ("the part is always there"), and it is why this
+        // family never ends: IKInit derefs +472 (fault 0x1d8), GetWepTargetPos
+        // derefs +0x80, cModel::setParent dies at +0x108 — which is getPartsPtr's
+        // OWN list walk doing *(NULL+264). One patch at the source beats 1101.
+        // NULL now yields a zeroed self-chaining dummy. Verified 0 caller loops
+        // terminate on NULL, so nothing can hang.
+        // Sig: InstallGetPartsPtrGuard(addrOfGetPartsPtr) -> bool
+        lua.set_function("InstallGetPartsPtrGuard", [](void* site) -> bool {
+            return native_hooks::install_getpartsptr_guard(reinterpret_cast<uintptr_t>(site));
+        });
+        // How many times a NULL was substituted — 0 means the family never fired.
+        lua.set_function("GetPartsPtrDummyCount", []() -> uint64_t {
+            return native_hooks::getpartsptr_dummy_count();
+        });
+
         // ── InstallXsbTrackBoundsGuard — the enemy sound-bank over-run ────────
         // CArmSoundBlock::ExtractTrackIndex strtol()s its cursor BEFORE applying
         // the end-of-name-table bound it checks four instructions later. A room

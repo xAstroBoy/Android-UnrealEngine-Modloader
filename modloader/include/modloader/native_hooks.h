@@ -177,6 +177,16 @@ void set_minethrower_enabled(bool on);
 // patching. NOT a crash guard — install_safe_call_guard is INERT (see below).
 bool install_laser_sight_fix(uintptr_t add_x1_site);
 
+// cModel::getPartsPtr (0x5F81AFC) is the root of the crossover crash family: a
+// scan of libUE4 found 2420 call sites, 1101 of which deref the result with NO
+// null check (IKInit -> fault 0x1d8, GetWepTargetPos -> 0x80), and its own LIST
+// walk derefs *(NULL+264) -> fault 0x108. Replaces it with a safe version: NULL
+// becomes a zeroed self-chaining dummy, and the walk null-checks. Verified no
+// caller loop terminates on NULL (0 sites), so the dummy cannot hang anything.
+// Does NOT bound ARRAY mode's `+= 496*idx` — that needs the part count.
+bool install_getpartsptr_guard(uintptr_t getparts);
+uint64_t getpartsptr_dummy_count();
+
 // CArmSoundBlock::ExtractTrackIndex (0x61AF06C) calls strtol on its cursor BEFORE
 // applying the end-of-name-table bound it then checks four instructions later. An
 // enemy whose room .xsb has fewer tracks than its .das expects walks the cursor off

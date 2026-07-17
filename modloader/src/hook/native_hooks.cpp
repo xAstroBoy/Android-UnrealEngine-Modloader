@@ -1577,6 +1577,108 @@ static void laser_null_parts_to_zero(void* addr, DobbyRegisterContext* ctx) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// cModel::getPartsPtr — THE ROOT OF THE WHOLE CROSSOVER CRASH FAMILY
+// ═══════════════════════════════════════════════════════════════════════
+// Scanned every call site in libUE4 (taint X0 from the BL, stop at the first
+// CBZ/CBNZ/CMP-vs-0 or the first deref):
+//     cModel::getPartsPtr — 2420 call sites, 1101 UNGUARDED, 82 guarded
+// 1101 places dereference this pointer without ever testing it. That is not a
+// handful of oversights, it is the engine's house style: "the part is always
+// there", which holds for authored rooms and collapses the moment an enemy is
+// somewhere it was not authored. Patching 1101 sites is not a plan; patching the
+// ONE function they all call is.
+//
+// The function itself (0x5F81AFC), exactly as shipped:
+//     if ((a2 & 0x80000000) == 0) {          // a2 >= 0
+//         this = *(_QWORD *)(this + 264);    // parts head
+//         if (this) {
+//             if ((*(_BYTE *)(v2 + 9) & 0x20))
+//                 this += 496LL * a2;             // ARRAY: no bounds check
+//             else
+//                 for (; a2; --a2)
+//                     this = *(_QWORD *)(this + 264);  // LIST: no null check
+//         }
+//     }
+//     return this;                           // may be NULL
+// TWO defects, both ours to fix:
+//   * LIST mode walks a2 links with no null check, so a model with fewer parts
+//     than asked derefs *(NULL + 264). 264 = 0x108 — that IS the cModel::setParent
+//     fault 0x108 in the crash table, i.e. the crash is INSIDE this walk.
+//   * It returns NULL, and 1101 callers deref it. IKInit does *(ret + 472) =>
+//     fault 0x1d8; GetWepTargetPos does ADD X1,ret,#0x80 => fault 0x80. Both are
+//     in the tombstones.
+//
+// Fix: return a zeroed dummy instead of NULL, so every unguarded deref reads
+// zeros. Verified safe before writing a line of it — the one way this could
+// backfire is a caller doing `while (getPartsPtr(i++))`, which a non-NULL dummy
+// would spin forever. A scan for "BL getPartsPtr; CBZ X0, <target outside a
+// back-edge>" found **0** such loops, which is exactly what the code predicts:
+// in ARRAY mode it never returns NULL for a2>=0, so NULL-termination was never a
+// usable idiom here. Nothing can hang on this.
+//
+// Cost: the 82 sites that DO test for NULL now see a non-NULL zeroed part and take
+// their "part exists" branch with zeros — an origin-positioned, all-zero part
+// instead of a skip. That is a visual/no-op difference, not a crash, and it buys
+// 1101 crash sites. Stated plainly because it IS a real trade.
+//
+// NOT FIXED and deliberately left alone: ARRAY mode's `+= 496 * a2` has no bounds
+// check, so an out-of-range index returns an out-of-bounds GARBAGE pointer (not
+// NULL) that no null check anywhere can catch. Bounding it needs the part count,
+// which is not a field I have identified yet. That is a strong candidate for the
+// still-unsolved EmSetFromList garbage-pointer tombstones (27/28) — do not claim
+// it is fixed.
+alignas(16) static uint8_t g_dummy_parts[0x800];   // seen derefs: +0xBC, +0x80, +0x1D8, +264
+static std::atomic<bool>     s_dummy_parts_ready{false};
+static std::atomic<uint64_t> s_getparts_dummies{0};
+
+static uint64_t getparts_safe(uint64_t self, int idx) {
+    // Self-pointing chain: any caller that walks the dummy's own +264 link stays
+    // inside the dummy instead of falling off into NULL. Same trick as the em32
+    // null-model buffer.
+    if (!s_dummy_parts_ready.load(std::memory_order_acquire)) {
+        *reinterpret_cast<void**>(g_dummy_parts + 264) = g_dummy_parts;
+        s_dummy_parts_ready.store(true, std::memory_order_release);
+    }
+    uint64_t dummy = reinterpret_cast<uint64_t>(g_dummy_parts);
+    if (!self) return dummy;
+    if (idx < 0) return self;                       // stock behaviour: returns `this`
+    uint64_t p = *reinterpret_cast<volatile uint64_t*>(self + 264);
+    if (!p) { s_getparts_dummies.fetch_add(1, std::memory_order_relaxed); return dummy; }
+    if (*reinterpret_cast<volatile uint8_t*>(self + 9) & 0x20)
+        return p + 496ull * static_cast<uint32_t>(idx);   // ARRAY mode: unchanged
+    for (; idx; --idx) {                            // LIST mode
+        p = *reinterpret_cast<volatile uint64_t*>(p + 264);
+        if (!p) {                                   // <== the check the game omits
+            s_getparts_dummies.fetch_add(1, std::memory_order_relaxed);
+            return dummy;
+        }
+    }
+    return p;
+}
+
+uint64_t getpartsptr_dummy_count() { return s_getparts_dummies.load(std::memory_order_relaxed); }
+
+bool install_getpartsptr_guard(uintptr_t getparts) {
+    if (!getparts) return false;
+    static bool installed = false;
+    if (installed) { logger::log_info("PARTS", "already installed"); return true; }
+    // Full replacement, not a wrapper: the stock body is 10 instructions and is
+    // reproduced above exactly, so there is nothing to call through to.
+    if (DobbyHook(reinterpret_cast<void*>(getparts),
+                  reinterpret_cast<dobby_dummy_func_t>(getparts_safe),
+                  nullptr) != RT_SUCCESS) {
+        logger::log_error("PARTS", "DobbyHook failed at 0x%lX", (unsigned long)getparts);
+        return false;
+    }
+    installed = true;
+    logger::log_info("PARTS", "cModel::getPartsPtr guard installed @0x%lX — NULL now yields a "
+                              "zeroed dummy (1101 unguarded derefs in libUE4) and the LIST walk "
+                              "null-checks (was: *(NULL+264) = fault 0x108)",
+                     (unsigned long)getparts);
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // XSB TRACK PARSER OVER-RUN — ArmLoadSoundBlockEnemy, SEGV_ACCERR
 // ═══════════════════════════════════════════════════════════════════════
 // tombstone_30:

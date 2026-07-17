@@ -229,6 +229,43 @@ do
         LogWarn(TAG .. ": InstallLaserSightFix missing — rebuild the modloader")
     end
 
+    -- ═══════════════════════════════════════════════════════════════════════
+    -- THE ROOT FIX — cModel::getPartsPtr
+    -- ═══════════════════════════════════════════════════════════════════════
+    -- I spent a whole session fixing this family ONE VICTIM AT A TIME: setChain,
+    -- setReset, setParent, em32, the laser sight, Emmark, the XSB parser. Every fix
+    -- was real and every one was a symptom. A scan of every call site in libUE4:
+    --
+    --     cModel::getPartsPtr — 2420 call sites, 1101 UNGUARDED, 82 guarded
+    --
+    -- 1101 places deref that pointer without ever testing it. That is the engine's
+    -- house style — "the part is always there" — true for authored rooms, false the
+    -- instant an enemy stands somewhere it was never authored. The victims I chased
+    -- are just the handful that happen to get hit first:
+    --     IKInit            *(getPartsPtr(..) + 472)   -> fault 0x1d8
+    --     GetWepTargetPos   ADD X1, getPartsPtr, #0x80 -> fault 0x80
+    --     cModel::setParent                            -> fault 0x108 = 264,
+    --                       which is getPartsPtr's OWN list walk doing *(NULL+264)
+    --
+    -- So patch the source, not the 1101. NULL -> a zeroed self-chaining dummy, and
+    -- the list walk gets the null check the devs left out. Checked the one way this
+    -- could backfire BEFORE writing it: a caller doing `while (getPartsPtr(i++))`
+    -- would spin forever on a non-NULL dummy. Scanned for it — 0 such loops, as the
+    -- code predicts (ARRAY mode never returns NULL, so NULL-termination was never
+    -- usable). Trade-off, stated honestly: the 82 sites that DO null-check now get a
+    -- zeroed part instead of skipping — a visual no-op, not a crash, for 1101 crash
+    -- sites closed.
+    if InstallGetPartsPtrGuard then
+        pcall(function()
+            local site = Offset(GetLibBase(), 0x5F81AFC)   -- cModel::getPartsPtr(int)
+            local ok = InstallGetPartsPtrGuard(site)
+            Log(TAG .. ": getPartsPtr root guard: " .. (ok and "installed" or "FAILED")
+                .. " — covers 1101 unguarded derefs")
+        end)
+    else
+        LogWarn(TAG .. ": InstallGetPartsPtrGuard missing — rebuild the modloader")
+    end
+
     -- ── Enemy sound bank over-run — SEGV_ACCERR in StrToI ───────────────────
     -- tombstone_30: StrToI <- ExtractTrackIndex <- ExtractTracksFromXSB <-
     -- TryLoadGenericFromDas <- ArmLoadSoundBlockEnemy <- cEmMgr::construct.
