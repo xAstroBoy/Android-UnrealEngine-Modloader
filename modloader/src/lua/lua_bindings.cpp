@@ -2209,6 +2209,22 @@ namespace lua_bindings
             return native_hooks::install_laser_sight_fix(reinterpret_cast<uintptr_t>(site));
         });
 
+        // ── InstallNullReturnGuards — the engine-wide audit's other 3909 sites ─
+        // Scanned all 14091 functions in the RE4 code range: 3456 can return NULL,
+        // 38 have callers that deref unchecked, 3999 unguarded sites — and FOUR
+        // functions are 98% of them (getRoomSavePtr 2975, SmdGetObjPtr 651,
+        // cEmWrap::getPtr 158, SceAtPtr 125). The devs knew: SmdGetObjPtr logs
+        // "invalid ID [%d] used" and cEmWrap::getPtr logs "cEmWrap::getPtr error"
+        // right before returning 0. The dummy carries a stub vtable (they ARE
+        // vtable-dispatched) and the guard is return-address aware so the 3/3/8
+        // loop-exit callers still see a real NULL. Sig: InstallNullReturnGuards() -> bool
+        lua.set_function("InstallNullReturnGuards", []() -> bool {
+            return native_hooks::install_null_return_guards();
+        });
+        lua.set_function("GetNullGuardSubstitutions", []() -> uint64_t {
+            return native_hooks::null_guard_substitutions();
+        });
+
         // ── InstallGetPartsPtrGuard — the ROOT of the crossover crash family ──
         // A scan of every call site in libUE4 says cModel::getPartsPtr has 2420
         // callers and 1101 of them deref the result with NO null check. That is the

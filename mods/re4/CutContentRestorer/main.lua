@@ -230,6 +230,44 @@ do
     end
 
     -- ═══════════════════════════════════════════════════════════════════════
+    -- ENGINE-WIDE NULL GUARDS — the other ~3900 unguarded derefs
+    -- ═══════════════════════════════════════════════════════════════════════
+    -- Scanned ALL 14091 functions in the RE4 code range (0x5D00000-0x6250000), not
+    -- just the ones whose NAME looked like a getter. 3456 can return NULL; after
+    -- taint-tracking every call site, 38 have callers that deref the result with no
+    -- null check — 3999 sites — and FOUR functions are 98% of it:
+    --     cRoomData::getRoomSavePtr  2975/3176
+    --     SmdGetObjPtr                651/2300
+    --     cEmWrap::getPtr             158/754
+    --     SceAtPtr                    125/255
+    -- The devs KNEW. SmdGetObjPtr literally does
+    --     LogErr(0, 0, "SmdGetObjPtr() invalid ID [%d] used", a1);
+    -- and cEmWrap::getPtr does
+    --     LogErr(0, 0, "EM_SET_NO(%d) cEmWrap::getPtr error", ...)
+    -- immediately before `return 0`. They wrote the diagnostic and shipped 3900
+    -- callers that deref it anyway.
+    --
+    -- A plain dummy would be WORSE than the crash here, which is why this is not a
+    -- blanket patch: those three get vtable-dispatched (8/29/30 verified sites, by
+    -- checking the BLR target is a reg LOADED FROM the pointer — the naive "any BLR
+    -- nearby" count was 3x inflated), so a zeroed dummy would BLR a NULL slot; and
+    -- 3/3/8 callers sit in loops that EXIT on NULL, which a non-NULL dummy would
+    -- spin forever. So: the dummy carries a stub vtable (every slot returns 0), and
+    -- the guard is return-address aware — those 14 exact call sites still get a real
+    -- NULL. All four only return NULL for INVALID input (bad room id, OOB index,
+    -- dead cEm, id not found), i.e. cases that were going to fault anyway, so this
+    -- never displaces working behaviour.
+    if InstallNullReturnGuards then
+        pcall(function()
+            local ok = InstallNullReturnGuards()
+            Log(TAG .. ": engine null guards: " .. (ok and "installed" or "FAILED")
+                .. " — covers ~3909 unguarded derefs")
+        end)
+    else
+        LogWarn(TAG .. ": InstallNullReturnGuards missing — rebuild the modloader")
+    end
+
+    -- ═══════════════════════════════════════════════════════════════════════
     -- THE ROOT FIX — cModel::getPartsPtr
     -- ═══════════════════════════════════════════════════════════════════════
     -- I spent a whole session fixing this family ONE VICTIM AT A TIME: setChain,

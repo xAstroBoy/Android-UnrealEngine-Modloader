@@ -177,6 +177,15 @@ void set_minethrower_enabled(bool on);
 // patching. NOT a crash guard — install_safe_call_guard is INERT (see below).
 bool install_laser_sight_fix(uintptr_t add_x1_site);
 
+// Engine-wide null audit (RE4 code 0x5D00000-0x6250000): 3456 functions can return
+// NULL; 38 have callers that deref it unchecked; 3999 unguarded sites, of which
+// FOUR functions are 98% — cRoomData::getRoomSavePtr (2975), SmdGetObjPtr (651),
+// cEmWrap::getPtr (158), SceAtPtr (125). Guards them with an inert dummy that
+// carries a STUB VTABLE (they get vtable-dispatched: 8/29/30 real sites), and is
+// RETURN-ADDRESS AWARE so the few loop-exit-on-NULL callers (3/3/8) still see NULL.
+bool install_null_return_guards();
+uint64_t null_guard_substitutions();
+
 // cModel::getPartsPtr (0x5F81AFC) is the root of the crossover crash family: a
 // scan of libUE4 found 2420 call sites, 1101 of which deref the result with NO
 // null check (IKInit -> fault 0x1d8, GetWepTargetPos -> 0x80), and its own LIST

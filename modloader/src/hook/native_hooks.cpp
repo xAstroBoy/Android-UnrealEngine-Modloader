@@ -1577,6 +1577,136 @@ static void laser_null_parts_to_zero(void* addr, DobbyRegisterContext* ctx) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// GENERIC NULL-RETURN GUARD — the engine-wide audit's other 3,900 sites
+// ═══════════════════════════════════════════════════════════════════════
+// Audit of the RE4 code range (0x5D00000-0x6250000): 14091 functions, 3456 that
+// can return NULL, and after taint-tracking every BL call site (X0 tainted, taint
+// KILLED on redefinition, stop at first CBZ/CBNZ/CMP-vs-0 or first deref):
+//
+//     38 functions have callers that deref the result with NO null check,
+//     3999 unguarded deref sites. FOUR functions are 98% of them:
+//        cRoomData::getRoomSavePtr  2975/3176   0x61809e0
+//        SmdGetObjPtr                651/2300   0x6198858
+//        cEmWrap::getPtr             158/754    0x5d7e4b8
+//        SceAtPtr                    125/255    0x6187c04
+//
+// The devs KNEW these return NULL — SmdGetObjPtr logs "SmdGetObjPtr() invalid ID
+// [%d] used" and cEmWrap::getPtr logs "EM_SET_NO(%d) cEmWrap::getPtr error" — and
+// then thousands of callers deref anyway. That is the whole crash family.
+//
+// A plain zeroed dummy is NOT safe for these three, and the checks say why:
+//   * loops that EXIT on NULL would spin forever on a non-NULL dummy
+//        getRoomSavePtr 3, SmdGetObjPtr 3, cEmWrap::getPtr 8
+//   * callers that BLR through the result's vtable would call a NULL slot —
+//     WORSE than the original crash. Verified properly (BLR target must be a reg
+//     LOADED FROM the returned pointer; the crude "any BLR nearby" count was ~3x
+//     inflated): getRoomSavePtr 8, SmdGetObjPtr 29, cEmWrap::getPtr 30.
+//
+// So the dummy carries a STUB VTABLE (every slot returns 0), and the guard is
+// RETURN-ADDRESS AWARE: the handful of loop-exit sites still receive a real NULL,
+// everything else gets the dummy. Deny-lists are the exact return addresses from
+// the scan, as RVAs.
+//
+// Why this is strictly better and not a gamble: all four only return NULL for
+// INVALID input (bad room id, OOB index, dead cEm, id not found) — cases where the
+// caller was going to fault anyway. The dummy never displaces working behaviour;
+// it only replaces a SIGSEGV with an inert object. Writes land in the dummy and
+// are discarded, which for an invalid room is exactly right.
+extern "C" uint64_t nullguard_stub_ret0() { return 0; }
+alignas(16) static void*   g_stub_vtable[128];
+alignas(16) static uint8_t g_null_dummy[0x1000];
+static std::atomic<bool>   g_null_dummy_ready{false};
+
+static void null_dummy_init() {
+    if (g_null_dummy_ready.load(std::memory_order_acquire)) return;
+    for (auto& s : g_stub_vtable) s = reinterpret_cast<void*>(&nullguard_stub_ret0);
+    *reinterpret_cast<void**>(g_null_dummy) = g_stub_vtable;   // obj[0] = vtable
+    g_null_dummy_ready.store(true, std::memory_order_release);
+}
+
+using NrgFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t, uint64_t);
+struct NullRetSlot {
+    NrgFn             orig = nullptr;
+    const char*      name = "";
+    const uintptr_t* deny = nullptr;   // RVAs that MUST still see NULL
+    size_t           deny_n = 0;
+    std::atomic<uint64_t> subs{0};
+};
+static NullRetSlot g_nrg[6];
+
+static uint64_t null_ret_common(int slot, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                  uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7,
+                                  void* ret_addr) {
+    NullRetSlot& s = g_nrg[slot];
+    uint64_t r = s.orig(a0, a1, a2, a3, a4, a5, a6, a7);
+    if (r) return r;
+    uintptr_t base = symbols::lib_base();
+    uintptr_t rva  = base ? (reinterpret_cast<uintptr_t>(ret_addr) - base) : 0;
+    for (size_t i = 0; i < s.deny_n; ++i)          // a loop that terminates on NULL
+        if (s.deny[i] == rva) return 0;            // -> must keep seeing NULL
+    null_dummy_init();
+    uint64_t n = s.subs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 2 || (n % 500) == 0)
+        logger::log_info("NULLGUARD", "%s returned NULL -> inert dummy (caller rva 0x%lX, %lu so far)",
+                         s.name, (unsigned long)rva, (unsigned long)n);
+    return reinterpret_cast<uint64_t>(g_null_dummy);
+}
+
+template <int N>
+static uint64_t nrg_thunk(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                         uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
+    return null_ret_common(N, a0, a1, a2, a3, a4, a5, a6, a7, __builtin_return_address(0));
+}
+
+// Deny-lists: exact RETURN addresses (RVA) of call sites whose loop EXITS on NULL.
+static const uintptr_t kDenyRoomSave[]  = {0x6188aa0, 0x6188c64, 0x6188e28};
+static const uintptr_t kDenySmdGetObj[] = {0x5d3a5c0, 0x5d4481c, 0x5d449dc};
+static const uintptr_t kDenyEmWrapGet[] = {0x60eb114, 0x61693a0, 0x61693c8, 0x61693f0,
+                                           0x616c4b4, 0x616c8a8, 0x616cc9c, 0x616d0a0};
+
+bool install_null_return_guards() {
+    struct Spec { uintptr_t rva; const char* name; const uintptr_t* deny; size_t n; NrgFn thunk; };
+    static const Spec specs[] = {
+        {0x61809e0, "cRoomData::getRoomSavePtr", kDenyRoomSave,  3, &nrg_thunk<0>},
+        {0x6198858, "SmdGetObjPtr",              kDenySmdGetObj, 3, &nrg_thunk<1>},
+        {0x5d7e4b8, "cEmWrap::getPtr",           kDenyEmWrapGet, 8, &nrg_thunk<2>},
+        {0x6187c04, "SceAtPtr",                  nullptr,        0, &nrg_thunk<3>},
+    };
+    uintptr_t base = symbols::lib_base();
+    if (!base) { logger::log_error("NULLGUARD", "lib_base unavailable"); return false; }
+    null_dummy_init();
+    int ok = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (g_nrg[i].orig) { ++ok; continue; }        // idempotent across mod reloads
+        g_nrg[i].name   = specs[i].name;
+        g_nrg[i].deny   = specs[i].deny;
+        g_nrg[i].deny_n = specs[i].n;
+        void* fn = reinterpret_cast<void*>(base + specs[i].rva);
+        if (DobbyHook(fn, reinterpret_cast<dobby_dummy_func_t>(specs[i].thunk),
+                      reinterpret_cast<dobby_dummy_func_t*>(&g_nrg[i].orig)) != RT_SUCCESS) {
+            g_nrg[i].orig = nullptr;
+            logger::log_error("NULLGUARD", "DobbyHook failed for %s @0x%lX",
+                              specs[i].name, (unsigned long)(base + specs[i].rva));
+            continue;
+        }
+        ++ok;
+        logger::log_info("NULLGUARD", "%s guarded (deny-list %zu sites keep real NULL)",
+                         specs[i].name, specs[i].n);
+    }
+    logger::log_info("NULLGUARD", "%d/4 installed — covers ~3909 unguarded derefs "
+                                  "(getRoomSavePtr 2975, SmdGetObjPtr 651, cEmWrap::getPtr 158, "
+                                  "SceAtPtr 125)", ok);
+    return ok > 0;
+}
+
+uint64_t null_guard_substitutions() {
+    uint64_t t = 0;
+    for (auto& s : g_nrg) t += s.subs.load(std::memory_order_relaxed);
+    return t;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // cModel::getPartsPtr — THE ROOT OF THE WHOLE CROSSOVER CRASH FAMILY
 // ═══════════════════════════════════════════════════════════════════════
 // Scanned every call site in libUE4 (taint X0 from the BL, stop at the first
