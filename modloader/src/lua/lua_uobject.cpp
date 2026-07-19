@@ -296,6 +296,20 @@ namespace lua_uobject
 
     thread_local PeCrashContext g_pe_crash_context;
 
+    // Culprit attribution for crash_guard (called from the SIGNAL HANDLER):
+    // expose the prepared PE context's class/function names as raw pointers.
+    // Reading .c_str() of an already-built std::string allocates nothing.
+    void pe_crash_ctx_names(const char **cls, const char **fn)
+    {
+        *cls = nullptr;
+        *fn = nullptr;
+        if (g_pe_crash_context.active)
+        {
+            *cls = g_pe_crash_context.class_name.c_str();
+            *fn = g_pe_crash_context.func_name.c_str();
+        }
+    }
+
     static std::vector<ParamDiagEntry> build_param_diag_entries(const std::vector<reflection::PropertyInfo> &params)
     {
         std::vector<ParamDiagEntry> result;
@@ -1541,6 +1555,12 @@ namespace lua_uobject
     {
         if (!symbols::FText_FromString)
             return;
+#if defined(__arm__)
+        // AAPCS32 struct-return: a >4-byte / non-trivial return (FText) goes via
+        // an implicit sret pointer in r0, so the real param (FString&&) is r1.
+        using ftext_fromstring_t = void (*)(void * /*sret*/, void * /*FString&&*/);
+        reinterpret_cast<ftext_fromstring_t>(symbols::FText_FromString)(out_ftext, fstring_param);
+#else
         __asm__ __volatile__(
             "mov x8, %0\n\t" // sret buffer → X8
             "mov x0, %1\n\t" // FString&& param → X0
@@ -1550,6 +1570,7 @@ namespace lua_uobject
             : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8",
               "x9", "x10", "x11", "x12", "x13", "x14", "x15",
               "x16", "x17", "x30", "memory");
+#endif
     }
 
     // ═══ Property read helper ═══════════════════════════════════════════════

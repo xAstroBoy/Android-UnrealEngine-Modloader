@@ -136,6 +136,15 @@ namespace ue
             static uint32_t v = 0x80; // FProperty* — linked list of props needing destruction
             return v;
         }
+        // TArray<uint8> Script — the Kismet/Blueprint VM bytecode. Layout:
+        //   +0x58 PropertiesSize (i32), +0x5C MinAlignment (i32),
+        //   +0x60 Script{ uint8* Data; i32 Num; i32 Max } → +0x70 PropertyLink,
+        //   +0x78 RefLink, +0x80 DestructorLink (matches DESTRUCTOR_LINK_OFF above).
+        inline uint32_t &SCRIPT_OFF()
+        {
+            static uint32_t v = 0x60;
+            return v;
+        }
     }
 
     // ═══ UFunction offsets (runtime-configurable, defaults = RE4 VR) ════════

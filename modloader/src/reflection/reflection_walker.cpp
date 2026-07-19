@@ -12,6 +12,8 @@
 #include <mutex>
 #include <cstdio>
 #include <cctype>
+#include <atomic>
+#include <ctime>
 
 namespace reflection
 {
@@ -162,6 +164,24 @@ namespace reflection
     // can validate pointers in memory regions allocated after boot.
     void refresh_memory_map()
     {
+        // THROTTLE — this is the level-load "lagging like holy fuck" fix.
+        // build_memory_map() reads ALL of /proc/self/maps (~6000 lines: fopen +
+        // fgets + sscanf each + sort). Cheap once, but refresh_memory_map() is
+        // called on EVERY class rebuild AND on EVERY cloth-sanitize (per enemy
+        // model spawn). During a Randomizer enemy-spawn storm that fires hundreds
+        // of times a second → the maps parse thrashes the game thread. The map
+        // only changes when the game mmaps a new region (rare), so refreshing at
+        // most ~5×/sec keeps pointer-validation fresh with no perceptible
+        // staleness. Callers that truly need an immediate rebuild use
+        // build_memory_map() directly (walk_all()).
+        static std::atomic<long long> s_last_ms{0};
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        long long now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+        long long last = s_last_ms.load(std::memory_order_relaxed);
+        if (last != 0 && now_ms - last < 200)
+            return;                       // refreshed <200 ms ago — skip the parse
+        s_last_ms.store(now_ms, std::memory_order_relaxed);
         build_memory_map();
     }
 
@@ -844,6 +864,11 @@ namespace reflection
                         fi.return_value_offset = ue::ufunc_get_return_value_offset(func);
                         fi.raw = func;
                         fi.return_prop = nullptr;
+                        // Trace the native C++ implementation thunk (Func pointer).
+                        // For FUNC_Native functions this is the engine's real
+                        // native function — surfaced in the SDK dump + C# proxies
+                        // so mods can call/hook it directly, not only via PE.
+                        fi.native_func = ue::ufunc_get_func_ptr(func);
 
                         // Walk function parameters (properties of the UFunction itself)
                         fi.params = walk_properties(reinterpret_cast<const ue::UStruct *>(func), false);

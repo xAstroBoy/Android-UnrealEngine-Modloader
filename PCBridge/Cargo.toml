@@ -1,0 +1,20 @@
+[package]
+name = "pcbridge"
+version = "0.1.0"
+edition = "2021"
+description = "Desktop control panel for the UE ModLoader bridge — toggle Lua/DLL mods, all on/off, live logcat + modloader log viewer"
+authors = ["xAstroBoy"]
+
+[[bin]]
+name = "pcbridge"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.28"
+egui = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
+lto = "thin"

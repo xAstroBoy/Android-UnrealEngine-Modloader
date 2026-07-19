@@ -135,6 +135,9 @@ namespace mod_loader
     // skipping the failed hook.
     thread_local sigjmp_buf s_mod_jmpbuf;
     thread_local volatile sig_atomic_t s_in_mod_loading = 0;
+    // Culprit attribution for crash_guard: the mod whose main.lua is executing
+    // on this thread (copied into the recovered-crash record by the handler).
+    thread_local char t_loading_mod_name[64] = {};
 
     static bool file_exists(const std::string &path)
     {
@@ -318,12 +321,14 @@ namespace mod_loader
 
         // Set up SIGSEGV recovery point — if the mod causes a crash,
         // siglongjmp brings us back here with the signal number
+        snprintf(t_loading_mod_name, sizeof(t_loading_mod_name), "%s", name.c_str());
         s_in_mod_loading = 1;
         int crash_sig = sigsetjmp(s_mod_jmpbuf, 1);
         if (crash_sig != 0)
         {
             // We got here via siglongjmp — the mod CRASHED
             s_in_mod_loading = 0;
+            t_loading_mod_name[0] = '\0';
 
             const char *sig_name = "UNKNOWN";
             if (crash_sig == SIGSEGV)
@@ -375,6 +380,7 @@ namespace mod_loader
 
         // Clear the recovery point
         s_in_mod_loading = 0;
+        t_loading_mod_name[0] = '\0';
 
         ModInfo mi;
         mi.name = name;

@@ -1,0 +1,97 @@
+// AUTO-GENERATED from the live UE reflection graph. Do not edit.
+// Package: /Game/UI/VR4/Menus/PauseMenu/UI_MainMenu_WideCoverEntry_Widget
+using System;
+
+namespace UEModLoader.Game
+{
+    public class UI_MainMenu_WideCoverEntry_Widget_C : UserWidget
+    {
+        public const string UeClassName = "UI_MainMenu_WideCoverEntry_Widget_C";
+        public UI_MainMenu_WideCoverEntry_Widget_C(global::System.IntPtr ptr) : base(ptr) {}
+        public static new UI_MainMenu_WideCoverEntry_Widget_C FromPointer(global::System.IntPtr p) => p==global::System.IntPtr.Zero?null:new UI_MainMenu_WideCoverEntry_Widget_C(p);
+        public static UI_MainMenu_WideCoverEntry_Widget_C FirstOf() { var o = UObject.FindFirstOf(UeClassName); return o==null?null:new UI_MainMenu_WideCoverEntry_Widget_C(o.Pointer); }
+        public static UI_MainMenu_WideCoverEntry_Widget_C[] All() { var a = UObject.FindAllOf(UeClassName); var r = new UI_MainMenu_WideCoverEntry_Widget_C[a.Length]; for(int i=0;i<a.Length;i++) r[i]=new UI_MainMenu_WideCoverEntry_Widget_C(a[i].Pointer); return r; }
+        public PointerToUberGraphFrame UberGraphFrame => new PointerToUberGraphFrame(AddrOf(0x230));
+        public Image ArrowLeft { get { var __p = GetAt<global::System.IntPtr>(0x238); return __p==global::System.IntPtr.Zero?null:new Image(__p); } set => SetAt(0x238, value?.Pointer ?? global::System.IntPtr.Zero); }
+        public Image ArrowRight { get { var __p = GetAt<global::System.IntPtr>(0x240); return __p==global::System.IntPtr.Zero?null:new Image(__p); } set => SetAt(0x240, value?.Pointer ?? global::System.IntPtr.Zero); }
+        public Image BG { get { var __p = GetAt<global::System.IntPtr>(0x248); return __p==global::System.IntPtr.Zero?null:new Image(__p); } set => SetAt(0x248, value?.Pointer ?? global::System.IntPtr.Zero); }
+        public Image Highlight { get { var __p = GetAt<global::System.IntPtr>(0x250); return __p==global::System.IntPtr.Zero?null:new Image(__p); } set => SetAt(0x250, value?.Pointer ?? global::System.IntPtr.Zero); }
+        public Image Overline_Bracket { get { var __p = GetAt<global::System.IntPtr>(0x258); return __p==global::System.IntPtr.Zero?null:new Image(__p); } set => SetAt(0x258, value?.Pointer ?? global::System.IntPtr.Zero); }
+        public TextBlock Text_Option { get { var __p = GetAt<global::System.IntPtr>(0x260); return __p==global::System.IntPtr.Zero?null:new TextBlock(__p); } set => SetAt(0x260, value?.Pointer ?? global::System.IntPtr.Zero); }
+        public TextBlock Text_Toggle { get { var __p = GetAt<global::System.IntPtr>(0x268); return __p==global::System.IntPtr.Zero?null:new TextBlock(__p); } set => SetAt(0x268, value?.Pointer ?? global::System.IntPtr.Zero); }
+        public HorizontalBox ToggleBox { get { var __p = GetAt<global::System.IntPtr>(0x270); return __p==global::System.IntPtr.Zero?null:new HorizontalBox(__p); } set => SetAt(0x270, value?.Pointer ?? global::System.IntPtr.Zero); }
+        public Image Underline { get { var __p = GetAt<global::System.IntPtr>(0x278); return __p==global::System.IntPtr.Zero?null:new Image(__p); } set => SetAt(0x278, value?.Pointer ?? global::System.IntPtr.Zero); }
+        public Image Underline_Bracket { get { var __p = GetAt<global::System.IntPtr>(0x280); return __p==global::System.IntPtr.Zero?null:new Image(__p); } set => SetAt(0x280, value?.Pointer ?? global::System.IntPtr.Zero); }
+        public bool Flag_Hovered { get => Native.GetPropBool(Pointer, "Flag_Hovered"); set => Native.SetPropBool(Pointer, "Flag_Hovered", value); }
+        public global::System.IntPtr Colors => AddrOf(0x290); // struct UI_WidgetColors_Struct
+        public bool IsSpecialOption { get => Native.GetPropBool(Pointer, "IsSpecialOption"); set => Native.SetPropBool(Pointer, "IsSpecialOption", value); }
+        public bool isTextOnly { get => Native.GetPropBool(Pointer, "isTextOnly"); set => Native.SetPropBool(Pointer, "isTextOnly", value); }
+        public global::System.IntPtr MercColors => AddrOf(0x4A0); // struct UI_WidgetColorsMercenaries_Struct
+        public void SetMercenariesColors()
+        {
+            var __pb = new ParamBuffer(0);
+            CallRaw("SetMercenariesColors", __pb.Bytes);
+        }
+        public void SetSpecialOption(bool IsSpecialOption)
+        {
+            var __pb = new ParamBuffer(1);
+            __pb.Set<byte>(0x0, (byte)(IsSpecialOption?1:0));
+            CallRaw("SetSpecialOption", __pb.Bytes);
+        }
+        public void EnableButton()
+        {
+            var __pb = new ParamBuffer(0);
+            CallRaw("EnableButton", __pb.Bytes);
+        }
+        public void HoverButton()
+        {
+            var __pb = new ParamBuffer(0);
+            CallRaw("HoverButton", __pb.Bytes);
+        }
+        public void SetToggleText(global::System.IntPtr newText)
+        {
+            var __pb = new ParamBuffer(24);
+            __pb.Set<global::System.IntPtr>(0x0, newText);
+            CallRaw("SetToggleText", __pb.Bytes);
+        }
+        public void SetOptionText(global::System.IntPtr newText)
+        {
+            var __pb = new ParamBuffer(24);
+            __pb.Set<global::System.IntPtr>(0x0, newText);
+            CallRaw("SetOptionText", __pb.Bytes);
+        }
+        public void HideToggle()
+        {
+            var __pb = new ParamBuffer(0);
+            CallRaw("HideToggle", __pb.Bytes);
+        }
+        public void DisableButton()
+        {
+            var __pb = new ParamBuffer(0);
+            CallRaw("DisableButton", __pb.Bytes);
+        }
+        public void UnhoverButton()
+        {
+            var __pb = new ParamBuffer(0);
+            CallRaw("UnhoverButton", __pb.Bytes);
+        }
+        public void HideUnderline()
+        {
+            var __pb = new ParamBuffer(0);
+            CallRaw("HideUnderline", __pb.Bytes);
+        }
+        public void EnableTextOnlyMode(bool isTextOnly_)
+        {
+            var __pb = new ParamBuffer(1);
+            __pb.Set<byte>(0x0, (byte)(isTextOnly_?1:0));
+            CallRaw("EnableTextOnlyMode", __pb.Bytes);
+        }
+        public void ExecuteUbergraph_UI_MainMenu_WideCoverEntry_Widget(int EntryPoint)
+        {
+            var __pb = new ParamBuffer(4);
+            __pb.Set(0x0, EntryPoint);
+            CallRaw("ExecuteUbergraph_UI_MainMenu_WideCoverEntry_Widget", __pb.Bytes);
+        }
+    }
+
+}

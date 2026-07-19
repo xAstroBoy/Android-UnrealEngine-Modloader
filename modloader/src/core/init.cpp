@@ -13,6 +13,8 @@
 #include "modloader/logger.h"
 #include "modloader/paths.h"
 #include "modloader/crash_handler.h"
+#include "modloader/crash_guard.h"
+#include "modloader/memtrace.h"
 #include "modloader/symbols.h"
 #include "modloader/pattern_scanner.h"
 #include "modloader/reflection_walker.h"
@@ -22,6 +24,7 @@
 #include "modloader/native_hooks.h"
 #include "modloader/lua_engine.h"
 #include "modloader/mod_loader.h"
+#include "modloader/dotnet_host.h"
 #include "modloader/pak_mounter.h"
 #include "modloader/adb_bridge.h"
 #include "modloader/notification.h"
@@ -339,6 +342,11 @@ namespace init
         logger::log_info("DEFER", "Reflection complete: %zu classes, %zu structs, %zu enums",
                          classes.size(), structs.size(), enums.size());
 
+        // ── C# / .NET mods ───────────────────────────────────────────────────
+        // Boot the Mono host after the reflection graph + Lua mods are ready.
+        // No-op (logs) if the runtime pack isn't installed or dotnet is disabled.
+        dotnet_host::init();
+
         // Auto-dump ONCE: generate the full SDK/IDA dump on the first launch, then
         // write a marker so subsequent launches skip the heavy boot-time dump.
         // Regenerate any time on demand via the ADB bridge (dump_sdk / dump_ida).
@@ -533,6 +541,12 @@ namespace init
             struct timespec ts = {5, 0};
             nanosleep(&ts, nullptr);
             crash_handler::reinstall();
+            // Flush crash-guard-suppressed crashes from the async-safe ring to
+            // modloader_recovered.log (no-op when nothing was recovered).
+            crash_guard::drain();
+            // Flush hardware-watchpoint samples to memtrace_live.log so trace
+            // data survives a later crash (no-op when no watch is armed).
+            memtrace::live_drain();
         }
 
         return nullptr;   // not reached — the watchdog is for the process lifetime
@@ -583,6 +597,47 @@ namespace init
 
         // ── Step 3.5: Load config.json ──────────────────────────────────────
         config::load(paths::data_dir());
+
+        // Apply the log level from config (DEBUG suppressed unless set to "debug").
+        logger::set_min_level(logger::level_from_string(config::log_level().c_str()));
+
+        // Apply the crash-guard settings from config.
+        //  enabled   — master toggle (OFF = every fault fatal, bug-hunting mode)
+        //  global    — instruction-skip coverage OUTSIDE guard regions
+        //  quarantine— crashes attributed to one mod before its patches revert
+        //
+        // GUARD ON (global null-skip). The bug-hunting pass is done: the REAL
+        // crossover-enemy crashes were found with the guard OFF and fixed at the
+        // SOURCE (stale EmInitFunc -> construct id remap; XSB track over-run ->
+        // readable-cursor check; GGCSingleton race -> null-guard). What remains are
+        // the engine's OWN ~3900 unguarded null-derefs (getPartsPtr/getRoomSavePtr/
+        // MotionMoveCore/... — its house style: "the data is always there", false
+        // the instant an enemy stands somewhere unauthored). Those are not
+        // individually fixable and were only ever survivable because the guard
+        // skipped the faulting read. So: recover them (read 0, advance PC) and log
+        // each to modloader_recovered.log. The report-only crash handler stays
+        // installed, so any fault the guard does NOT cover still gets the full
+        // async-safe dump — nothing new is hidden. Toggle at runtime with
+        // SetCrashGuardEnabled/SetCrashGuardGlobalMode if bug-hunting again.
+        crash_guard::set_enabled(true);
+        crash_guard::set_global_mode(crash_guard::global_mode_from_string("all"));
+        crash_guard::set_quarantine_threshold(0);
+        logger::log_info("CGUARD", "Crash guard ON (global null-skip) — engine's unguarded null-derefs "
+                                   "recovered + logged to modloader_recovered.log; real crashes still dumped");
+
+        // ⚠ DO NOT install_fast_fmodf() HERE — it crashes with a STACK OVERFLOW.
+        //     signal 11 (SIGSEGV), code 2 (SEGV_ACCERR)
+        //     #00 pc ... [anon:stack_and_tls:NNNNN]      <- guard page
+        // The idea (3 hardware FP ops instead of bionic's bit loop for the enemy
+        // AI's angle wrapping) is sound, but the IMPLEMENTATION recurses: the
+        // fallback path calls s_fmodf_orig() for out-of-range/NaN inputs, and
+        // Dobby's trampoline for a function this small re-enters the hook rather
+        // than reaching the original, so every fallback recurses until the stack
+        // dies. Same family as the GetFiringHand thunk problem: tiny libm/thunk
+        // functions are not safe inline-hook targets.
+        // A working version must be self-contained — no call back into fmodf at
+        // all (handle the out-of-range case with pure FP, or don't hook at all).
+        // native_hooks::install_fast_fmodf();
 
         // ── Step 4: Wait for engine library ──────────────────────────────────
         logger::log_info("BOOT", "Waiting for %s to load...", game_profile::engine_lib_name().c_str());

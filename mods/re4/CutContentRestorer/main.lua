@@ -143,6 +143,161 @@ do
         LogWarn(TAG .. ": InstallCutVillagerFix missing — rebuild the modloader")
     end
 
+    -- Crossover pool ids 0x60-0x6F sit OUTSIDE ArmEmCallProlog's switch, so the
+    -- villager fix can't reach them: the global EmInitFunc stays stale and
+    -- cEmMgr::construct runs the previous enemy's init -> stack smash into
+    -- 0xA54AB68 (PC==LR every time). Remap the id at construct entry to a real
+    -- base enemy (0x68→em18, 0x66→em46, 0x6C/6D/6F→em4c/4d/4f, ema-series→em09).
+    -- gameRoomInit calls vtable[0x90] on every enemy with NO null check, and the
+    -- BASE cEm vtable has no entry there (_ZTV3cEm +0x90 = NULL, while cEmObj and
+    -- cEm09 both have one). Any enemy left as a bare cEm therefore makes room init
+    -- BLR address 0:
+    --     signal 11 SEGV_MAPERR, fault addr 0x0, "null pointer dereference"
+    --     #00 pc 0  <unknown>      #01 gameRoomInit()+2260   #02 ABio4::Tick
+    -- Guarding the CALL SITE fixes every id at once instead of guessing which
+    -- enemy ended up as a base cEm.
+    if InstallGameRoomInitVCallGuard then
+        pcall(function()
+            local site = Offset(GetLibBase(), 0x5F43B38)   -- ldr x8,[x8,#0x90]
+            local ok = InstallGameRoomInitVCallGuard(site)
+            Log(TAG .. ": gameRoomInit NULL-vcall guard: " .. (ok and "installed" or "FAILED"))
+        end)
+    else
+        LogWarn(TAG .. ": InstallGameRoomInitVCallGuard missing — rebuild the modloader")
+    end
+
+    -- EmSetFromList2 runs BEFORE cEmMgr::construct, so the construct remap below
+    -- is too late for it: an id the room cannot build faults inside the spawn-list
+    -- read itself, the safe-call guard "recovers" it by returning 0/0.0, and the
+    -- half-built spawn takes the process down shortly after with no tombstone.
+    -- Observed every time with id 0x59 (all other placed ids passed cleanly).
+    -- Remapping X0 at entry means there is no fault to recover in the first place.
+    -- ── THE REAL REASON U3 WAS UNKILLABLE ────────────────────────────────
+    -- Found with a HARDWARE WATCHPOINT on a live U3's HP (cEm+0x3F0), not by
+    -- reading code: exactly ONE writer, 3 hits while the player was shooting —
+    --     libUE4.so+0x5EEF1F8  inside LifeDownSet2(cEm*, dmg, ...)
+    --       v33 = hp - dmg;
+    --       if (v33 <= 0 && (a4 & 1) != 0) v33 = 1;   // "keep alive" flag
+    --       *(int16*)(cEm + 0x3F0) = v33;
+    -- So the damage ALWAYS landed. U3's hitboxes were fine and YarareAdd had run;
+    -- the caller just passes "never let this one die", which is right for scripted
+    -- encounters and wrong for a boss spawned out of context. HP sat at 1 forever
+    -- (its max at +0x3F2 still read the true 7500 the spawn list gave it).
+    -- Clearing that bit per-em-id lets HP reach 0 so the normal death runs.
+    if InstallLifeDownKeepAliveFix then
+        pcall(function()
+            local fn = Resolve("_Z12LifeDownSet2P3cEmiijib", 0x5EEEF88)
+            local ok = InstallLifeDownKeepAliveFix(fn)
+            Log(TAG .. ": LifeDownSet2 keep-alive fix: " .. (ok and "installed" or "FAILED"))
+            if ok and SetEmKillable then
+                -- U3 (em32 = 0x32 = 50) — the one this was diagnosed on.
+                pcall(SetEmKillable, 0x32, true)
+                -- The other bosses that are unkillable for the same reason when
+                -- spawned outside their own scenario.
+                -- Keep this list in sync with BOSS_BASE_HP in mods/re4/BossFixes:
+                -- a boss with scaled HP but no keep-alive clear is unkillable, and
+                -- BossFixes no longer force-kills anything to paper over it.
+                --   0x09 Tyrant  0x2B El Gigante  0x2C Novistador  0x2F Salamander
+                --   0x31 Saddler-After  0x33 Novistador-Event  0x35 Mendez
+                --   0x37 Verdugo  0x38 Verdugo-After  0x39 Krauser  0x3F Saddler-Ada
+                for _, id in ipairs({ 0x09, 0x2B, 0x2C, 0x2F, 0x31, 0x33, 0x35, 0x37, 0x38, 0x39, 0x3F }) do
+                    pcall(SetEmKillable, id, true)
+                end
+            end
+        end)
+    else
+        LogWarn(TAG .. ": InstallLifeDownKeepAliveFix missing — rebuild the modloader")
+    end
+
+    -- ═══════════════════════════════════════════════════════════════════
+    -- CROSSOVER ID REMAP — OFF BY DEFAULT.  IT ATE LEVEL CONTENT.
+    -- ═══════════════════════════════════════════════════════════════════
+    -- These three hooks substitute "unbuildable" em ids with the inert object
+    -- (0x50) so a MOD-SPAWNED crossover enemy cannot crash the room. The design
+    -- assumption was that ids 0x59/0x60-0x6F are only ever introduced by the
+    -- Randomizer / EnemySpawner. THAT ASSUMPTION IS WRONG.
+    --
+    -- r10b (the boat / lake level) AUTHORS ids in that range itself. With the
+    -- Randomizer switched OFF and doing nothing, the log still showed:
+    --     XEMAP EmSetFromList2 id 0x64 -> 0x50   (unbuildable here)
+    --     XEMAP EmSetFromList2 id 0x65 -> 0x50
+    --     XEMAP EmSetFromList2 id 0x69 -> 0x50
+    --     XEMAP EmSetFromList2 id 0x6B -> 0x50
+    --     XEMAP EmSetFromList2 id 0x6E -> 0x50
+    --     XEMAP crossover em   0x60 -> em 0x50
+    -- i.e. the level's OWN Salamander and boat were replaced by inert objects.
+    -- Reported in-game as "it swapped the Salamander & boat".
+    --
+    -- is_em_id_supported() answers "can the BASE table build this id", which is
+    -- NOT the same question as "did the level author it". Until the native side
+    -- can tell mod-injected ids from level-authored ones, a blanket substitution
+    -- is destructive and must not run. The crash it prevented only happens when
+    -- a mod actually places a crossover enemy, so the correct scope is "only
+    -- while a mod is injecting", not "always".
+    --
+    -- Flip to true only to reproduce/debug the original crossover crash.
+    local ENABLE_CROSSOVER_REMAP = false
+
+    if not ENABLE_CROSSOVER_REMAP then
+        Log(TAG .. ": crossover id remap DISABLED (it substituted level-authored "
+            .. "ids — r10b Salamander/boat became inert objects)")
+    end
+
+    if ENABLE_CROSSOVER_REMAP and InstallEmSetFromListIdRemap then
+        pcall(function()
+            local entry = Resolve("_Z14EmSetFromList2jj", 0x5EE9A6C)
+            local ok = InstallEmSetFromListIdRemap(entry)
+            Log(TAG .. ": EmSetFromList2 id remap: " .. (ok and "installed" or "FAILED"))
+        end)
+    end
+
+    -- EmSetFromList() (no "2") is the WHOLE-LIST pass and takes NO arguments, so
+    -- there is no id register to remap — it reads every id from the global spawn
+    -- list (pG + 32*i + 21661, 256 slots; the same 32-byte stride the Randomizer
+    -- rewrites). An unbuildable id there builds an enemy whose vtable+0x28 is
+    -- garbage and the pass's final virtual call jumps to it:
+    --     SIGSEGV fault=0x13c pc=0x13c  cause: EmSetFromList
+    -- so the LIST itself gets cleaned before the pass reads it.
+    -- Same reason as above: this one rewrote the AUTHORED spawn list in place,
+    -- so it is the most destructive of the three. It was also the one taking a
+    -- SIGSEGV inside EmSetFromList+0xE8 that the crash guard kept recovering.
+    if ENABLE_CROSSOVER_REMAP and InstallEmSetFromListSanitize then
+        pcall(function()
+            local entry = Resolve("_Z13EmSetFromListv", 0x5EE9610)
+            local pg    = Offset(GetLibBase(), 0x0A456E48)   -- &pG (the pointer variable)
+            local ok = InstallEmSetFromListSanitize(entry, pg)
+            Log(TAG .. ": EmSetFromList list sanitiser: " .. (ok and "installed" or "FAILED"))
+        end)
+    end
+
+    if ENABLE_CROSSOVER_REMAP and InstallCrossoverEnemyRemap then
+        pcall(function()
+            local entry = Offset(GetLibBase(), 0x5D90288)   -- cEmMgr::construct
+            local ok = InstallCrossoverEnemyRemap(entry)
+            Log(TAG .. ": crossover enemy remap (0x60-0x6F): " .. (ok and "installed" or "FAILED"))
+        end)
+    end
+
+    -- FAsyncLoadingThread::Run polls GGCSingleton+8; if the GC singleton isn't up
+    -- (startup / level transition) it's NULL -> fault 0x8 -> level never loads
+    -- (black). Redirect the null read to 0 = "GC idle".
+    if InstallAsyncGcSingletonGuard then
+        pcall(function()
+            local site = Offset(GetLibBase(), 0x68957DC)   -- LDAR W8,[X8]
+            local ok = InstallAsyncGcSingletonGuard(site)
+            Log(TAG .. ": async-loader GGCSingleton null guard: " .. (ok and "installed" or "FAILED"))
+        end)
+    else
+        LogWarn(TAG .. ": InstallAsyncGcSingletonGuard missing — rebuild the modloader")
+    end
+
+    -- NOTE: do NOT safe-call-guard InverseKinematics — it is called per-enemy
+    -- PER FRAME, and routing something that hot through dispatch_full re-enters
+    -- the recovery path and crashes libmodloader itself (fault 0x30 in
+    -- dispatch_full). The IK fault-storm is instead avoided upstream: the
+    -- crash-prone crossover ids are remapped to an inert cEmObj (no model, no IK)
+    -- in install_crossover_enemy_remap.
+
     -- em32's init (sub_5E49AA0) asks SetObj00 for two sub-object models, CBZ-checks
     -- each result, then dereferences it anyway 4 instructions later:
     --   LDR X2,[X25,#0xA88] ; LDR X8,[X2,#0x180]   => SIGSEGV, fault addr 0x180
@@ -356,12 +511,33 @@ do
         LogWarn(TAG .. ": InstallShootGamePausedGuard missing — rebuild the modloader")
     end
 
-    -- NOTE: IKInit and ArmLoadSoundBlockEnemy had InstallCrashGuard here too. They
-    -- were removed, not kept "just in case" — they are inert for the same reason
-    -- and only served to make the log claim protection that does not exist. Both
-    -- still need real fixes when their tombstones come back:
-    --   IKInit                 getPartsPtr NULL -> *(NULL+472)  fault 0x1d8
-    --   ArmLoadSoundBlockEnemy XSB parser walks off a missing bank, SEGV_ACCERR
+    -- NOTE: IKInit still had its InstallCrashGuard removed (getPartsPtr NULL ->
+    -- *(NULL+472) fault 0x1d8) — it's per-enemy and a real fix is still owed.
+
+    -- CArmSoundBlock::ExtractTracksFromXSB (0x61ae54c) — the XSB track parser.
+    -- When a spawned enemy's sound bank is missing (crossover / Randomizer picks an
+    -- enemy this room never authored), LoadXSBFile returns a header whose track
+    -- offset-table points into the absent bank. The inner ExtractTrackIndex then
+    -- walks a string with bounds *(hdr+42)+*(hdr+30) that run off the mapping ->
+    -- SEGV_ACCERR *inside a tight loop*. The global instruction-skipper "recovers"
+    -- each fault but immediately re-enters the same loop and re-faults — hundreds
+    -- of signal round-trips per call = the EXTREME LAG (not a crash; the room shows).
+    --
+    -- crash_guard was rebuilt since the old "guards are inert" note — siglongjmp
+    -- recovery works now. Guarding the parent chokepoint (every sound path —
+    -- SndInit2/LoadRoomData/LoadWeapon/LoadGeneric — funnels through it) converts
+    -- the storm into ONE clean bail: it returns 0 = "no XSB", the game's own
+    -- no-sound path. Enemy is silent; game is smooth. Sound is not gameplay-
+    -- critical (unlike U3's hitboxes below), so bailing here is safe.
+    if InstallCrashGuard then
+        pcall(function()
+            local xsb = Offset(GetLibBase(), 0x61ae54c)   -- CArmSoundBlock::ExtractTracksFromXSB
+            local ok = InstallCrashGuard(xsb, "CArmSoundBlock::ExtractTracksFromXSB")
+            Log(TAG .. ": XSB track-parser storm guard: " .. (ok and "installed" or "FAILED"))
+        end)
+    else
+        LogWarn(TAG .. ": InstallCrashGuard missing — rebuild the modloader")
+    end
 
     -- U3 "It" (emId 50 = 0x32 = cEm32) — killable OUTSIDE its scripted level.
     --
@@ -458,6 +634,24 @@ local EM_MODELS = {
     [0x07] = V_DIR   .. "Em07_Poseable.Em07_Poseable_C",
     [0x08] = V_DIR   .. "Em08_Poseable.Em08_Poseable_C",
     [0x09] = V_DIR   .. "Em09_Poseable.Em09_Poseable_C",
+    -- 0x0A / 0x0B / 0x0D were MISSING, and that is why they could not spawn:
+    -- install_cut_villager_fix makes them constructible (prolog 0x82 -> _prologEm09,
+    -- confirmed in the log), but with no model class registered the factory
+    -- (EmMgr vtable+56) fails, EmSetEvent returns errEm, and EnemySpawner reported
+    -- "EmSetEvent returned NULL" — then retried 19 positions and smashed the stack.
+    --
+    -- They belong here for the SAME reason 6/7/8 do: EmFileTbl maps ids
+    -- 6/7/8/9/A/B/D to em/em10.das, the ganado archive (see the note above), so
+    -- the ganado poseable is the model that matches the archive the id loads.
+    --
+    -- ⚠ NOTE: these are ganado variants, NOT characters. EnemySpawner labels
+    -- 0x0A "Krauser (NPC)", 0x0D "Wesker", 0x06 "HUNK" — that comes from the
+    -- PLAYER id space (PL0A_Krauser / PL0D_Wesker / PL06_Hunk), which is a
+    -- DIFFERENT table. The real Krauser enemy is em 0x39 (EM39_Poseable_BP),
+    -- already in the spawner as "Krauser Knife (No3)" / "Krauser Mutant" (id 57).
+    [0x0A] = V_DIR   .. "Em10_Poseable.Em10_Poseable_C",
+    [0x0B] = V_DIR   .. "Em10_Poseable.Em10_Poseable_C",
+    [0x0D] = V_DIR   .. "Em10_Poseable.Em10_Poseable_C",
     [0x10] = V_DIR   .. "Em10_Poseable.Em10_Poseable_C",
     [0x33] = V_DIR   .. "Em33_Poseable.Em33_Poseable_C",
     [0x37] = V_DIR   .. "Em37_Poseable.Em37_Poseable_C",
@@ -599,7 +793,40 @@ local function stateName(p)
     if STATE_NAMES[p] then return STATE_NAMES[p] end
     return "S" .. (p & 0xFF) .. ":" .. ((p >> 8) & 0xFF)
 end
-local function tGetHP(p)      return ReadS32(Offset(p, OFF.hp)) end
+-- HP is an int16, not int32. cEmWrap::setHp does
+--     if (wrap[11]==1 && (cem=*(cEm**)wrap) && (cem->flags & 0x201)==1)
+--         *(int16*)(cem + 1008) = hp;      // 1008 = 0x3F0
+-- Reading S32 here splices the adjacent field into the value, which is exactly
+-- why the monitor kept printing nonsense like "HP=196611000" / "HP=491527500".
+local function tGetHP(p)      return ReadU16(Offset(p, OFF.hp)) end
+
+-- Is this pointer STILL a live em09? Two things make a tracked pointer go bad:
+--   1. install_cut_villager_fix() wires ids 6/7/8/A/B/D/33/37 to _prologEm09, so
+--      Em09Init fires for every VILLAGER too and they all get tracked as Tyrants.
+--   2. When a spawn faults and the safe-call guard recovers (or the Randomizer
+--      rewrites the level), the enemy is freed/reused WITHOUT cEm09_dtor running,
+--      so untrackTyrant is never called and the pointer dangles.
+-- The poll then reads freed memory every 250ms. That is what produced
+--     "Tyrant S255:255 -> INIT [HP=...]"
+-- (state 0xFFFF = the all-ones pattern of unmapped/freed memory) immediately
+-- before the process died with no tombstone. Validate before every read.
+-- Every id that install_cut_villager_fix() wires to _prologEm09 is CONSTRUCTED as
+-- a cEm09 object, so the em09 state machine (and the stuck-in-INIT watchdog below)
+-- applies to all of them — not just literal em09. Restricting this to id==9 is why
+-- the watchdog never saw the real offenders: the two objects caught pegging the
+-- game thread were emId 0x33 and 0x37, both on this list.
+-- Doubles as the dangling-pointer guard: freed/reused memory reads back as 0x00 or
+-- 0xFF, neither of which is in this set.
+local EM09_CLASS_IDS = {
+    [0x06] = true, [0x07] = true, [0x08] = true, [0x09] = true, [0x0A] = true,
+    [0x0B] = true, [0x0D] = true, [0x33] = true, [0x37] = true,
+}
+local function tIsLiveTyrant(p)
+    if not p or p == 0 then return false end
+    local ok, id = pcall(function() return ReadU8(Offset(p, OFF.emId)) end)
+    if not ok or id == nil then return false end
+    return EM09_CLASS_IDS[id] == true
+end
 local function tGetState(p)   return ReadU16(Offset(p, OFF.mainState)) end
 local function tGetMain(p)    return ReadU8(Offset(p, OFF.mainState)) end
 local function tSetState(p,v) WriteU16(Offset(p, OFF.mainState), v) end
@@ -619,15 +846,18 @@ local function trackTyrant(ptr)
         -- and maintained by the poll instead.
         tyrants.instances[ptr] = { ptr=ptr, lastState=-1, spawnTime=os.clock(), transitions=0 }
         tyrants.count = tyrants.count + 1
-        Log(TAG .. string.format(": Tyrant SPAWNED @ 0x%X (total %d)", ptr, tyrants.count))
+        -- ToHex(ptr), NOT string.format("%X", ptr): ptr is light userdata and %X
+        -- wants a number, which raises a sol::error that aborts the process.
+        Log(TAG .. ": Tyrant SPAWNED @ " .. ToHex(ptr) .. " (total " .. tyrants.count .. ")")
     end
     return tyrants.instances[ptr]
 end
 local function untrackTyrant(ptr)
     local inst = tyrants.instances[ptr]
     if inst then
-        Log(TAG .. string.format(": Tyrant DESTROYED @ 0x%X (lived %.1fs transitions=%d)",
-            ptr, os.clock()-inst.spawnTime, inst.transitions or 0))
+        Log(TAG .. ": Tyrant DESTROYED @ " .. ToHex(ptr)
+            .. string.format(" (lived %.1fs transitions=%d)",
+                os.clock() - inst.spawnTime, inst.transitions or 0))
         tyrants.instances[ptr] = nil
         tyrants.count = tyrants.count - 1
     end
@@ -670,6 +900,68 @@ end)
 local TYRANT_POLL_SEC = 0.25
 pcall(function()
     LoopAsync(math.floor(TYRANT_POLL_SEC * 1000), function()
+        -- NOTE: the stuck-in-INIT watchdog below must run even when transition
+        -- LOGGING is off, so this no longer early-returns on logTransitions —
+        -- that flag now gates only the log line.
+        -- Drop dangling/never-really-a-Tyrant entries BEFORE reading anything off
+        -- them. Without this the poll dereferences freed memory every 250ms.
+        local dead = nil
+        for ptr, _ in pairs(tyrants.instances) do
+            if not tIsLiveTyrant(ptr) then
+                dead = dead or {}
+                dead[#dead + 1] = ptr
+            end
+        end
+        if dead then
+            for _, ptr in ipairs(dead) do
+                tyrants.instances[ptr] = nil
+                tyrants.count = math.max(0, tyrants.count - 1)
+            end
+        end
+        -- ── STUCK-IN-INIT WATCHDOG ──────────────────────────────────────────
+        -- THE 99%-GAME-THREAD BUG. cEm09::move dispatches on the state byte at
+        -- +0x114 through a function-pointer table (0x9D3D660, indexed with NO
+        -- bounds check), and state 0 is the spawn/init handler @0x5D91D80. That
+        -- handler is meant to run for ONE frame and advance the state. A cut id
+        -- wired to _prologEm09 (0x33/0x37/...) spawned outside its own scenario
+        -- never gets the data it needs to advance, so it re-runs the whole init
+        -- EVERY FRAME — re-setting HP to 1000, redoing motion setup, and landing
+        -- in an indirect call to libm fmod with garbage operands. fmod's remainder
+        -- loop costs one iteration per bit of exponent difference, so a single
+        -- stuck enemy pegged the game thread at 99% with 99.5% of all samples in
+        -- fmod. Proven live: poking this one byte 0->1 dropped the game thread
+        -- from 99% to 75% and removed fmod from the profile entirely.
+        -- Repair, don't remove: state 1 = IDLE, the same value the tyrant_idle
+        -- command writes, so the enemy stays alive and playable.
+        for ptr, inst in pairs(tyrants.instances) do
+            local mok, main = pcall(tGetMain, ptr)
+            if mok and main == 0 then
+                inst.initPolls = (inst.initPolls or 0) + 1
+                -- A healthy init clears within a frame. 8 polls = ~2s, far beyond
+                -- any legitimate INIT, so this cannot fight a normal spawn.
+                if inst.initPolls >= 8 then
+                    inst.initPolls = 0
+                    inst.initRepairs = (inst.initRepairs or 0) + 1
+                    pcall(tSetState, ptr, 0x0001)
+                    pcall(tSetPhase, ptr, 0)
+                    pcall(tSetParam, ptr, 0)
+                    if inst.initRepairs <= 5 then
+                        -- ptr is LIGHT USERDATA, not a number: string.format("%X", ptr)
+                        -- raises "bad argument #2 to 'format'", and because this runs
+                        -- inside the Lua tick the sol::error escapes into native code
+                        -- and ABORTS THE PROCESS (tombstone_08). ToHex() is the
+                        -- pointer formatter — use it, never %X/%d, for a pointer.
+                        pcall(function()
+                            Log(TAG .. ": Tyrant/cut-em stuck in INIT @ " .. ToHex(ptr)
+                                .. " — forced to IDLE (repair #" .. inst.initRepairs .. ")")
+                        end)
+                    end
+                end
+            else
+                inst.initPolls = 0
+            end
+        end
+
         if not tyrants.logTransitions then return false end
         for ptr, inst in pairs(tyrants.instances) do
             local ok, packed = pcall(tGetState, ptr)
@@ -701,10 +993,13 @@ end)
 RegisterCommand("tyrant_status", function()
     forEachTyrant(function(ptr, inst)
         -- Read live, on demand — no per-frame hook needed to answer this.
-        Log(string.format("── Tyrant @ 0x%X ── %s HP=%s dist=%.0f anim=%s transitions=%d",
-            ptr, stateName(tGetState(ptr)), tostring(tGetHP(ptr)),
-            math.sqrt(math.max(0, tGetDistSq(ptr) or 0)),
-            string.format("0x%X", tGetAnim(ptr) or 0), inst.transitions or 0))
+        -- Both ptr and tGetAnim()'s result are light userdata — they must go
+        -- through ToHex(), not %X, or this command aborts the process.
+        Log("── Tyrant @ " .. ToHex(ptr) .. " ── " .. stateName(tGetState(ptr))
+            .. " HP=" .. tostring(tGetHP(ptr))
+            .. string.format(" dist=%.0f", math.sqrt(math.max(0, tGetDistSq(ptr) or 0)))
+            .. " anim=" .. ToHex(tGetAnim(ptr))
+            .. " transitions=" .. tostring(inst.transitions or 0))
     end)
 end)
 RegisterCommand("tyrant_idle",   function() forEachTyrant(function(p) tSetState(p,0x0001); tSetPhase(p,0); tSetParam(p,0); Log(TAG..": Tyrant → IDLE") end) end)

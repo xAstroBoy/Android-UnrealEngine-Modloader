@@ -19,7 +19,8 @@ namespace paths
     std::string paks_dir();  // data_dir + "/paks/"
     std::string sdk_dir();   // data_dir + "/SDK/"
     std::string log_path();  // data_dir + "/UEModLoader.log"
-    std::string crash_log(); // data_dir + "/modloader_crash.log"
+    std::string crash_log();     // data_dir + "/modloader_crash.log" (fatal crashes)
+    std::string recovered_log(); // data_dir + "/modloader_recovered.log" (crash-guard-suppressed crashes)
 
     // SDK subdirectories (old per-class format)
     std::string sdk_classes_dir();   // data_dir + "/SDK/Classes/"

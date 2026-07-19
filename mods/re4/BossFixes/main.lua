@@ -63,54 +63,129 @@ local sym_EmSetDieCnt = Resolve("EmSetDieCnt", 0x05EEA310)
 local bossKills = {}
 
 -- ═══════════════════════════════════════════════════════════════════════
--- NATIVE HOOK — cEmWrap::setHp → detect boss death
+-- REMOVED — the cEmWrap::setHp Lua hook  (was: force boss death at HP 0)
 -- ═══════════════════════════════════════════════════════════════════════
+--
+-- DO NOT PUT THIS BACK. It caused both of the bugs it looked like it fixed.
+--
+-- 1) THE LAG. cEmWrap::setHp runs per-enemy, many times per frame, from inside
+--    cEmMgr::move. Hanging a LUA callback off it means every one of those calls
+--    crosses native -> sol2 -> lua_State, no matter how early the callback
+--    returns. Profiling the game thread with ~24 enemies put 12/12 samples in
+--    libm fmod with the return address at 0x5d90924 — the BLR of the enemy's
+--    virtual move(), i.e. the frame that called setHp. libUE4 imports NO fmodf
+--    at all and reaches fmod only from ICU/timecode; libmodloader is what
+--    imports fmod, because that is Lua's `%`. The time was ours, not the game's.
+--    Rule (learned twice now): never hang a Lua callback on a hot function —
+--    use a pure-C++ hook in re4_native_hooks.cpp if one is genuinely needed.
+--
+-- 2) THE MISSING DEATH ANIMATION. EmSetDie/EmSetDieCnt only flag the enemy dead
+--    in room-save data and bump a counter — they never run the death STATE, so
+--    the body vanished instead of playing its death anim. The engine's own path
+--    is LifeDownSet2: when HP reaches 0 it fires ArmSendEmEvent(em, 10), which
+--    is what actually plays the animation.
+--
+-- Both existed only to work around bosses that could never reach 0 HP. That is
+-- now fixed at the source: LifeDownSet2 takes a "keep alive" flag in a4 bit 0
+-- that clamps HP to a floor of 1 (proved with a hardware watchpoint on U3's HP).
+-- install_lifedown_keepalive_fix() in re4_native_hooks.cpp clears that bit for
+-- the ids registered via SetEmKillable, so damage lands, HP reaches 0, and the
+-- engine plays the death animation by itself. Nothing to force from Lua.
 
-pcall(function()
-RegisterNativeHook("cEmWrap_setHp",
-    function(self_ptr, new_hp)
-        V("Native pre cEmWrap_setHp, self=%s hp=%s", ToHex(self_ptr), tostring(new_hp))
-        if new_hp > 0 then return self_ptr, new_hp end
+Log(TAG .. ": boss death is handled by the engine (LifeDownSet2 keep-alive fix) — no setHp hook")
 
-        local valid = ReadU8(Offset(self_ptr, OFF_WRAP_VALID))
-        if valid ~= 1 then return self_ptr, new_hp end
+-- ═══════════════════════════════════════════════════════════════════════
+-- DIFFICULTY-SCALED BOSS HP ON SPAWN
+-- ═══════════════════════════════════════════════════════════════════════
+--
+-- WHY: a boss spawned outside its own scenario comes up with HP = 1. Its init
+-- writes the real value (verified in em32/U3's init: `mov w8,#0x1f4; strh w8,
+-- [x19,#0x3f0]` = 500), but the spawn path re-applies the room-authored /
+-- difficulty-scaled HP afterwards, and out of context that lookup yields 1.
+-- A 1-HP boss reads as "invincible" because the engine floors it there and the
+-- scripted SCE kill that would finish it only exists in its home level.
+--
+-- HP lives at cEm+0x3F0 as an int16 — confirmed from cEmWrap::setHp, which does
+--     if (wrap[11]==1 && (cem=*(cEm**)wrap) && (cem->flags & 0x201)==1)
+--         *(int16*)(cem + 1008) = hp;
+-- so writing there directly is exactly what the engine's own setter does.
+--
+-- Values are the enemy's own base HP where known, scaled by difficulty. Tune
+-- BOSS_BASE_HP freely — anything above 1 makes the boss damageable.
+local OFF_HP_CEM = 0x3F0
 
-        local cem = ReadPointer(Offset(self_ptr, OFF_WRAP_CEM))
-        if IsNull(cem) then return self_ptr, new_hp end
+local BOSS_BASE_HP = {
+    [9]  = 800,   -- Tyrant
+    [43] = 1200,  -- El Gigante
+    [44] = 600,   -- Novistador Boss
+    [47] = 700,   -- Salamander
+    [49] = 900,   -- Saddler After
+    [50] = 500,   -- U3 (It)          — 500 read straight out of its init
+    [51] = 600,   -- Novistador Boss Event
+    [53] = 800,   -- Mendez
+    [55] = 700,   -- Verdugo (No2)
+    [56] = 700,   -- Verdugo After
+    [57] = 900,   -- Krauser
+    [63] = 1000,  -- Saddler (Ada)
+}
 
-        local main_state = ReadU8(Offset(cem, OFF_MAIN_STATE))
-        if main_state == 3 then return self_ptr, new_hp end -- already dying
+-- UBio4Utils::GetGameDifficulty — 0=easy 1=normal 2=hard (higher = tougher)
+local sym_GetDifficulty = Resolve("_ZN10UBio4Utils17GetGameDifficultyEv", 0x06218B30)
+local DIFF_MULT = { [0] = 0.6, [1] = 1.0, [2] = 1.6 }
 
-        local em_type = ReadU8(Offset(cem, OFF_EM_TYPE))
-        local boss_name = BOSS_IDS[em_type]
-        if not boss_name then return self_ptr, new_hp end
+local function currentDifficulty()
+    if not sym_GetDifficulty then return 1 end
+    local ok, d = pcall(function() return CallNative(sym_GetDifficulty, "i") end)
+    if ok and type(d) == "number" and DIFF_MULT[d] then return d end
+    return 1
+end
 
-        -- Track kills
-        bossKills[boss_name] = (bossKills[boss_name] or 0) + 1
+-- idx -> cEm: the pool is a flat array, so cEm = poolBase + stride*idx.
+-- (EmMgr layout read out of cEmMgr::move: +0x08 poolBase, +0x10 count, +0x14 stride)
+local EMMGR_RVA = 0xA3C28D8
+local function cemFromIndex(idx)
+    local ok, cem = pcall(function()
+        local mgr = ReadPointer(Offset(GetLibBase(), EMMGR_RVA))
+        if IsNull(mgr) then return nil end
+        local base   = ReadPointer(Offset(mgr, 0x08))
+        local count  = ReadU32(Offset(mgr, 0x10))
+        local stride = ReadU32(Offset(mgr, 0x14))
+        if IsNull(base) or not count or not stride then return nil end
+        if idx < 0 or idx >= count then return nil end
+        return Offset(base, stride * idx)
+    end)
+    if ok then return cem end
+    return nil
+end
 
-        Log(TAG .. ": " .. boss_name .. " (type " .. em_type .. ") HP→0 — forcing death"
-            .. " (kill #" .. bossKills[boss_name] .. ")")
-
-        if sym_EmSetDie then
-            V("pcall: EmSetDie cem=%s", ToHex(cem))
-            pcall(function() CallNative(sym_EmSetDie, "vpi", cem, 0) end)
-        end
-        if sym_EmSetDieCnt then
-            V("pcall: EmSetDieCnt cem=%s", ToHex(cem))
-            pcall(function() CallNative(sym_EmSetDieCnt, "vpi", cem, 0) end)
-        end
-
-        return self_ptr, new_hp
-    end, nil)
-Log(TAG .. ": Native hook — cEmWrap_setHp (boss death trigger)")
-end)
-
--- ── Diagnostic hook ─────────────────────────────────────────────────────
 pcall(function()
     RegisterNativeHook("EmListSetAlive",
         function(idx, alive)
-            V("Native pre EmListSetAlive idx=%s alive=%s", tostring(idx), tostring(alive))
-            if alive == 0 then
+            if VERBOSE then
+                V("Native pre EmListSetAlive idx=%s alive=%s", tostring(idx), tostring(alive))
+            end
+            -- Spawn edge only. Everything below runs once per spawn, never per frame.
+            if alive ~= 0 then
+                local cem = cemFromIndex(idx)
+                if cem and not IsNull(cem) then
+                    local em_type = ReadU8(Offset(cem, OFF_EM_TYPE))
+                    local base    = BOSS_BASE_HP[em_type]
+                    if base then
+                        local hp = ReadU16(Offset(cem, OFF_HP_CEM))
+                        -- Only repair a boss the spawn path left at 1 (or 0). If it
+                        -- already has real HP, the game set it correctly — leave it.
+                        if hp == nil or hp <= 1 then
+                            local d      = currentDifficulty()
+                            local scaled = math.floor(base * (DIFF_MULT[d] or 1.0))
+                            if scaled < 2 then scaled = 2 end
+                            pcall(function() WriteU16(Offset(cem, OFF_HP_CEM), scaled) end)
+                            Log(TAG .. ": " .. (BOSS_IDS[em_type] or ("type " .. em_type))
+                                .. " spawned with HP=" .. tostring(hp) .. " → set " .. scaled
+                                .. " (base " .. base .. " x difficulty " .. d .. ")")
+                        end
+                    end
+                end
+            else
                 Log(TAG .. ": EmListSetAlive idx=" .. idx .. " → DEAD")
             end
             return idx, alive

@@ -29,6 +29,14 @@ namespace config
     static bool s_adb_bridge_enabled = true;
     static bool s_log_to_file = true;
     static std::string s_log_level = "info"; // "debug", "info", "warn", "error"
+    static bool s_crash_guard_enabled = true;
+    static std::string s_crash_guard_global = "all"; // "off" | "null" | "all"
+    static int s_crash_guard_quarantine_threshold = 20; // 0 = never
+    // C#/.NET support is OFF by default. The managed host costs a runtime init,
+    // an extra thread and a GC on the game thread, and nothing ships that needs
+    // it — the debug menu is Lua-owned. Set "dotnet_enabled": true in the config
+    // json to turn it back on.
+    static bool s_dotnet_enabled = false;
 
     static bool s_loaded = false;
 
@@ -48,6 +56,10 @@ namespace config
         j["adb_bridge_enabled"] = true;
         j["log_to_file"] = true;
         j["log_level"] = "info";
+        j["crash_guard_enabled"] = true;
+        j["crash_guard_global"] = "all";
+        j["crash_guard_quarantine_threshold"] = 20;
+        j["dotnet_enabled"] = false;   // C#/.NET off by default — see s_dotnet_enabled
         // SDK dump settings
         j["auto_dump_on_boot"] = true;
         j["auto_dump_on_level_change"] = false;
@@ -132,6 +144,13 @@ namespace config
         s_adb_bridge_enabled = safe_get<bool>(j, "adb_bridge_enabled", true);
         s_log_to_file = safe_get<bool>(j, "log_to_file", true);
         s_log_level = safe_get<std::string>(j, "log_level", std::string("info"));
+        s_crash_guard_enabled = safe_get<bool>(j, "crash_guard_enabled", true);
+        s_crash_guard_global = safe_get<std::string>(j, "crash_guard_global", std::string("all"));
+        s_crash_guard_quarantine_threshold = safe_get<int>(j, "crash_guard_quarantine_threshold", 20);
+        // Fallback must be false too: an EXISTING config json written before this
+        // key existed has no "dotnet_enabled", and a `true` fallback would silently
+        // re-enable the managed host on every device that already has a config.
+        s_dotnet_enabled = safe_get<bool>(j, "dotnet_enabled", false);
         s_auto_dump_on_boot = safe_get<bool>(j, "auto_dump_on_boot", true);
         s_auto_dump_on_level_change = safe_get<bool>(j, "auto_dump_on_level_change", false);
         s_object_monitor_enabled = safe_get<bool>(j, "object_monitor_enabled", false);
@@ -144,6 +163,9 @@ namespace config
         logger::log_info("CONFIG", "  adb_bridge_enabled        = %s", s_adb_bridge_enabled ? "true" : "false");
         logger::log_info("CONFIG", "  log_to_file               = %s", s_log_to_file ? "true" : "false");
         logger::log_info("CONFIG", "  log_level                 = %s", s_log_level.c_str());
+        logger::log_info("CONFIG", "  crash_guard_enabled       = %s", s_crash_guard_enabled ? "true" : "false");
+        logger::log_info("CONFIG", "  crash_guard_global        = %s", s_crash_guard_global.c_str());
+        logger::log_info("CONFIG", "  crash_guard_quarantine    = %d", s_crash_guard_quarantine_threshold);
         logger::log_info("CONFIG", "  auto_dump_on_boot         = %s", s_auto_dump_on_boot ? "true" : "false");
         logger::log_info("CONFIG", "  auto_dump_on_level_change = %s", s_auto_dump_on_level_change ? "true" : "false");
         logger::log_info("CONFIG", "  object_monitor_enabled    = %s", s_object_monitor_enabled ? "true" : "false");
@@ -168,6 +190,10 @@ namespace config
         j["adb_bridge_enabled"] = s_adb_bridge_enabled;
         j["log_to_file"] = s_log_to_file;
         j["log_level"] = s_log_level;
+        j["crash_guard_enabled"] = s_crash_guard_enabled;
+        j["crash_guard_global"] = s_crash_guard_global;
+        j["crash_guard_quarantine_threshold"] = s_crash_guard_quarantine_threshold;
+        j["dotnet_enabled"] = s_dotnet_enabled;
         j["auto_dump_on_boot"] = s_auto_dump_on_boot;
         j["auto_dump_on_level_change"] = s_auto_dump_on_level_change;
         j["object_monitor_enabled"] = s_object_monitor_enabled;
@@ -198,5 +224,9 @@ namespace config
     bool adb_bridge_enabled() { return s_adb_bridge_enabled; }
     bool log_to_file() { return s_log_to_file; }
     const std::string &log_level() { return s_log_level; }
+    bool crash_guard_enabled() { return s_crash_guard_enabled; }
+    const std::string &crash_guard_global() { return s_crash_guard_global; }
+    int crash_guard_quarantine_threshold() { return s_crash_guard_quarantine_threshold; }
+    bool dotnet_enabled() { return s_dotnet_enabled; }
 
 } // namespace config

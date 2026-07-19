@@ -1,0 +1,17 @@
+// AUTO-GENERATED from the live UE reflection graph. Do not edit.
+// Package: /Game/Blueprints/Debug/DebugManager_BP
+using System;
+
+namespace UEModLoader.Game
+{
+    public class DebugManager_BP_C : DebugManager
+    {
+        public const string UeClassName = "DebugManager_BP_C";
+        public DebugManager_BP_C(System.IntPtr ptr) : base(ptr) {}
+        public static new DebugManager_BP_C FromPointer(System.IntPtr p) => p==System.IntPtr.Zero?null:new DebugManager_BP_C(p);
+        public static DebugManager_BP_C FirstOf() { var o = UObject.FindFirstOf(UeClassName); return o==null?null:new DebugManager_BP_C(o.Pointer); }
+        public static DebugManager_BP_C[] All() { var a = UObject.FindAllOf(UeClassName); var r = new DebugManager_BP_C[a.Length]; for(int i=0;i<a.Length;i++) r[i]=new DebugManager_BP_C(a[i].Pointer); return r; }
+        public SceneComponent DefaultSceneRoot { get { var __p = GetAt<System.IntPtr>(0x338); return __p==System.IntPtr.Zero?null:new SceneComponent(__p); } set => SetAt(0x338, value?.Pointer ?? System.IntPtr.Zero); }
+    }
+
+}

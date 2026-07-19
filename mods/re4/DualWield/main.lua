@@ -115,6 +115,50 @@ local DW_PATCHES = {
     { name = "IsExternallyAllowed (grab-vote bypass, enables 2nd-gun grab)",
       mangled = "_ZNK18UVR4GamePlayerGrip19IsExternallyAllowedE11EHandedness",
       fb = 0x062CE5D8, insn_off = 0x24, word = ARM64_MOV_W8_0 },
+
+    -- THE 2-HANDED DUAL-WIELD GATE. Grabbing a second gun already worked, but a
+    -- two-handed weapon still refused to FIRE once your other hand was busy
+    -- holding the clone — so 2H dual-wield looked like "no independence".
+    -- AVR4GamePlayerGun::IsReadyToFire:
+    --     62dbab0  ldrb w8, [x19,#0x7aa]   ; [1962] weapon REQUIRES two hands
+    --     62dbab4  cbz  w8, 0x62dbac0      ; 1H weapon -> skip, fine
+    --     62dbab8  ldrb w8, [x19,#0xd2c]   ; [3372] currently held by BOTH hands
+    --     62dbabc  cbz  w8, 0x62dbae8      ; 2H gun not two-handed -> return FALSE
+    -- Measured live on a held MachineGun: [1962]=1 [3372]=1 (passes). Hold that
+    -- same gun one-handed and [3372] goes 0, so IsReadyToFire fails before it
+    -- ever looks at ammo or state. NOP the second CBZ: a two-handed weapon may
+    -- now fire while held in one hand, which is the entire point of [1].
+    -- The ammo and weapon-state checks after it are untouched.
+    { name = "IsReadyToFire (2H weapon may fire one-handed)",
+      mangled = "_ZNK17AVR4GamePlayerGun13IsReadyToFireEv",
+      fb = 0x062DBA88, insn_off = 0x34, word = 0xD503201F },
+
+    -- ROCKET LAUNCHER ONE-HANDED. The launcher fired fine with BOTH grips held
+    -- and only "clicked" on one — because it was DRY-firing, not failing a fire
+    -- gate. AVR4GamePlayerRocketLauncher::PreBio4Tick:
+    --     6317014  blr  x8                 ; readiness
+    --     6317018  tbz  w0,#0, 0x631704c   ; not ready  -> DryFire
+    --     631701c  mov  x0, x19
+    --     6317020  bl   GetPrimaryHand     ; = grip[78]->CurrentHand (grip+760)
+    --     6317024  cbz  x0, 0x631704c      ; NULL hand  -> DryFire   <-- THIS
+    --     6317038  bl   TryFire            ; the real shot
+    --     6317054  bl   DryFire            ; trigger clicks, nothing comes out
+    -- AVR4GamePlayerProp::GetPrimaryHand only ever looks at the PRIMARY grip
+    -- (prop+624). Hold the weapon by the forestock alone and that grip has no
+    -- hand, so GetPrimaryHand returns NULL and the trigger is routed to DryFire
+    -- no matter how much ammo or readiness the weapon has. That is why every
+    -- weapon-side fix (chamber flags, HasOneHandedStock, IsReadyToFire) did
+    -- nothing here — they sit on a path the code never reaches.
+    --
+    -- ⚠ DO NOT NOP THAT CBZ. I tried it (insn_off 0x98 -> 0xD503201F) and the
+    -- trigger DID finally reach TryFire instead of DryFire — then the game died:
+    --     modloader_recovered.log: 12x libUE4.so+0x5fb7020 / +0x5fb6ff0
+    --                              (_ZN12cObjLauncher6launchEv)
+    -- which is the documented cObjLauncher::launch()+372 -> fault 0x78. The NULL
+    -- check is LOAD-BEARING: launch() needs the primary hand for its muzzle/aim
+    -- anchor, so letting a NULL through only moves the failure downstream.
+    -- The real fix is to give GetPrimaryHand something valid to return (fall back
+    -- to the forestock grip's hand) rather than deleting the guard.
 }
 
 local patchesApplied = false
@@ -147,6 +191,117 @@ local function restoreDualWieldPatch()
 end
 
 if state.enabled then applyDualWieldPatch() end
+
+-- ── [1b] ONE-HANDED FIRING FOR TWO-HANDED WEAPONS (QOL) ────────────────
+-- Grabbing a 2nd gun was only half the feature: a two-handed weapon held by a
+-- single grip still refused to shoot. It was never failing a fire check — it was
+-- DRY-FIRING. Every weapon's PreBio4Tick does
+--     if (ready && GetPrimaryHand(this)) TryFire(this); else DryFire(this);
+-- and AVR4GamePlayerProp::GetPrimaryHand only ever inspects the PRIMARY grip
+-- (prop+624 -> grip+760). Hold the gun by the forestock alone and that grip has
+-- no hand, so it returns NULL and the trigger clicks with nothing behind it —
+-- no matter the ammo, chamber state, HasOneHandedStock or IsReadyToFire.
+--
+-- Deleting the NULL check does NOT work: cObjLauncher::launch() needs a real
+-- hand for its muzzle anchor and faults without one (12x libUE4+0x5fb6ff0).
+-- So we hand it a genuine hand instead — whichever grip IS held, via the grip
+-- group's GetAnyCurrentGrip (group at prop+0xD38).
+-- ⚠ DISABLED — this whole block never delivered and only added risk.
+-- Measured facts: GetPrimaryHandFallbackCount() stayed at 0 for the entire
+-- session (the fallback never once fired), the launcher still refused to shoot
+-- one-handed, and the shared fallback body crashed the game twice by running on
+-- objects it was never meant for (AVR4GamePlayerConsumable::Tick -> SIGSEGV
+-- 0x3e78) and by aliasing the two hands (SIGBUS 0x601). The vtable swap likewise
+-- installed correctly and changed nothing observable.
+-- The DIAGNOSIS is still good and worth keeping: PreBio4Tick gates on
+-- GetFiringHand (-> GunTwoHanded::GetForestockHand) BEFORE anything else, so a
+-- one-grip hold is refused before ammo/ready/primary are ever consulted. But a
+-- safe fix needs a genuine second hand, not a substituted one.
+local ENABLE_ONEHAND_EXPERIMENT = false
+if ENABLE_ONEHAND_EXPERIMENT and InstallPrimaryHandFallback then
+    pcall(function()
+        local gph     = Resolve("_ZNK18AVR4GamePlayerProp14GetPrimaryHandEv",              0x630DB18)
+        local anygrip = Resolve("_ZNK32UVR4GamePlayerGripGroupComponent17GetAnyCurrentGripEv", 0x62D3DA8)
+        local curhand = Resolve("_ZNK18UVR4GamePlayerGrip14GetCurrentHandEv",              0x62D0C24)
+        -- THE one that actually mattered. A two-handed weapon needs TWO DIFFERENT
+        -- grips held to fire, and the FORESTOCK is the gate that runs first:
+        --     RocketLauncher::GetFiringHand -> GunTwoHanded::GetForestockHand
+        --     PreBio4Tick: if (GetFiringHand(this)) { if (ready && GetPrimaryHand) TryFire }
+        -- With one grip held GetForestockHand is NULL, so the outer `if` short-
+        -- circuits and the trigger is dead before ammo/ready/primary is even
+        -- consulted. (Proved it: the primary-hand fallback counter stayed at 0 —
+        -- GetPrimaryHand was never reached.)
+        --
+        -- ⚠ NO FORESTOCK HOOK. Both ways of doing it break the game:
+        --
+        --   1) Hooking GunTwoHanded::GetForestockHand (0x62E1660) — the shared
+        --      function — makes the forestock hand ALIAS the primary hand. But it
+        --      also feeds IK, hand poses and two-handed aiming, which all assume
+        --      the two hands are DISTINCT. Result: SIGBUS fault_addr=0x601 with
+        --      0 recovered faults (not a null deref — corrupted transform math).
+        --
+        --   2) Hooking RocketLauncher::GetFiringHand (0x6317618) instead — it is
+        --      a THUNK, i.e. a single branch instruction. Dobby writes a 16-BYTE
+        --      inline patch, so hooking a 4-byte function overwrites the function
+        --      that follows it in memory. That corrupted adjacent code and broke
+        --      firing even with BOTH grips held. Same 16-byte rule that bit the
+        --      DobbyInstrument work: never inline-hook a tiny/thunk function.
+        --
+        -- The gate itself is understood and correct:
+        --     RocketLauncher::GetFiringHand -> GunTwoHanded::GetForestockHand
+        --     PreBio4Tick: if (GetFiringHand(this)) { if (ready && GetPrimaryHand) TryFire }
+        -- so one grip => NULL firing hand => dead trigger. A real fix has to give
+        -- the launcher a genuine SECOND hand (or patch the single CBZ inside
+        -- PreBio4Tick while ALSO supplying launch() a valid muzzle anchor —
+        -- NOPing that CBZ alone reproduces cObjLauncher::launch() fault 0x78).
+        local gfh     = nil   -- never inline-hook the firing hand (see above)
+        -- The grip-group VTABLE is required, not optional. GetPrimaryHand is on
+        -- AVR4GamePlayerProp — the base of EVERY prop — so without a type check
+        -- the fallback read prop+0xD38 on a Consumable (herb/ammo/flashlight),
+        -- got mapped-but-unrelated memory, and crashed inside GetAnyCurrentGrip:
+        --     #01 ph_get_primary_hand  #02 AVR4GamePlayerConsumable::Tick
+        --     SIGSEGV fault 0x3e78
+        local gvt     = Resolve("_ZTV32UVR4GamePlayerGripGroupComponent", 0)
+        local ok = InstallPrimaryHandFallback(gph, anygrip, curhand, 0xD38, gfh, gvt)
+
+        -- The firing-hand gate is fixed by swapping ONE VTABLE ENTRY instead.
+        -- RocketLauncher's vtable+1968 is GetFiringHand (verified via the RELA
+        -- relocations: _ZTV28AVR4GamePlayerRocketLauncher, vptr = symbol+16).
+        -- PreBio4Tick only tests that result for non-NULL — it never stores or
+        -- dereferences the hand — so substituting it affects the trigger check
+        -- and nothing else. No code is patched, so neither the shared-function
+        -- aliasing crash nor Dobby's 16-byte thunk clobber can happen.
+        -- FIRING-HAND GATE via a VTABLE SWAP (not a code patch).
+        -- RocketLauncher's vtable+1968 is GetFiringHand (confirmed from the RELA
+        -- relocations of _ZTV28AVR4GamePlayerRocketLauncher; vptr = symbol+16).
+        -- PreBio4Tick only tests that result for non-NULL and never dereferences
+        -- it, so substituting affects the trigger gate and nothing else.
+        --
+        -- This was blamed for the SIGSEGV 0x3e78 crash, wrongly: the tombstone
+        -- names ph_get_primary_hand <- AVR4GamePlayerConsumable::Tick, i.e. the
+        -- shared fallback body running on a NON-gun prop. That is fixed by the
+        -- grip-group vtable type check above, so the swap is safe to use.
+        -- Not an inline hook => immune to Dobby's 16-byte thunk-clobber problem,
+        -- and GetForestockHand stays untouched so IK/aiming keep distinct hands.
+        if ok and InstallFiringHandVtableFallback then
+            pcall(function()
+                local vt = Resolve("_ZTV28AVR4GamePlayerRocketLauncher", 0x9D83AE0)
+                if vt and not IsNull(vt) then
+                    local slot = Offset(vt, 16 + 1968)   -- +16 skips the RTTI header
+                    local ok2 = InstallFiringHandVtableFallback(slot)
+                    Log(TAG .. ": launcher firing-hand vtable fallback: "
+                        .. (ok2 and "installed" or "FAILED"))
+                end
+            end)
+        end
+        Log(TAG .. ": one-handed firing for 2H weapons: " .. (ok and "installed" or "FAILED"))
+        if ok and SetPrimaryHandFallbackEnabled then
+            pcall(SetPrimaryHandFallbackEnabled, state.enabled)
+        end
+    end)
+else
+    LogWarn(TAG .. ": InstallPrimaryHandFallback missing — rebuild/redeploy the modloader")
+end
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- [2] SIMULTANEOUS FIRE (QOL) — native; never a Lua hook on TryFire

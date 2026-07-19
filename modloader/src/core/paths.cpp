@@ -363,6 +363,7 @@ namespace paths
     std::string sdk_dir() { return s_data_dir + "/SDK/"; }
     std::string log_path() { return s_data_dir + "/UEModLoader.log"; }
     std::string crash_log() { return s_data_dir + "/modloader_crash.log"; }
+    std::string recovered_log() { return s_data_dir + "/modloader_recovered.log"; }
     std::string sdk_classes_dir() { return s_data_dir + "/SDK/Classes/"; }
     std::string sdk_structs_dir() { return s_data_dir + "/SDK/Structs/"; }
     std::string sdk_enums_dir() { return s_data_dir + "/SDK/Enums/"; }

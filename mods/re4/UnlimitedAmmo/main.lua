@@ -50,6 +50,64 @@ local RAW_PATCHES = {
   -- so one-handed weapons drain and force a reload. NOP it so the top-up (already
   -- gated on GetAmmoCheatState==2 just after) runs regardless of grip.
   { name="PreBio4Tick_gripGate", rva = 0x62D9A68, from = 0x54000321, to = 0xD503201F },
+
+  -- ── THE CHICAGO-TYPEWRITER FIX (this is a GAME bug, not a mod bug) ──────
+  -- Weapons whose magazine capacity is the sentinel 0x8000 ("infinite") break
+  -- the moment ANY infinite-ammo path is active — including the game's OWN
+  -- built-in ammo cheat, with no mods loaded at all.
+  --
+  -- WeaponId2ChargeNum (0x5F555E4) ends with:
+  --     5f557ac  lsl  w8, w0, #1       ; 2 * capacity
+  --     5f557b0  cmp  w0, #0x8000      ; the "infinite" sentinel
+  --     5f557b4  mov  w9, #-0x8000     ; 0xFFFF8000 == -32768
+  --     5f557b8  csel w0, w9, w8, eq   ; sentinel -> -32768, else 2*capacity
+  -- and cItemMgr::bulletNum's cheat branch then does
+  --     if ((uint16)cur >= (uint16)cap) return cur; else return cap;
+  -- The compare is uint16 but the RETURN is the raw value, so the sentinel
+  -- escapes as -32768. Every caller that treats the count as signed sees
+  -- massively negative ammo and the weapon reads as broken/empty.
+  --
+  -- Affected item ids (capacity table word_4320104 contains 0x8000):
+  --     52, 83  [106,20,25,30,35,40,50,0x8000]  <- Chicago Typewriter class, max upgrade
+  --     55      [26,3,4,5,6,8,10,0x8000]        <- Handcannon class, max upgrade
+  --     40, 65  [70,0x8000,0x8000,...]          <- NOT special-cased anywhere: broken at ANY level
+  -- (bulletNum special-cases only 52/55/83 — ids 40 and 65 fall to `default`.)
+  --
+  -- ⚠ DO NOT PATCH THE 0x8000 SENTINEL OUT OF WeaponId2ChargeNum.
+  -- I tried exactly that (`mov w9,#-0x8000` -> `mov w9,#999`) to stop the
+  -- negative count leaking out of cItemMgr::bulletNum, and it made the affected
+  -- weapons UNFIREABLE. 0x8000 is not just a capacity value, it is a CONTRACT:
+  --     cItemMgr::trigger:
+  --         if (itemId != 109 && (uint16)WeaponId2ChargeNum(id,lvl) != 0x8000) {
+  --             ...entire ammo-consumption block...
+  --         }
+  --         return 1;
+  -- i.e. the sentinel is what makes trigger() SKIP consumption for an infinite
+  -- weapon. Rewrite it and those weapons fall into the consumption path instead,
+  -- which with GetAmmoCheatState()==2 takes `return 0` without consuming — the
+  -- infinite behaviour is gone. cItemMgr::use/combine/reloadable/reload and
+  -- armReloadNumBullets test the same sentinel. Any fix has to preserve it and
+  -- clamp only where the value is RETURNED as a count.
+
+  -- ── MACHINE GUN "CAN'T SHOOT" FIX (Chicago Typewriter / SMG class) ───────
+  -- Ammo was never the blocker here. Measured live on a held
+  -- VR4GamePlayer_Wep12_BP_C (a MachineGun subclass):
+  --     [4380] chamber/bolt flag = 0   <-- the ONLY failing gate
+  --     [1962] grip = 1, [3372] override = 1   -> (!grip || override) = true  OK
+  --     vtable+1976 = GetCurrentAmmo (patched to 999)                         OK
+  -- Writing 1 to [4380] does NOT stick: the tick re-clears it every frame, so
+  -- the bolt-ready state never latches and the weapon can never fire.
+  --
+  -- AVR4GamePlayerMachineGun::IsReadyToFire is just:
+  --     62f1c24  mov  w8, #0x111c        ; 4380
+  --     62f1c28  ldrb w8, [x0, x8]
+  --     62f1c2c  cbz  w8, 0x62f1c34      ; chamber empty -> return 0
+  --     62f1c30  b    AVR4GamePlayerGun::IsReadyToFire
+  --     62f1c34  mov  w0, wzr / ret
+  -- NOP the CBZ so it always tail-calls the base check, which already passes.
+  -- This only removes the SMG's extra bolt gate; the base ammo/grip/state
+  -- checks still apply, so nothing else is loosened.
+  { name="MachineGun_chamberGate", rva = 0x62F1C2C, from = 0x34000048, to = 0xD503201F },
 }
 
 local function apply()

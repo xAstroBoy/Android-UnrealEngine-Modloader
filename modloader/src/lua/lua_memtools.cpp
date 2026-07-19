@@ -18,6 +18,8 @@
 #include "modloader/safe_call.h"
 #include "modloader/logger.h"
 #include "modloader/pattern_scanner.h"
+#include "modloader/memtrace.h"
+#include "modloader/paths.h"
 
 #include <sol/sol.hpp>
 
@@ -33,6 +35,9 @@
 #include <algorithm>
 #include <fstream>
 #include <cctype>
+#include <atomic>
+#include <mutex>
+#include <ctime>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -51,8 +56,68 @@ namespace lua_bindings
     static char g_scan_kind = 'u';                // 'u' uint, 's' int, 'f' float, 'd' double
 
     // ── Hardware watchpoint state ───────────────────────────────────────────
-    struct MLWatch { int fd; void *ring; size_t ringsz; uintptr_t addr; int len; std::string mode; };
-    static std::unordered_map<int, MLWatch> g_watches;
+    // FIXED SLOTS (not a map) so the fatal-crash handler can walk them
+    // async-signal-safely for the last-gasp drain (see memtrace.h). `fd` is
+    // the publish flag: it is set LAST on arm and cleared FIRST on stop.
+    // Stopped slots deliberately LEAK their ring mapping — munmap could race
+    // the crash handler reading it, and a stopped watch is a rare debug event.
+    struct MLWatchSlot
+    {
+        std::atomic<int> fd{-1};
+        void *ring = nullptr;
+        size_t ringsz = 0;
+        uintptr_t addr = 0;
+        int len = 0;
+        char mode[8] = {};
+        std::map<uint64_t, uint64_t> acc; // cumulative ip→count (normal ctx only)
+    };
+    static constexpr int kMaxWatchSlots = 8;
+    static MLWatchSlot g_watch_slots[kMaxWatchSlots];
+    static std::mutex g_watch_mutex;   // serializes Lua ops + live_drain
+    static int g_memtrace_fd = -1;     // O_APPEND fd for memtrace_live.log
+
+    static MLWatchSlot *watch_slot_by_fd(int fd)
+    {
+        for (int i = 0; i < kMaxWatchSlots; i++)
+            if (g_watch_slots[i].fd.load(std::memory_order_acquire) == fd)
+                return &g_watch_slots[i];
+        return nullptr;
+    }
+
+    // Parse all pending PERF_RECORD_SAMPLE records out of a watch's ring and
+    // hand each IP to `emit`. Plain memory reads + tail update — safe in both
+    // normal and signal context (fn-pointer callback, no std::function).
+    static void watch_parse_ring(MLWatchSlot &s, void (*emit)(void *, uint64_t), void *ctx)
+    {
+        char *mapbase = (char *)s.ring;
+        if (!mapbase)
+            return;
+        auto *mp = (struct perf_event_mmap_page *)mapbase;
+        uint64_t head = mp->data_head;
+        __sync_synchronize();
+        uint64_t tail = mp->data_tail;
+        uint64_t doff = mp->data_offset ? mp->data_offset : 4096;
+        uint64_t dsize = mp->data_size ? mp->data_size : (s.ringsz - 4096);
+        char *data = mapbase + doff;
+        int guard = 0;
+        while (tail < head && guard++ < 100000)
+        {
+            uint32_t type = 0;
+            uint16_t rsize = 0;
+            for (int k = 0; k < 4; k++) ((char *)&type)[k] = data[(tail + k) % dsize];
+            for (int k = 0; k < 2; k++) ((char *)&rsize)[k] = data[(tail + 6 + k) % dsize];
+            if (rsize == 0)
+                break;
+            if (type == PERF_RECORD_SAMPLE)
+            {
+                uint64_t ip = 0;
+                for (int k = 0; k < 8; k++) ((char *)&ip)[k] = data[(tail + 8 + k) % dsize];
+                emit(ctx, ip);
+            }
+            tail += rsize;
+        }
+        mp->data_tail = head; // consume
+    }
 
     // ── /proc/self/mem fd (kernel-mediated R/W; works on PROT_NONE pages) ────
     static int ml_mem_fd()
@@ -376,55 +441,67 @@ namespace lua_bindings
             size_t ringsz = (size_t)(1 + 8) * pg;   // 1 header + 8 data pages
             void *ring = mmap(nullptr, ringsz, PROT_READ | PROT_WRITE, MAP_SHARED, (int)fd, 0);
             if (ring == MAP_FAILED) { close((int)fd); logger::log_warn("MEMTOOLS", "WatchAccess mmap failed errno=%d", errno); return -9999; }
+
+            std::lock_guard<std::mutex> lock(g_watch_mutex);
+            MLWatchSlot *slot = nullptr;
+            for (int i = 0; i < kMaxWatchSlots; i++)
+                if (g_watch_slots[i].fd.load(std::memory_order_relaxed) < 0) { slot = &g_watch_slots[i]; break; }
+            if (!slot)
+            {
+                munmap(ring, ringsz); close((int)fd);
+                logger::log_warn("MEMTOOLS", "WatchAccess: all %d watch slots in use", kMaxWatchSlots);
+                return -9998;
+            }
+
+            // Crash-surviving live log — open once, append forever.
+            if (g_memtrace_fd < 0)
+                g_memtrace_fd = open(memtrace::live_path().c_str(),
+                                     O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+
+            slot->ring = ring;
+            slot->ringsz = ringsz;
+            slot->addr = (uintptr_t)addr;
+            slot->len = L;
+            snprintf(slot->mode, sizeof(slot->mode), "%s", m.c_str());
+            slot->acc.clear();
             ioctl((int)fd, PERF_EVENT_IOC_RESET, 0);
             ioctl((int)fd, PERF_EVENT_IOC_ENABLE, 0);
-            g_watches[(int)fd] = MLWatch{(int)fd, ring, ringsz, (uintptr_t)addr, L, m};
-            logger::log_info("MEMTOOLS", "WatchAccess fd=%d addr=0x%lx len=%d mode=%s armed", (int)fd, (unsigned long)addr, L, m.c_str());
+            slot->fd.store((int)fd, std::memory_order_release);   // publish LAST
+
+            if (g_memtrace_fd >= 0)
+            {
+                char hdr[160];
+                int n = snprintf(hdr, sizeof(hdr),
+                                 "=== watch armed fd=%d addr=0x%lx len=%d mode=%s ===\n",
+                                 (int)fd, (unsigned long)addr, L, m.c_str());
+                if (n > 0) { ssize_t w = write(g_memtrace_fd, hdr, (size_t)n); (void)w; }
+            }
+            logger::log_info("MEMTOOLS", "WatchAccess fd=%d addr=0x%lx len=%d mode=%s armed (live log: %s)",
+                             (int)fd, (unsigned long)addr, L, m.c_str(), memtrace::live_path().c_str());
             return (int64_t)fd;
         });
 
-        // WatchRead(fd) → { hits, samples={ {abs,module,off,count}, ... } }  (drains ring; sorted by count desc)
+        // WatchRead(fd) → { hits, samples={ {abs,module,off,count}, ... } }
+        // CUMULATIVE: merges the ring's pending samples into the slot's
+        // accumulator (which the periodic live_drain also feeds), so hits the
+        // watchdog already drained to memtrace_live.log still show up here.
         lua.set_function("WatchRead", [](sol::this_state ts, int fd) -> sol::object
         {
             sol::state_view lua(ts);
             sol::table res = lua.create_table();
-            auto it = g_watches.find(fd);
-            if (it == g_watches.end()) { res["error"] = "no such watch"; return res; }
+            std::lock_guard<std::mutex> lock(g_watch_mutex);
+            MLWatchSlot *slot = watch_slot_by_fd(fd);
+            if (!slot) { res["error"] = "no such watch"; return res; }
 
-            char *mapbase = (char *)it->second.ring;
-            auto *mp = (struct perf_event_mmap_page *)mapbase;
-            long pg = sysconf(_SC_PAGESIZE);
-            uint64_t head = mp->data_head;
-            __sync_synchronize();
-            uint64_t tail = mp->data_tail;
-            uint64_t doff = mp->data_offset ? mp->data_offset : (uint64_t)pg;
-            uint64_t dsize = mp->data_size ? mp->data_size : (it->second.ringsz - pg);
-            char *data = mapbase + doff;
+            watch_parse_ring(*slot, [](void *ctx, uint64_t ip) {
+                (*static_cast<std::map<uint64_t, uint64_t> *>(ctx))[ip]++;
+            }, &slot->acc);
 
-            auto rd = [&](uint64_t pos, void *dst, size_t n) {
-                for (size_t k = 0; k < n; k++) ((char *)dst)[k] = data[(pos + k) % dsize];
-            };
-
-            std::map<uint64_t, uint64_t> counts; // ip → count
             uint64_t total = 0;
-            int guard = 0;
-            while (tail < head && guard++ < 100000)
-            {
-                uint32_t type = 0; uint16_t rsize = 0;
-                rd(tail, &type, 4);
-                rd(tail + 6, &rsize, 2);
-                if (rsize == 0) break;
-                if (type == PERF_RECORD_SAMPLE)
-                {
-                    uint64_t ip = 0; rd(tail + 8, &ip, 8);
-                    counts[ip]++; total++;
-                }
-                tail += rsize;
-            }
-            mp->data_tail = head; // consume
+            for (auto &pr : slot->acc) total += pr.second;
 
             auto mods = ml_module_map();
-            std::vector<std::pair<uint64_t, uint64_t>> v(counts.begin(), counts.end());
+            std::vector<std::pair<uint64_t, uint64_t>> v(slot->acc.begin(), slot->acc.end());
             std::sort(v.begin(), v.end(), [](auto &x, auto &y) { return x.second > y.second; });
             sol::table samples = lua.create_table();
             int i = 0;
@@ -445,12 +522,17 @@ namespace lua_bindings
         // WatchStop(fd) → bool
         lua.set_function("WatchStop", [](int fd) -> bool
         {
-            auto it = g_watches.find(fd);
-            if (it == g_watches.end()) return false;
+            std::lock_guard<std::mutex> lock(g_watch_mutex);
+            MLWatchSlot *slot = watch_slot_by_fd(fd);
+            if (!slot) return false;
+            slot->fd.store(-1, std::memory_order_release); // unpublish FIRST
             ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
-            if (it->second.ring && it->second.ring != MAP_FAILED) munmap(it->second.ring, it->second.ringsz);
             close(fd);
-            g_watches.erase(it);
+            // NOTE: ring mapping deliberately NOT munmap'd — the crash
+            // handler's last-gasp drain may race a stop; a leaked 36KB ring
+            // per stopped watch is cheaper than a fault in the fatal path.
+            slot->ring = nullptr;
+            slot->acc.clear();
             logger::log_info("MEMTOOLS", "WatchStop fd=%d", fd);
             return true;
         });
@@ -460,16 +542,23 @@ namespace lua_bindings
         {
             sol::state_view lua(ts);
             sol::table res = lua.create_table();
+            std::lock_guard<std::mutex> lock(g_watch_mutex);
             int i = 0;
-            for (auto &kv : g_watches)
+            for (int k = 0; k < kMaxWatchSlots; k++)
             {
+                int fd = g_watch_slots[k].fd.load(std::memory_order_relaxed);
+                if (fd < 0) continue;
                 sol::table row = lua.create_table();
-                row["fd"] = (int64_t)kv.second.fd; row["addr"] = (int64_t)kv.second.addr;
-                row["len"] = (int64_t)kv.second.len; row["mode"] = kv.second.mode;
+                row["fd"] = (int64_t)fd; row["addr"] = (int64_t)g_watch_slots[k].addr;
+                row["len"] = (int64_t)g_watch_slots[k].len; row["mode"] = g_watch_slots[k].mode;
                 res[++i] = row;
             }
             return res;
         });
+
+        // MemTraceLivePath() → path of the crash-surviving watch trace log
+        lua.set_function("MemTraceLivePath", []() -> std::string
+        { return memtrace::live_path(); });
 
         // ═══ AOB / PATTERN (future-proof address resolution) ═════════════════
         // A signature scanner that survives game updates: author a sig once
@@ -627,3 +716,131 @@ namespace lua_bindings
     }
 
 } // namespace lua_bindings
+
+// ═══════════════════════════════════════════════════════════════════════════
+// memtrace — crash-surviving live log for the hardware watchpoint (see
+// modloader/memtrace.h for the contract). Lives here because it shares the
+// watch-slot state above.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace memtrace
+{
+
+    std::string live_path()
+    {
+        return paths::data_dir() + "/memtrace_live.log";
+    }
+
+    // Periodic drain (watchdog thread): ring → accumulator + compact log line.
+    void live_drain()
+    {
+        using namespace lua_bindings;
+        std::lock_guard<std::mutex> lock(g_watch_mutex);
+        for (int i = 0; i < kMaxWatchSlots; i++)
+        {
+            MLWatchSlot &s = g_watch_slots[i];
+            int fd = s.fd.load(std::memory_order_acquire);
+            if (fd < 0 || !s.ring)
+                continue;
+
+            std::map<uint64_t, uint64_t> fresh;
+            watch_parse_ring(s, [](void *ctx, uint64_t ip) {
+                (*static_cast<std::map<uint64_t, uint64_t> *>(ctx))[ip]++;
+            }, &fresh);
+            if (fresh.empty())
+                continue;
+
+            uint64_t total = 0;
+            for (auto &pr : fresh)
+            {
+                s.acc[pr.first] += pr.second;
+                total += pr.second;
+            }
+
+            if (g_memtrace_fd < 0)
+                continue;
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            char buf[768];
+            int n = snprintf(buf, sizeof(buf), "[%lld.%03ld] fd=%d addr=0x%lx +%llu hits:",
+                             (long long)ts.tv_sec, ts.tv_nsec / 1000000, fd,
+                             (unsigned long)s.addr, (unsigned long long)total);
+            int shown = 0;
+            for (auto &pr : fresh)
+            {
+                if (n >= (int)sizeof(buf) - 40 || shown >= 12)
+                {
+                    n += snprintf(buf + n, sizeof(buf) - n, " ...");
+                    break;
+                }
+                n += snprintf(buf + n, sizeof(buf) - n, " 0x%llx x%llu",
+                              (unsigned long long)pr.first, (unsigned long long)pr.second);
+                shown++;
+            }
+            if (n < (int)sizeof(buf) - 2)
+            {
+                buf[n++] = '\n';
+                ssize_t w = write(g_memtrace_fd, buf, (size_t)n);
+                (void)w;
+            }
+        }
+    }
+
+    // Last-gasp drain from the FATAL signal handler. Async-signal-safe:
+    // no locks (the process is dying; a torn read is acceptable), no malloc —
+    // fixed-size aggregation + raw write() to the pre-opened O_APPEND fd.
+    void crash_drain(int sig)
+    {
+        using namespace lua_bindings;
+        if (g_memtrace_fd < 0)
+            return;
+
+        bool any = false;
+        for (int i = 0; i < kMaxWatchSlots; i++)
+        {
+            MLWatchSlot &s = g_watch_slots[i];
+            int fd = s.fd.load(std::memory_order_acquire);
+            if (fd < 0 || !s.ring)
+                continue;
+
+            struct Agg
+            {
+                uint64_t ip[64];
+                uint64_t count[64];
+                int n;
+                uint64_t total;
+            } agg;
+            agg.n = 0;
+            agg.total = 0;
+            watch_parse_ring(s, [](void *ctx, uint64_t ip) {
+                Agg *a = static_cast<Agg *>(ctx);
+                a->total++;
+                for (int k = 0; k < a->n; k++)
+                    if (a->ip[k] == ip) { a->count[k]++; return; }
+                if (a->n < 64) { a->ip[a->n] = ip; a->count[a->n] = 1; a->n++; }
+            }, &agg);
+
+            if (!any)
+            {
+                char hdr[96];
+                int hn = snprintf(hdr, sizeof(hdr),
+                                  "=== CRASH last-gasp drain (signal %d) ===\n", sig);
+                if (hn > 0) { ssize_t w = write(g_memtrace_fd, hdr, (size_t)hn); (void)w; }
+                any = true;
+            }
+
+            char buf[768];
+            int n = snprintf(buf, sizeof(buf), "CRASH fd=%d addr=0x%lx pending=%llu:",
+                             fd, (unsigned long)s.addr, (unsigned long long)agg.total);
+            for (int k = 0; k < agg.n && n < (int)sizeof(buf) - 40; k++)
+                n += snprintf(buf + n, sizeof(buf) - n, " 0x%llx x%llu",
+                              (unsigned long long)agg.ip[k], (unsigned long long)agg.count[k]);
+            if (n < (int)sizeof(buf) - 2)
+            {
+                buf[n++] = '\n';
+                ssize_t w = write(g_memtrace_fd, buf, (size_t)n);
+                (void)w;
+            }
+        }
+    }
+
+} // namespace memtrace

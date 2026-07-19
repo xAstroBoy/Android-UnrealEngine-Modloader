@@ -69,6 +69,10 @@ namespace adb_bridge
 
     // ═══ Custom command registry ════════════════════════════════════════════
     static std::unordered_map<std::string, CommandHandler> s_custom_commands;
+    // Wrappers let a mod ENHANCE an existing command (built-in or custom): the
+    // wrapper receives the args plus a `call_original` thunk it may invoke,
+    // inspect, and augment. Keyed by command name.
+    static std::unordered_map<std::string, CommandWrapper> s_wrappers;
     static std::mutex s_command_mutex;
 
     void register_command(const std::string &name, CommandHandler handler)
@@ -85,6 +89,20 @@ namespace adb_bridge
         {
             logger::log_info("ADB", "Unregistered custom command: '%s'", name.c_str());
         }
+    }
+
+    void register_command_wrapper(const std::string &name, CommandWrapper wrapper)
+    {
+        std::lock_guard<std::mutex> lock(s_command_mutex);
+        s_wrappers[name] = std::move(wrapper);
+        logger::log_info("ADB", "Registered command WRAPPER on: '%s'", name.c_str());
+    }
+
+    void unregister_command_wrapper(const std::string &name)
+    {
+        std::lock_guard<std::mutex> lock(s_command_mutex);
+        if (s_wrappers.erase(name) > 0)
+            logger::log_info("ADB", "Unregistered command wrapper: '%s'", name.c_str());
     }
 
     std::vector<std::string> get_registered_commands()
@@ -1085,7 +1103,9 @@ namespace adb_bridge
     }
 
     // ═══ Dispatch command ═══════════════════════════════════════════════════
-    static std::string dispatch(const std::string &raw_json)
+    // The stock dispatcher (built-ins + custom commands). Renamed so a mod
+    // WRAPPER can call it as the "original" without re-entering wrapper lookup.
+    static std::string dispatch_core(const std::string &raw_json)
     {
         json cmd = json::parse(raw_json, nullptr, false);
         if (cmd.is_discarded())
@@ -1145,6 +1165,15 @@ namespace adb_bridge
             return handle_inspect(cmd);
         if (command == "object_count")
             return handle_object_count();
+        // Runtime log-level control: {"cmd":"log_level","level":"debug"} sets it;
+        // no "level" just reports the current one. Turns DEBUG output on/off.
+        if (command == "log_level")
+        {
+            if (cmd.contains("level") && cmd["level"].is_string())
+                logger::set_min_level(logger::level_from_string(cmd["level"].get<std::string>().c_str()));
+            static const char *names[] = {"debug", "info", "warn", "error"};
+            return ok_response(std::string(names[logger::get_min_level()]));
+        }
         if (command == "aes_scan")
             return handle_aes_scan();
         if (command == "aes_latest")
@@ -1425,6 +1454,41 @@ namespace adb_bridge
         }
 
         return error_response("unknown command: " + command);
+    }
+
+    // Public dispatch: apply a mod WRAPPER if one is registered for this command
+    // (so C#/Lua can append/enhance/override a stock command), otherwise run the
+    // stock dispatcher. The wrapper is handed the args + a `call_original` thunk.
+    static std::string dispatch(const std::string &raw_json)
+    {
+        json cmd = json::parse(raw_json, nullptr, false);
+        if (cmd.is_discarded() || !cmd.contains("cmd"))
+            return dispatch_core(raw_json);
+        std::string command = cmd["cmd"];
+
+        CommandWrapper wrapper;
+        {
+            std::lock_guard<std::mutex> lock(s_command_mutex);
+            auto it = s_wrappers.find(command);
+            if (it != s_wrappers.end())
+                wrapper = it->second;
+        }
+        if (!wrapper)
+            return dispatch_core(raw_json);
+
+        std::string args = cmd.contains("args") && cmd["args"].is_string()
+                               ? cmd["args"].get<std::string>()
+                               : "";
+        // call_original re-runs the STOCK dispatcher for this exact request.
+        auto call_original = [&raw_json]() -> std::string { return dispatch_core(raw_json); };
+        try
+        {
+            return wrapper(args, call_original);
+        }
+        catch (...)
+        {
+            return error_response("command wrapper for '" + command + "' threw");
+        }
     }
 
     // ═══ Handle a single client connection ══════════════════════════════════

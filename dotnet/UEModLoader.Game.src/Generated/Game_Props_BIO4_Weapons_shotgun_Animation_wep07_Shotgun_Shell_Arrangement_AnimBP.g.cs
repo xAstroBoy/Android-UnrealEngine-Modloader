@@ -1,0 +1,33 @@
+// AUTO-GENERATED from the live UE reflection graph. Do not edit.
+// Package: /Game/Props/BIO4/Weapons/shotgun/Animation/wep07_Shotgun_Shell_Arrangement_AnimBP
+using System;
+
+namespace UEModLoader.Game
+{
+    public class wep07_Shotgun_Shell_Arrangement_AnimBP_C : AnimInstance
+    {
+        public const string UeClassName = "wep07_Shotgun_Shell_Arrangement_AnimBP_C";
+        public wep07_Shotgun_Shell_Arrangement_AnimBP_C(global::System.IntPtr ptr) : base(ptr) {}
+        public static new wep07_Shotgun_Shell_Arrangement_AnimBP_C FromPointer(global::System.IntPtr p) => p==global::System.IntPtr.Zero?null:new wep07_Shotgun_Shell_Arrangement_AnimBP_C(p);
+        public static wep07_Shotgun_Shell_Arrangement_AnimBP_C FirstOf() { var o = UObject.FindFirstOf(UeClassName); return o==null?null:new wep07_Shotgun_Shell_Arrangement_AnimBP_C(o.Pointer); }
+        public static wep07_Shotgun_Shell_Arrangement_AnimBP_C[] All() { var a = UObject.FindAllOf(UeClassName); var r = new wep07_Shotgun_Shell_Arrangement_AnimBP_C[a.Length]; for(int i=0;i<a.Length;i++) r[i]=new wep07_Shotgun_Shell_Arrangement_AnimBP_C(a[i].Pointer); return r; }
+        public PointerToUberGraphFrame UberGraphFrame => new PointerToUberGraphFrame(AddrOf(0x270));
+        public AnimNode_Root AnimGraphNode_Root => new AnimNode_Root(AddrOf(0x278));
+        public AnimNode_Slot AnimGraphNode_Slot => new AnimNode_Slot(AddrOf(0x2A8));
+        public AnimNode_LinkedInputPose AnimGraphNode_LinkedInputPose => new AnimNode_LinkedInputPose(AddrOf(0x2F0));
+        public void AnimGraph(global::System.IntPtr InPose, global::System.IntPtr AnimGraph)
+        {
+            var __pb = new ParamBuffer(32);
+            __pb.Set<global::System.IntPtr>(0x0, InPose);
+            __pb.Set<global::System.IntPtr>(0x10, AnimGraph);
+            CallRaw("AnimGraph", __pb.Bytes);
+        }
+        public void ExecuteUbergraph_wep07_Shotgun_Shell_Arrangement_AnimBP(int EntryPoint)
+        {
+            var __pb = new ParamBuffer(4);
+            __pb.Set(0x0, EntryPoint);
+            CallRaw("ExecuteUbergraph_wep07_Shotgun_Shell_Arrangement_AnimBP", __pb.Bytes);
+        }
+    }
+
+}

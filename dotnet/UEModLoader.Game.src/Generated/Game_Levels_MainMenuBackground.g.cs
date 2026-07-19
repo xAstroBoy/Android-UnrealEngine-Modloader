@@ -1,0 +1,29 @@
+// AUTO-GENERATED from the live UE reflection graph. Do not edit.
+// Package: /Game/Levels/MainMenuBackground
+using System;
+
+namespace UEModLoader.Game
+{
+    public class MainMenuBackground_C : LevelScriptActor
+    {
+        public const string UeClassName = "MainMenuBackground_C";
+        public MainMenuBackground_C(global::System.IntPtr ptr) : base(ptr) {}
+        public static new MainMenuBackground_C FromPointer(global::System.IntPtr p) => p==global::System.IntPtr.Zero?null:new MainMenuBackground_C(p);
+        public static MainMenuBackground_C FirstOf() { var o = UObject.FindFirstOf(UeClassName); return o==null?null:new MainMenuBackground_C(o.Pointer); }
+        public static MainMenuBackground_C[] All() { var a = UObject.FindAllOf(UeClassName); var r = new MainMenuBackground_C[a.Length]; for(int i=0;i<a.Length;i++) r[i]=new MainMenuBackground_C(a[i].Pointer); return r; }
+        public PointerToUberGraphFrame UberGraphFrame => new PointerToUberGraphFrame(AddrOf(0x228));
+        public LinearColor LinearBlack => new LinearColor(AddrOf(0x230));
+        public void ReceiveBeginPlay()
+        {
+            var __pb = new ParamBuffer(0);
+            CallRaw("ReceiveBeginPlay", __pb.Bytes);
+        }
+        public void ExecuteUbergraph_MainMenuBackground(int EntryPoint)
+        {
+            var __pb = new ParamBuffer(4);
+            __pb.Set(0x0, EntryPoint);
+            CallRaw("ExecuteUbergraph_MainMenuBackground", __pb.Bytes);
+        }
+    }
+
+}

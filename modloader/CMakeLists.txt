@@ -30,6 +30,7 @@ set(MOD_SOURCES
     src/hook/process_event_hook.cpp
     src/hook/pe_trace.cpp
     src/hook/native_hooks.cpp
+    src/hook/re4_native_hooks.cpp
     src/reflection/reflection_walker.cpp
     src/reflection/lua_dump_generator.cpp
     src/reflection/ida_mapping_generator.cpp
@@ -51,10 +52,16 @@ set(MOD_SOURCES
     src/pak/pak_mounter.cpp
     src/pak/aes_extractor.cpp
     src/bridge/adb_bridge.cpp
+    src/bridge/menu_bridge.cpp
     src/util/logger.cpp
     src/util/crash_handler.cpp
+    src/util/crash_guard.cpp
     src/util/notification.cpp
     src/util/safe_call.cpp
+    src/core/arm64_asm.cpp
+    src/core/codepatch.cpp
+    src/dotnet/dotnet_host.cpp
+    src/dotnet/csharp_proxy_generator.cpp
     src/core/auto_offsets.cpp
     src/core/ue_memory.cpp
     src/lua/lua_console.cpp

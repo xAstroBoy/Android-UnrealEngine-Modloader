@@ -15,6 +15,7 @@
 #include "modloader/logger.h"
 #include "modloader/paths.h"
 #include "modloader/safe_call.h"
+#include "modloader/crash_guard.h"
 #include "modloader/auto_offsets.h"
 #include "modloader/pe_trace.h"
 #include "modloader/reflection_walker.h"
@@ -534,7 +535,40 @@ namespace lua_console
             t["exception_recoveries"] = safe_call::exception_count();
             t["signal_recoveries"] = safe_call::signal_recovery_count();
             t["last_context"] = safe_call::last_crash_context();
+            // Crash-guard v2 stats (recovered/suppressed crashes)
+            crash_guard::Stats cg = crash_guard::stats();
+            sol::table g = lua_view.create_table();
+            g["enabled"] = crash_guard::enabled();
+            g["total"] = cg.total;
+            g["dropped"] = cg.dropped;
+            g["sites"] = cg.sites;
+            g["suppressed_log"] = cg.suppressed_log;
+            g["storm_tripped"] = cg.storm_tripped;
+            g["safe_call"] = cg.by_kind[(int)crash_guard::Kind::SafeCall];
+            g["hook_original"] = cg.by_kind[(int)crash_guard::Kind::HookOriginal];
+            g["hook_install"] = cg.by_kind[(int)crash_guard::Kind::HookInstall];
+            g["ufunction_call"] = cg.by_kind[(int)crash_guard::Kind::UFunctionCall];
+            g["mod_load"] = cg.by_kind[(int)crash_guard::Kind::ModLoad];
+            g["global_skip"] = cg.by_kind[(int)crash_guard::Kind::GlobalSkip];
+            g["last"] = crash_guard::last_summary();
+            t["crash_guard"] = g;
             return t; });
+
+        // ─── Crash-guard controls ───────────────────────────────────────────
+        // Master toggle: false = every fault fatal (tombstone), for bug-hunting.
+        lua.set_function("SetCrashGuardEnabled", [](bool on)
+                         { crash_guard::set_enabled(on); });
+        lua.set_function("IsCrashGuardEnabled", []() -> bool
+                         { return crash_guard::enabled(); });
+        // Global instruction-skip mode: "off" | "null" | "all".
+        lua.set_function("SetCrashGuardGlobalMode", [](const std::string &m)
+                         { crash_guard::set_global_mode(crash_guard::global_mode_from_string(m)); });
+        // Auto-quarantine threshold: recovered crashes attributed to one mod
+        // before its patches are reverted (0 = never).
+        lua.set_function("SetCrashGuardQuarantineThreshold", [](int n)
+                         { crash_guard::set_quarantine_threshold(n); });
+        lua.set_function("GetRecoveredCrashLogPath", []() -> std::string
+                         { return paths::recovered_log(); });
 
         // ─── Crash Log Path ─────────────────────────────────────────────────
         lua.set_function("GetCrashLogPath", []() -> std::string

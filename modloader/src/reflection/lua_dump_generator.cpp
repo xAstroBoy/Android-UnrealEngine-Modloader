@@ -995,6 +995,20 @@ namespace sdk_gen
                 if (!fflags.empty())
                     fprintf(f, "---%s\n", fflags.c_str());
 
+                // Trace the native C++ implementation: for FUNC_Native functions
+                // emit the thunk's libUE4 RVA so a mod can call/hook the real
+                // native function directly (dlsym is usually stripped for these).
+                if (func.is_native() && func.native_func)
+                {
+                    uintptr_t base = symbols::lib_base();
+                    uintptr_t addr = reinterpret_cast<uintptr_t>(func.native_func);
+                    if (base && addr >= base)
+                        fprintf(f, "---@native_func 0x%lX (RVA 0x%lX)\n",
+                                (unsigned long)addr, (unsigned long)(addr - base));
+                    else
+                        fprintf(f, "---@native_func 0x%lX\n", (unsigned long)addr);
+                }
+
                 fprintf(f, "function %s:%s(", ci.name.c_str(), func.name.c_str());
                 bool first = true;
                 for (const auto &param : func.params)

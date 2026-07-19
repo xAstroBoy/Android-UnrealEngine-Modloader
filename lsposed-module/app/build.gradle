@@ -12,8 +12,11 @@ android {
         targetSdk 34
         versionCode 1
         versionName '1.0'
-        // arm64 only — Quest is ARM64, and the payload is libmodloader.so (arm64-v8a)
-        ndk { abiFilters 'arm64-v8a' }
+        // Bundle BOTH payloads: arm64-v8a for 64-bit titles (RE4, Pinball FX) and
+        // armeabi-v7a for 32-bit titles (Face Your Fears 1/2). The module app runs
+        // 64-bit, so only arm64 lands in its nativeLibraryDir; the armeabi-v7a copy
+        // rides along in the APK and is extracted at inject time for 32-bit games.
+        ndk { abiFilters 'arm64-v8a', 'armeabi-v7a' }
     }
 
     // Force the payload .so to be extracted to the module's nativeLibraryDir on

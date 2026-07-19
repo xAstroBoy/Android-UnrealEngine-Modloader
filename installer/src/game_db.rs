@@ -49,6 +49,26 @@ pub const GAMES: &[GameProfile] = &[
         ],
         native_lib: "libUnreal.so",
     },
+    // 32-bit (armeabi-v7a) UE4 titles — the installer auto-selects the
+    // armeabi-v7a libmodloader.so for these by detecting the APK's ABI.
+    GameProfile {
+        name: "Face Your Fears",
+        package: "gg.trs.fears",
+        smali_target: "com/epicgames/ue4/GameActivity",
+        smali_fallbacks: &[
+            "com/epicgames/unreal/GameActivity",
+        ],
+        native_lib: "libUE4.so",
+    },
+    GameProfile {
+        name: "Face Your Fears 2",
+        package: "gg.trs.fyf2",
+        smali_target: "com/epicgames/ue4/GameActivity",
+        smali_fallbacks: &[
+            "com/epicgames/unreal/GameActivity",
+        ],
+        native_lib: "libUE4.so",
+    },
 ];
 
 /// Find a game profile by package name

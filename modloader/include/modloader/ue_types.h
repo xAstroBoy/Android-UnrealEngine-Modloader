@@ -34,14 +34,15 @@ namespace ue
         int32_t Num;
         int32_t Max;
     };
-    static_assert(sizeof(FTArray) == 0x10, "FTArray must be 16 bytes");
+    // 16 bytes on ARM64 (8-byte Data ptr), 12 bytes on ARM32 (4-byte Data ptr).
+    static_assert(sizeof(FTArray) == sizeof(void *) + 8, "FTArray must be ptr + 2*int32");
 
     namespace tarray
     {
         constexpr uint32_t DATA = 0x00;
-        constexpr uint32_t NUM = 0x08;
-        constexpr uint32_t MAX = 0x0C;
-        constexpr uint32_t SIZE = 0x10;
+        constexpr uint32_t NUM = sizeof(void *);      // 0x08 ARM64 / 0x04 ARM32
+        constexpr uint32_t MAX = sizeof(void *) + 4;  // 0x0C ARM64 / 0x08 ARM32
+        constexpr uint32_t SIZE = sizeof(void *) + 8; // 0x10 ARM64 / 0x0C ARM32
     }
 
     // FString — TArray<TCHAR> where TCHAR = char16_t on Android ARM64
@@ -53,14 +54,14 @@ namespace ue
         int32_t Num;
         int32_t Max;
     };
-    static_assert(sizeof(FString) == 0x10, "FString must be 16 bytes");
+    static_assert(sizeof(FString) == sizeof(void *) + 8, "FString must be ptr + 2*int32");
 
     namespace fstring
     {
         constexpr uint32_t DATA = 0x00;
-        constexpr uint32_t NUM = 0x08;
-        constexpr uint32_t MAX = 0x0C;
-        constexpr uint32_t SIZE = 0x10;
+        constexpr uint32_t NUM = sizeof(void *);      // 0x08 ARM64 / 0x04 ARM32
+        constexpr uint32_t MAX = sizeof(void *) + 4;  // 0x0C ARM64 / 0x08 ARM32
+        constexpr uint32_t SIZE = sizeof(void *) + 8; // 0x10 ARM64 / 0x0C ARM32
     }
 
     // FText — opaque text container
@@ -403,7 +404,7 @@ namespace ue
     {
         FTArray InvocationList; // TArray<FScriptDelegate>
     };
-    static_assert(sizeof(FMulticastScriptDelegate) == 16, "FMulticastScriptDelegate must be 16 bytes");
+    static_assert(sizeof(FMulticastScriptDelegate) == sizeof(FTArray), "FMulticastScriptDelegate is one TArray");
 
     // ═══════════════════════════════════════════════════════════════════════════
     // FSoftObjectPath / FSoftObjectPtr

@@ -52,14 +52,52 @@ public class UeModLoaderModule implements IXposedHookLoadPackage, IXposedHookZyg
     private static final String MODULE_PKG = "com.xastroboy.uemodloader.lsposed";
     /** System.load target — libmodloader.so → soname "modloader". */
     private static final String PAYLOAD_SO = "libmodloader.so";
-    private static final String PAYLOAD_ENTRY = "lib/arm64-v8a/" + PAYLOAD_SO;
     private static final String TARGETS_FILE = "/sdcard/UnrealModloader/lsposed_targets.txt";
 
     private static final List<String> KNOWN_TARGETS = Arrays.asList(
-            "com.Armature.VR4",         // Resident Evil 4 VR
-            "com.zenstudios.PFXVRQuest", // Pinball FX VR
-            "com.Capricia.HandBoi"      // Hand Boi
+            "com.Armature.VR4",          // Resident Evil 4 VR (arm64)
+            "com.zenstudios.PFXVRQuest", // Pinball FX VR (arm64)
+            "com.Capricia.HandBoi",      // Hand Boi (arm64)
+            "gg.trs.fears",              // Face Your Fears (armeabi-v7a, 32-bit)
+            "gg.trs.fyf2"                // Face Your Fears 2 (armeabi-v7a, 32-bit)
     );
+
+    /** True if the CURRENT (target game) process is 64-bit. The module runs
+     *  inside the game process, so this is the game's bitness — which decides
+     *  whether we load the arm64-v8a or the armeabi-v7a libmodloader.so. */
+    private static boolean targetIs64() {
+        try {
+            return android.os.Process.is64Bit();
+        } catch (Throwable t) {
+            return true; // default to arm64 (the common Quest case)
+        }
+    }
+
+    /** The bundled APK zip entry for the payload matching the target's bitness. */
+    private static String payloadEntry() {
+        return (targetIs64() ? "lib/arm64-v8a/" : "lib/armeabi-v7a/") + PAYLOAD_SO;
+    }
+
+    /** True if `f` is an ELF whose class (32/64-bit) matches the target process,
+     *  so we never hand a 64-bit .so to a 32-bit game (or vice-versa) — the
+     *  linker would reject it. ELF class byte is at offset 4 (1=32, 2=64). */
+    private static boolean elfMatchesTarget(File f) {
+        InputStream in = null;
+        try {
+            in = new FileInputStream(f);
+            byte[] h = new byte[5];
+            int n = in.read(h);
+            if (n < 5 || h[0] != 0x7f || h[1] != 'E' || h[2] != 'L' || h[3] != 'F') {
+                return false;
+            }
+            boolean elf64 = (h[4] == 2);
+            return elf64 == targetIs64();
+        } catch (Throwable t) {
+            return false;
+        } finally {
+            closeQuietly(in);
+        }
+    }
 
     /** Absolute path to this module's APK — captured at zygote init. */
     private static volatile String sModulePath = null;
@@ -269,8 +307,15 @@ public class UeModLoaderModule implements IXposedHookLoadPackage, IXposedHookZyg
         String loadPath = path;
         if (ctx != null) {
             try {
+                File src = new File(path);
                 File dst = new File(ctx.getCodeCacheDir(), PAYLOAD_SO);
-                copyFile(new File(path), dst);
+                // resolvePayloadPath may ALREADY have extracted into codeCacheDir
+                // (the 32-bit path extracts the armeabi-v7a payload from the APK
+                // straight to this dir). Copying a file onto itself truncates it to
+                // 0 bytes — so only copy when src and dst are genuinely different.
+                if (!src.getCanonicalFile().equals(dst.getCanonicalFile())) {
+                    copyFile(src, dst);
+                }
                 //noinspection ResultOfMethodCallIgnored
                 dst.setReadable(true, false);
                 //noinspection ResultOfMethodCallIgnored
@@ -372,13 +417,21 @@ public class UeModLoaderModule implements IXposedHookLoadPackage, IXposedHookZyg
      *   3. Extract the lib from the module APK into the game's codeCacheDir.
      */
     private String resolvePayloadPath(Context ctx) {
-        // 1. Derive from the module APK path: <apkdir>/lib/arm64/libmodloader.so
+        // The module app installs with the device's primary ABI (arm64 on Quest),
+        // so its extracted nativeLibraryDir only holds the arm64 payload. For a
+        // 64-bit game that is exactly right; for a 32-bit game (Face Your Fears)
+        // it is the WRONG arch, so every on-disk candidate is validated against
+        // the target process's bitness (elfMatchesTarget) and a mismatch falls
+        // through to extracting the armeabi-v7a payload from the module APK zip.
+        final String subdir = targetIs64() ? "lib/arm64/" : "lib/arm/";
+
+        // 1. Derive from the module APK path: <apkdir>/lib/<abi>/libmodloader.so
         if (sModulePath != null) {
             try {
                 File apkDir = new File(sModulePath).getParentFile();
                 if (apkDir != null) {
-                    File cand = new File(apkDir, "lib/arm64/" + PAYLOAD_SO);
-                    if (cand.exists()) {
+                    File cand = new File(apkDir, subdir + PAYLOAD_SO);
+                    if (cand.exists() && elfMatchesTarget(cand)) {
                         return cand.getAbsolutePath();
                     }
                 }
@@ -392,7 +445,7 @@ public class UeModLoaderModule implements IXposedHookLoadPackage, IXposedHookZyg
                 ApplicationInfo ai = ctx.getPackageManager().getApplicationInfo(MODULE_PKG, 0);
                 if (ai.nativeLibraryDir != null) {
                     File cand = new File(ai.nativeLibraryDir, PAYLOAD_SO);
-                    if (cand.exists()) {
+                    if (cand.exists() && elfMatchesTarget(cand)) {
                         return cand.getAbsolutePath();
                     }
                 }
@@ -400,13 +453,14 @@ public class UeModLoaderModule implements IXposedHookLoadPackage, IXposedHookZyg
             }
         }
 
-        // 3. Last resort: extract from the module APK zip into the game's own
-        //    code cache (app_data_file for the game UID — usually exec-allowed).
+        // 3. Extract the ABI-matching payload from the module APK zip into the
+        //    game's own code cache (app_data_file for the game UID — usually
+        //    exec-allowed). This is the normal path for a 32-bit game, whose
+        //    arch the module's own nativeLibraryDir does not carry.
         if (sModulePath != null && ctx != null) {
             try {
                 File out = new File(ctx.getCodeCacheDir(), PAYLOAD_SO);
-                if (extractFromApk(sModulePath, PAYLOAD_ENTRY, out)) {
-                    // Loadable only if it landed executable; try it regardless.
+                if (extractFromApk(sModulePath, payloadEntry(), out) && elfMatchesTarget(out)) {
                     return out.getAbsolutePath();
                 }
             } catch (Throwable t) {

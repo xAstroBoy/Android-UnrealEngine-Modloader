@@ -1,4 +1,4 @@
--- mods/Randomizer/main.lua v12.7
+-- mods/Randomizer/main.lua v12.9
 -- ═══════════════════════════════════════════════════════════════════════
 -- UE4SS-enhanced Enemy Randomizer — re-randomizes on EVERY level load
 --
@@ -416,11 +416,19 @@ local function getEmListSignature(emListPtr)
     return table.concat(parts, ":")
 end
 
-local function findOriginalEnemyDef(emListPtr, origEmId, allowEmIdFallback)
-    local sig = ""
-    pcall(function()
-        sig = getEmListSignature(emListPtr)
-    end)
+-- knownSig (optional): callers that have ALREADY built the row signature pass
+-- it in so we do not read the same 7 bytes a second time. Each ReadU8 is an
+-- msync syscall, so on the room-load path this was 7 wasted syscalls + a table
+-- + 7 tostring() strings + a closure per spawn slot. Omit it and the old
+-- self-contained behaviour is unchanged.
+local function findOriginalEnemyDef(emListPtr, origEmId, allowEmIdFallback, knownSig)
+    local sig = knownSig
+    if sig == nil then
+        sig = ""
+        pcall(function()
+            sig = getEmListSignature(emListPtr)
+        end)
+    end
     if sig ~= "" then
         local bySig = ENEMIES_BY_SIGNATURE[sig]
         if bySig then return bySig, "signature" end
@@ -490,6 +498,20 @@ local state = {
     -- pick the enemy. Turn this ON only to restrict picks to the emIds this room
     -- was authored with, if you ever want a guaranteed-vanilla-safe shuffle.
     roomScopedCrossover = false,
+    -- ON by default. A level's SCE script drives its set pieces off SPECIFIC boss
+    -- rows in EM_LIST — r10b (the boat/lake level) is the reported case. Rewriting
+    -- one of those rows swaps the scripted boss for an ordinary enemy, so the beat
+    -- never resolves: the fight doesn't end, the level can't progress, and the
+    -- progression items that beat is supposed to hand out never appear. That is
+    -- the "randomizer fucks up level bosses n scripted bosses/items" report.
+    --
+    -- The protection is ONE-DIRECTIONAL and deliberately so:
+    --   * a boss row is never used as a SOURCE  -> the script still gets its boss
+    --   * bosses stay fully available as TARGETS -> a normal row can still become
+    --     El Gigante / Krauser / U3, so the VARIETY IS UNCHANGED. Nothing is
+    --     capped, weighted, or removed from the pool.
+    -- Turn it off with `randomizer_protect` if you want the old chaos.
+    protectScripted = true,
     enabledEnemies = {},
     swapCount = 0,
 }
@@ -502,13 +524,16 @@ for _, e in ipairs(ENEMIES) do state.enabledEnemies[e.name] = true end
 -- ═══════════════════════════════════════════════════════════════════════
 local currentGen    = 0      -- Increments on each detected level change
 local levelSwaps    = 0      -- Swaps since last level change
+local protectedSkips = 0     -- Scripted boss rows left alone this level (r10b fix)
 local lastDetectTime = 0     -- Debounce level-change log messages
 local cachedPool    = nil    -- Pre-built enabled pool (rebuilt on config change)
 local poolDirty     = true   -- Flag to rebuild cachedPool
+local poolVersion   = 0      -- Bumped on every invalidate; cache key for derived lists
 
 local function invalidatePool()
     cachedPool = nil
     poolDirty = true
+    poolVersion = poolVersion + 1
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -525,6 +550,7 @@ local function saveConfig()
         hpMode = state.hpMode,
         randomizeCutscenes = state.randomizeCutscenes,
         roomScopedCrossover = state.roomScopedCrossover,
+        protectScripted = state.protectScripted,
         enabledNames = names,
     })
     invalidatePool()  -- Rebuild cached pool on next pickRandom
@@ -549,6 +575,10 @@ local function loadConfig()
     if cfg.hpMode then state.hpMode = cfg.hpMode end
     if cfg.randomizeCutscenes ~= nil then state.randomizeCutscenes = cfg.randomizeCutscenes end
     if cfg.roomScopedCrossover ~= nil then state.roomScopedCrossover = cfg.roomScopedCrossover end
+    -- Default TRUE for existing configs saved before this option existed: a saved
+    -- config without the field must still get the r10b protection, not inherit
+    -- the old broken behaviour.
+    if cfg.protectScripted ~= nil then state.protectScripted = cfg.protectScripted end
     if cfg.enabledNames then
         for name, _ in pairs(state.enabledEnemies) do state.enabledEnemies[name] = false end
         for _, name in ipairs(cfg.enabledNames) do
@@ -608,27 +638,80 @@ local function getEnabledPool()
     return pool
 end
 
+-- ═══════════════════════════════════════════════════════════════════════
+-- IS THIS PICK ACTUALLY WRITEABLE?
+-- ═══════════════════════════════════════════════════════════════════════
+-- "If an enemy is invalid, don't put empty — return the original one or another
+-- valid one." A row is not a request, it is a FACT: writing an emId the engine
+-- cannot construct does not fail loudly, it just produces NOTHING — an empty
+-- spot where the level had an enemy. getEnabledPool() screens the pool at build
+-- time, but a pick can still arrive here from a cached candidate list built
+-- before the screen, or with a nil/absent emId byte, so the write site re-checks.
+--
+-- Deliberately conservative: with no IsEmIdSupported binding we only verify the
+-- bytes exist, because assuming "unsupported" there would silently disable the
+-- whole mod rather than one enemy.
+local function pickIsUsable(e)
+    if not e or not e.bytes then return false end
+    local id = e.bytes[1]
+    if id == nil then return false end
+    if IsEmIdSupported then
+        local ok, sup = pcall(IsEmIdSupported, id)
+        if not ok or not sup then return false end
+    end
+    return true
+end
+
 local function pickRandom()
     local pool = getEnabledPool()
     if #pool == 0 then return nil end
     return pool[math.random(#pool)]
 end
 
-local function pickFromCandidatesAvoidName(candidates, avoidName)
-    if #candidates == 0 then return nil end
+-- PERF: this used to build a `filtered` COPY of the candidate list on every
+-- call just to exclude one name. On the room-load path that is a ~200-element
+-- table allocated and thrown away per spawn slot (255 slots => ~50k wasted
+-- iterations + ~0.8MB of garbage), and the GC bill lands on the game thread
+-- while the screen is black.
+--
+-- Enemy names are UNIQUE across POOL (verified: 202 entries, 202 distinct
+-- names) and every candidate list here is a single-pass filter over the pool
+-- or over ENEMIES — no concatenation, no duplicates. So at most ONE element
+-- can match avoidName, and "uniform over the list minus that element" is
+-- exactly index-skip sampling: draw r in 1..n-1, bump it past the skipped
+-- index. Same set of outcomes, same probability for each, same number of
+-- math.random draws (1), so the RNG stream is not shifted either.
+--
+-- indexByName is optional: when the caller holds a stable candidate list it
+-- can pass a prebuilt name->index map and the skip lookup becomes O(1)
+-- instead of a linear scan. Without it the behaviour is identical.
+local function pickFromCandidatesAvoidName(candidates, avoidName, indexByName)
+    local n = #candidates
+    if n == 0 then return nil end
     if not avoidName then
-        return candidates[math.random(#candidates)]
+        return candidates[math.random(n)]
     end
-    local filtered = {}
-    for _, e in ipairs(candidates) do
-        if e.name ~= avoidName then
-            filtered[#filtered + 1] = e
+
+    local skip
+    if indexByName then
+        skip = indexByName[avoidName]
+    else
+        for i = 1, n do
+            if candidates[i].name == avoidName then skip = i; break end
         end
     end
-    if #filtered > 0 then
-        return filtered[math.random(#filtered)]
+
+    -- skip == nil  -> avoidName not present, old code's `filtered` was the whole
+    --                 list, so draw over all n.
+    -- n == 1       -> old code's `filtered` was EMPTY, which fell through to the
+    --                 "return candidates[math.random(#candidates)]" fallback.
+    if not skip or n == 1 then
+        return candidates[math.random(n)]
     end
-    return candidates[math.random(#candidates)]
+
+    local r = math.random(n - 1)
+    if r >= skip then r = r + 1 end
+    return candidates[r]
 end
 
 local DIRECT_LIST_COMPAT_GROUPS = {
@@ -793,6 +876,55 @@ end
 local roomEmIds, roomEmIdsGen = {}, -1
 local roomHasEmId, buildRoomEmIdSet   -- forward: need the EM_LIST helpers below
 
+-- ── PERF: the crossover candidate list is INVARIANT within a room load ──────
+--
+-- This list used to be rebuilt inside chooseDirectListTarget, i.e. once per
+-- spawn slot. Its inputs are:
+--     getEnabledPool()        - changes only when the user edits the config
+--     crossoverAllowed()      - a constant table lookup (CROSSOVER_BLOCK_EMIDS)
+--     roomHasEmId()           - fixed for a generation, and only consulted when
+--                               roomScopedCrossover is ON (it is OFF by default)
+-- None of those change between slot 0 and slot 254, so the loop produced the
+-- SAME ~200-entry list 255 times per room load: ~51k iterations and 255
+-- throwaway tables (~1.7MB of garbage) on the game thread, during the black
+-- screen. That is the single largest cost of the full-level rewrite.
+--
+-- Cache it keyed on (poolVersion, currentGen, scoped flag) so any config edit,
+-- any new room, and any toggle of room-scoping all rebuild it correctly.
+-- IMPORTANT: this changes NOTHING about selection. Same entries, same order,
+-- so math.random(#ok) draws from an identical set with identical odds. No
+-- enemy is capped, dropped, reweighted or excluded that was not already
+-- excluded by CROSSOVER_BLOCK_EMIDS.
+local crossoverCache, crossoverCacheIndex
+local crossoverKeyGen, crossoverKeyPool, crossoverKeyScoped
+
+local function getCrossoverCandidates()
+    local scoped = state.roomScopedCrossover and true or false
+    if crossoverCache
+       and crossoverKeyGen == currentGen
+       and crossoverKeyPool == poolVersion
+       and crossoverKeyScoped == scoped then
+        return crossoverCache, crossoverCacheIndex
+    end
+
+    local pool = getEnabledPool()
+    -- Drop placement-dependent targets (see CROSSOVER_BLOCK_EMIDS), and — by
+    -- default — anything this room never loaded data for (see the note above:
+    -- that is what crashes/lags, not the enemy itself).
+    local ok, byName = {}, {}
+    for _, e in ipairs(pool) do
+        if crossoverAllowed(e)
+           and (not scoped or roomHasEmId(e.bytes[1])) then
+            ok[#ok + 1] = e
+            byName[e.name] = #ok
+        end
+    end
+
+    crossoverCache, crossoverCacheIndex = ok, byName
+    crossoverKeyGen, crossoverKeyPool, crossoverKeyScoped = currentGen, poolVersion, scoped
+    return ok, byName
+end
+
 local function chooseDirectListTarget(origEntry, origEmId, sourceSig)
     local avoidName = nil
     if sourceSig and sourceSig ~= "" then
@@ -800,20 +932,10 @@ local function chooseDirectListTarget(origEntry, origEmId, sourceSig)
     end
 
     if FULL_CROSSOVER then
-        local pool = getEnabledPool()
-        -- Drop placement-dependent targets (see CROSSOVER_BLOCK_EMIDS), and — by
-        -- default — anything this room never loaded data for (see the note above:
-        -- that is what crashes/lags, not the enemy itself).
-        local ok = {}
-        for _, e in ipairs(pool) do
-            if crossoverAllowed(e)
-               and (not state.roomScopedCrossover or roomHasEmId(e.bytes[1])) then
-                ok[#ok + 1] = e
-            end
-        end
+        local ok, okByName = getCrossoverCandidates()
         if #ok > 0 then
             -- nil plan => full emId + tail write in applyReplacementToEmListRow
-            return pickFromCandidatesAvoidName(ok, avoidName), nil
+            return pickFromCandidatesAvoidName(ok, avoidName, okByName), nil
         end
     end
 
@@ -854,21 +976,25 @@ local function pickReplacement(origEmId, avoidName)
         return pickFromCandidatesAvoidName(eligible, avoidName)
     end
 
-    -- Hard fallback for crow sources: never keep crow when any non-crow exists globally.
-    if origEmId == crowId then
-        local globalNonCrow = {}
-        for _, e in ipairs(ENEMIES) do
-            local eid = e.bytes and e.bytes[1] or nil
-            if eid and eid ~= crowId then
-                globalNonCrow[#globalNonCrow + 1] = e
-            end
-        end
-        if #globalNonCrow > 0 then
-            return pickFromCandidatesAvoidName(globalNonCrow, avoidName)
-        end
-    end
+    -- ── DELETED: the "global non-crow" fallback ─────────────────────────
+    -- It used to be:
+    --     if origEmId == crowId then
+    --         for _, e in ipairs(ENEMIES) do ... end   -- THE WHOLE TABLE
+    --         return pickFromCandidatesAvoidName(globalNonCrow, avoidName)
+    --     end
+    -- and it was the "randomizer isn't respecting my choice for each group" bug.
+    -- It reached past `pool` into ENEMIES, so once the enabled selection held
+    -- nothing but crows it would happily spawn ANY enemy in the game — including
+    -- every one the user had explicitly switched off. Worse, ENEMIES is not
+    -- filtered by IsEmIdSupported (getEnabledPool does that), so it could also
+    -- hand back an emId the engine cannot construct → the stale-EmInitFunc crash.
+    --
+    -- Reaching outside the user's selection is never correct. If somebody
+    -- enables only crows, the honest answer is "crows" (or nothing), not "surprise,
+    -- here is the entire roster". The selection is the contract.
 
-    -- Fallback: if user enabled only one type, still return something.
+    -- Fallback: the selection admits nothing but same-emId picks (e.g. only one
+    -- type enabled). Stay inside the pool — it is exactly what the user chose.
     return pickFromCandidatesAvoidName(pool, avoidName)
 end
 
@@ -1102,6 +1228,25 @@ for emId, _ in pairs(NATIVE_EMID_COMPAT) do
     RANDOMIZABLE_EMIDS[emId] = true
 end
 
+-- ── SCRIPTED-CONTENT PROTECTION (see state.protectScripted) ──────────────
+-- Derived from the POOL's own "boss" tag (raw[3] -> e.hpType), so it stays in
+-- sync automatically when pool entries are added — no second hand-maintained
+-- list to drift. These emIds are barred from being a rewrite SOURCE only; they
+-- remain in the pool as TARGETS, so randomization variety is untouched.
+--
+-- NOTE the ordering: this MUST come after the ENEMIES loop above, because it
+-- reads e.hpType which is assigned when POOL is expanded into ENEMIES.
+local PROTECTED_SOURCE_EMIDS = {}
+local protectedIdCount = 0
+for _, e in ipairs(ENEMIES) do
+    if e and e.hpType == "boss" and e.bytes and e.bytes[1] ~= nil then
+        if not PROTECTED_SOURCE_EMIDS[e.bytes[1]] then
+            PROTECTED_SOURCE_EMIDS[e.bytes[1]] = true
+            protectedIdCount = protectedIdCount + 1
+        end
+    end
+end
+
 buildNativeRewritePlan = function(origEmId, avoidName)
     local spec = NATIVE_EMID_COMPAT[origEmId]
     if not spec then return nil end
@@ -1184,6 +1329,17 @@ local function castEmListRow(emListPtr)
     }
 end
 
+-- PERF: every ReadU8 crosses into C++ and runs an msync() page probe — one
+-- syscall per byte (~500ns; the modloader's own types.h says "use at Lua API
+-- boundaries, not in hot loops"). castEmListRow therefore costs 10 syscalls
+-- plus a 10-field table. The room-load rewrite paths below only ever look at
+-- .emId, and they call castEmListRow THREE times on the same pointer, so that
+-- was 30 syscalls per slot where 3 will do. Same value, 1/10th the cost.
+local function readEmListEmId(emListPtr)
+    if not emListPtr or ptrval(emListPtr) == 0 then return nil end
+    return ReadU8(Offset(emListPtr, 0x01))
+end
+
 -- ── ACTUALLY CHANGE THE ENEMY ──────────────────────────────────────────
 -- Until now this mod could not change an enemy TYPE at all. Every entry in
 -- NATIVE_EMID_COMPAT is mode="preserve-emid", so nativePlan was always non-nil
@@ -1221,13 +1377,14 @@ local function applyReplacementToEmListRow(emListPtr, pick, hp, nativePlan)
     -- Swap the type whenever the pick is something the engine can build.
     local wantSwap = SWAP_EMID and pick and pick.bytes and emIdConstructable(pick.bytes[1])
     if wantSwap or nativePlan == nil or nativePlan.mode == "preserve-emid" then
-        local orig = castEmListRow(emListPtr)
-        if not orig then return nil end
+        -- Only .emId was ever read off this row — see readEmListEmId.
+        local origEmId = readEmListEmId(emListPtr)
+        if not origEmId then return nil end
         local targetEmId
         if wantSwap then
             targetEmId = pick.bytes[1]            -- become the picked enemy
         else
-            targetEmId = nativePlan and orig.emId or pick.bytes[1]
+            targetEmId = nativePlan and origEmId or pick.bytes[1]
         end
         WriteU8(Offset(emListPtr, 0x01), targetEmId)
         -- Row +2..+7 are the SLOT's authored spawn params, not the enemy's
@@ -1262,8 +1419,10 @@ local function applyReplacementToEmListRow(emListPtr, pick, hp, nativePlan)
         WriteU8(Offset(emListPtr, 0x03), p3 & ~0x40)
     end
 
-    local final = castEmListRow(emListPtr)
-    return final and final.emId or nil
+    -- Read-back: the caller only wants the emId that actually landed.
+    -- `final and final.emId or nil` returned 0 unchanged when the row read 0
+    -- (0 is truthy in Lua), and so does this.
+    return readEmListEmId(emListPtr)
 end
 
 local currentChoiceBySourceSig = {}
@@ -1299,7 +1458,21 @@ local function pushReplacementEvent(ev)
     ev.seq = replacementSeq
     replacementJournal[#replacementJournal + 1] = ev
     if #replacementJournal > MAX_JOURNAL then
-        table.remove(replacementJournal, 1)
+        -- PERF (black-screen room loads): this used to be
+        --     table.remove(replacementJournal, 1)
+        -- which drops ONE entry off the FRONT and therefore shifts all 4096
+        -- elements down by one on EVERY push. The journal stays full for the rest
+        -- of the session, and a full-level rewrite pushes up to 255 events, so
+        -- that was ~255 * 4096 ≈ 1M element moves PER ROOM LOAD — on the game
+        -- thread, while the screen is black. It also got worse the longer you
+        -- played, because the journal only fills up once.
+        -- Drop the oldest half in a single table.move instead: same eviction
+        -- order, same iteration order for dumpReplacementJournal (ipairs), but
+        -- amortised O(1) per push instead of O(MAX_JOURNAL).
+        local n = #replacementJournal
+        local keep = MAX_JOURNAL // 2
+        table.move(replacementJournal, n - keep + 1, n, 1)
+        for i = n, keep + 1, -1 do replacementJournal[i] = nil end
     end
 end
 
@@ -1369,8 +1542,8 @@ buildRoomEmIdSet = function()
         pcall(function()
             local p = getListPtrFromIndex(idx)
             if p and ptrval(p) ~= 0 then
-                local row = castEmListRow(p)
-                local id = row and row.emId
+                -- Only .emId is needed: 1 msync syscall per slot, not 10.
+                local id = readEmListEmId(p)
                 if id and id ~= 0 and not set[id] then
                     set[id] = true
                     n = n + 1
@@ -1445,10 +1618,13 @@ local function runImmediateFullLevelRewrite(reason, force)
     end
 
     local changed = 0
+    -- pcall(f, args) instead of pcall(function() ... end): identical error
+    -- trapping and identical results (pcall forwards every return value, and
+    -- we still read only ok/did), but it does not allocate a fresh closure per
+    -- slot. `reason or "full-level"` is loop-invariant, so hoist it too.
+    local tag = reason or "full-level"
     for idx = 0, 254 do
-        local ok, did = pcall(function()
-            return rewriteListSlotByIndex(idx, reason or "full-level")
-        end)
+        local ok, did = pcall(rewriteListSlotByIndex, idx, tag)
         if ok and did then
             changed = changed + 1
         end
@@ -1458,8 +1634,12 @@ local function runImmediateFullLevelRewrite(reason, force)
     fullLevelRewriteChanged = changed
     fullRewriteInFlight = false
     fullRewriteIndex = 255
+    -- protected= is the r10b diagnostic: it is the number of scripted boss rows
+    -- this room load left untouched. On a boss level it should be >= 1; on an
+    -- ordinary room it will be 0 and `changed` should look exactly as it always did.
     Log(TAG .. ": Full-level rewrite complete gen=" .. currentGen
         .. " changed=" .. tostring(changed)
+        .. " protected=" .. tostring(protectedSkips)
         .. " reason=" .. tostring(reason))
     return changed > 0
 end
@@ -1483,6 +1663,249 @@ local function isCutsceneSuppressed()
     return false, nil
 end
 
+-- ═══════════════════════════════════════════════════════════════════════
+-- ORIGINAL-ROW SNAPSHOT  —  makes the scramble REVERTIBLE
+-- ═══════════════════════════════════════════════════════════════════════
+-- WHY THIS EXISTS: the rewrite is destructive and IN PLACE. EM_LIST is a
+-- persistent 256-slot buffer, so once a row is overwritten the level's authored
+-- enemy is gone from memory. Turning the randomizer OFF therefore did NOT give
+-- vanilla enemies back — there was nothing left to restore from, and the room
+-- kept whatever the last scramble wrote. Confirmed in-game.
+--
+-- So: snapshot every row we are about to touch BEFORE touching it, and keep it
+-- for the life of the room. `randomizer_restore` writes it back.
+--
+-- Scope note: we snapshot only rows with (flags & 3) == 1, because those are the
+-- only rows the rewrite is allowed to modify now. Snapshotting all 255 would cost
+-- ~2550 native reads on the synchronous room-load path for rows we never write.
+--
+-- Freshness note: the snapshot is taken at readEmList POST, which is the moment
+-- the engine has just populated the room's list and before we alter it. It is
+-- refreshed on every room load, so it always reflects THIS room. It cannot undo
+-- damage done in an earlier session — for a guaranteed-clean baseline, restart
+-- the game once so each room's first snapshot is authored data.
+local originalRows  = nil   -- [idx] = {emId, b2..b7, hpLo, hpHi}
+local snapshotGen   = -1
+local snapshotCount = 0
+
+local function snapshotOriginalRows()
+    local snap, n = {}, 0
+    for idx = 0, 254 do
+        local p = getListPtrFromIndex(idx)
+        if p and ptrval(p) >= 0x100000000 then
+            local ok, row = pcall(function()
+                local flags = ReadU8(p)
+                if not flags or (flags & 3) ~= 1 then return nil end
+                return {
+                    ReadU8(Offset(p, 0x01)),
+                    ReadU8(Offset(p, 0x02)), ReadU8(Offset(p, 0x03)),
+                    ReadU8(Offset(p, 0x04)), ReadU8(Offset(p, 0x05)),
+                    ReadU8(Offset(p, 0x06)), ReadU8(Offset(p, 0x07)),
+                    ReadU8(Offset(p, 0x08)), ReadU8(Offset(p, 0x09)),
+                }
+            end)
+            if ok and row then snap[idx] = row; n = n + 1 end
+        end
+    end
+    originalRows  = snap
+    snapshotGen   = currentGen
+    snapshotCount = n
+    return n
+end
+
+-- Write the snapshot back. Never touches +0x00: the flags byte belongs to the
+-- engine (bit0 = enabled, bit1 = already spawned) and must not be replayed.
+local function restoreOriginalRows()
+    if not originalRows or snapshotCount == 0 then
+        return 0, "no snapshot yet — load a room first"
+    end
+    local n = 0
+    for idx, row in pairs(originalRows) do
+        local p = getListPtrFromIndex(idx)
+        if p and ptrval(p) >= 0x100000000 then
+            local ok = pcall(function()
+                WriteU8(Offset(p, 0x01), row[1])
+                WriteU8(Offset(p, 0x02), row[2])
+                WriteU8(Offset(p, 0x03), row[3])
+                WriteU8(Offset(p, 0x04), row[4])
+                WriteU8(Offset(p, 0x05), row[5])
+                WriteU8(Offset(p, 0x06), row[6])
+                WriteU8(Offset(p, 0x07), row[7])
+                WriteU8(Offset(p, 0x08), row[8])
+                WriteU8(Offset(p, 0x09), row[9])
+            end)
+            if ok then n = n + 1 end
+        end
+    end
+    slotMap = {}
+    return n, nil
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- SAVE GUARD — keep the scramble OUT of the save file
+-- ═══════════════════════════════════════════════════════════════════════
+-- THE BUG THE USER KEPT REPORTING AND I KEPT DENYING.
+-- cGameSave::save (0x5F44B38) snapshots a block of pG straight into the save:
+--     0x5f44c4c  mov w9,#0x5018    ; src = pG + 0x5018
+--     0x5f44c50  add x1, x8, x9
+--     0x5f44c54  mov w2,#0x3640    ; 13888 bytes
+--     0x5f44c58  bl  memcpy        ; -> save buffer
+-- and EM_LIST is at pG+0x549C length 0x1FE0 (from readEmList). So:
+--     saved block : 0x5018 .. 0x8658
+--     EM_LIST     : 0x549C .. 0x747C          <- ENTIRELY INSIDE IT
+-- Every row the randomizer rewrote was being serialised into the save at
+-- offset 0x484 of that block. That is why the scramble survived a restart,
+-- survived the randomizer being switched OFF, and reappeared on load: it was
+-- no longer in memory, it was in the SAVE FILE.
+--
+-- (My earlier reasoning — "readEmList reloads the list from disk every room
+-- load, therefore nothing persists" — was half right and wholly wrong: the
+-- reload is real, but the save captures the POST-randomizer state and restores
+-- it over the top on load.)
+--
+-- FIX: immediately before that memcpy, put the AUTHORED rows back; restore the
+-- randomized rows immediately after. The save always records the level's own
+-- enemies; the live session stays randomized. Game-side only, never save-side.
+-- Safe to hook from Lua: this runs on an actual save, not per frame.
+local savedScramble = nil
+
+local function writeRow(p, r)
+    WriteU8(Offset(p, 0x01), r[1]); WriteU8(Offset(p, 0x02), r[2])
+    WriteU8(Offset(p, 0x03), r[3]); WriteU8(Offset(p, 0x04), r[4])
+    WriteU8(Offset(p, 0x05), r[5]); WriteU8(Offset(p, 0x06), r[6])
+    WriteU8(Offset(p, 0x07), r[7]); WriteU8(Offset(p, 0x08), r[8])
+    WriteU8(Offset(p, 0x09), r[9])
+end
+
+local function readRow(p)
+    return { ReadU8(Offset(p, 0x01)), ReadU8(Offset(p, 0x02)), ReadU8(Offset(p, 0x03)),
+             ReadU8(Offset(p, 0x04)), ReadU8(Offset(p, 0x05)), ReadU8(Offset(p, 0x06)),
+             ReadU8(Offset(p, 0x07)), ReadU8(Offset(p, 0x08)), ReadU8(Offset(p, 0x09)) }
+end
+
+-- PRE-save: stash what is live (the scramble) and lay the authored rows down.
+local function saveGuardToAuthored()
+    if not originalRows or snapshotCount == 0 then return 0 end
+    local keep, n = {}, 0
+    for idx, row in pairs(originalRows) do
+        local p = getListPtrFromIndex(idx)
+        if p and ptrval(p) >= 0x100000000 then
+            local ok, cur = pcall(readRow, p)
+            if ok and cur then
+                keep[idx] = cur
+                if pcall(writeRow, p, row) then n = n + 1 end
+            end
+        end
+    end
+    savedScramble = keep
+    return n
+end
+
+-- POST-save: put the scramble back so play continues randomized.
+local function saveGuardRestoreScramble()
+    if not savedScramble then return 0 end
+    local n = 0
+    for idx, cur in pairs(savedScramble) do
+        local p = getListPtrFromIndex(idx)
+        if p and ptrval(p) >= 0x100000000 then
+            if pcall(writeRow, p, cur) then n = n + 1 end
+        end
+    end
+    savedScramble = nil
+    return n
+end
+
+-- ── SNAPSHOT READERS ────────────────────────────────────────────────────
+-- The snapshot is the only record of what a level ACTUALLY authored, so make it
+-- inspectable over the bridge. Two uses:
+--   * "unknown" — authored signatures the POOL does not know. Those are enemy
+--     variants we could add, i.e. how to FIND MORE ENEMIES from real level data
+--     instead of guessing byte tails.
+--   * "all"/"changed" — see authored vs current per row, which is what any
+--     future scripted-row SKIP LOGIC has to be built from.
+-- Row layout: row[1]=emId, row[2..7]=authored params (+0x02..+0x07),
+-- row[8]=hpLo, row[9]=hpHi. row[1..7] is exactly the 7-value signature that
+-- buildEnemySignature / getEmListSignature produce, so keys match the pool.
+local function snapshotSignature(row)
+    local parts = {}
+    for i = 1, 7 do parts[i] = tostring(row[i] or 0) end
+    return table.concat(parts, ":")
+end
+
+local function snapshotReport(mode, limit)
+    if not originalRows or snapshotCount == 0 then
+        return "no snapshot yet — load a room first"
+    end
+    mode  = mode or "unknown"
+    limit = limit or 80
+    local out = {}
+    out[#out+1] = "snapshot gen=" .. tostring(snapshotGen)
+                  .. " rows=" .. snapshotCount .. " mode=" .. mode
+
+    if mode == "unknown" then
+        -- distinct authored signatures, flagged against the pool
+        local agg = {}
+        for idx, row in pairs(originalRows) do
+            local sig = snapshotSignature(row)
+            local a = agg[sig]
+            if not a then a = { n = 0, emId = row[1], idx = idx }; agg[sig] = a end
+            a.n = a.n + 1
+        end
+        local sigs = {}
+        for sig in pairs(agg) do sigs[#sigs+1] = sig end
+        table.sort(sigs)
+        local nUnknown, nKnown = 0, 0
+        for _, sig in ipairs(sigs) do
+            local a = agg[sig]
+            local def = ENEMIES_BY_SIGNATURE[sig]
+            if def then
+                nKnown = nKnown + 1
+            else
+                nUnknown = nUnknown + 1
+                if nUnknown <= limit then
+                    out[#out+1] = string.format("UNKNOWN emId=0x%02X x%-3d sig=%s (idx %d)",
+                                                a.emId, a.n, sig, a.idx)
+                end
+            end
+        end
+        out[#out+1] = string.format("-- distinct sigs: %d known, %d UNKNOWN --",
+                                    nKnown, nUnknown)
+        return table.concat(out, "\n")
+    end
+
+    -- "all" / "changed": authored vs what is in memory right now
+    local idxs = {}
+    for idx in pairs(originalRows) do idxs[#idxs+1] = idx end
+    table.sort(idxs)
+    local shown = 0
+    for _, idx in ipairs(idxs) do
+        local row = originalRows[idx]
+        local p = getListPtrFromIndex(idx)
+        local curSig, curHp = "?", -1
+        if p and ptrval(p) >= 0x100000000 then
+            pcall(function()
+                curSig = getEmListSignature(p)
+                curHp  = (ReadU8(Offset(p, 0x08)) or 0) + (ReadU8(Offset(p, 0x09)) or 0) * 256
+            end)
+        end
+        local origSig = snapshotSignature(row)
+        local origHp  = (row[8] or 0) + (row[9] or 0) * 256
+        local changed = (curSig ~= origSig)
+        if mode == "all" or changed then
+            shown = shown + 1
+            if shown <= limit then
+                local def = ENEMIES_BY_SIGNATURE[origSig]
+                out[#out+1] = string.format("%3d %s orig=%s hp=%-5d | now=%s hp=%-5d | %s",
+                    idx, changed and "CHANGED" or "same   ",
+                    origSig, origHp, curSig, curHp,
+                    def and def.name or "(not in pool)")
+            end
+        end
+    end
+    out[#out+1] = "-- " .. shown .. " row(s) matched (limit " .. limit .. ") --"
+    return table.concat(out, "\n")
+end
+
 rewriteListSlotByIndex = function(idx, sourceTag)
     if not state.enabled then return false end
     if not levelDetected then return false end
@@ -1504,12 +1927,35 @@ rewriteListSlotByIndex = function(idx, sourceTag)
     -- validating the slot, not banning the only address it can legally be.
     local _lpv = ptrval(listPtr)
     if _lpv < 0x100000000 then return false end   -- still bogus on AArch64
+
+    -- ── ONLY REWRITE ROWS THIS ROOM ACTUALLY USES ────────────────────────
+    -- +0x00 is the engine's flags byte and (flags & 3) == 1 means "this row is
+    -- live for the current room" — it is the exact test EmSetFromList and the
+    -- native sanitiser use to decide what to spawn.
+    --
+    -- Without this check the rewrite hit ALL 255 rows. Dumping r10b's live table
+    -- proved it: every one of the 255 rows carried a randomizer HP value
+    -- (1000/3000/4000/5000/5500/7500 — our own table, not the level's), i.e. the
+    -- whole array had been overwritten, and 164 rows were left ACTIVE. A room is
+    -- authored with a fraction of that. The array is a persistent 256-slot buffer,
+    -- so the rows this room did NOT author are leftovers, and clobbering them
+    -- destroyed data belonging to scripted spawns — including the boss rows a
+    -- level's SCE beats key off. That is the r10b (boat/lake) breakage.
+    --
+    -- This does NOT reduce randomization: an inactive row cannot spawn, so
+    -- rewriting it never produced a visible enemy. Everything that actually
+    -- appears in the room still gets randomized exactly as before. It also cuts
+    -- the synchronous room-load work by ~35% (255 rows -> ~164), one ReadU8 per
+    -- slot, taken BEFORE any allocation.
+    local okF, flags = pcall(ReadU8, listPtr)
+    if not okF or flags == nil then return false end
+    if (flags & 3) ~= 1 then return false end
     -- Sanity-check the slot itself: a real EM_LIST row has a plausible emId
     -- (non-zero) — the emId==0 test below is the actual stale-pointer guard.
 
-    local row = castEmListRow(listPtr)
-    if not row then return false end
-    local origEmId = row.emId
+    -- Only .emId is used here, so read the one byte instead of casting the
+    -- whole 10-field row (10 msync syscalls + a table) — see readEmListEmId.
+    local origEmId = readEmListEmId(listPtr)
     if not origEmId or origEmId == 0 then return false end
 
     if not isRandomizableEmId(origEmId) then
@@ -1521,24 +1967,55 @@ rewriteListSlotByIndex = function(idx, sourceTag)
             reason = "non-randomizable-emid",
             oldName = "Unknown/NPC",
             oldEmId = origEmId,
-            newName = "(unchanged)",
+            newName = "Unknown/NPC",
             newEmId = origEmId,
         })
         return false
     end
 
+    -- SCRIPTED BOSS ROW — leave it exactly as the level authored it.
+    -- This is the r10b (boat/lake) fix: the level's SCE script owns this row and
+    -- swapping it breaks the sequence and the items that beat awards. Bosses are
+    -- still valid TARGETS elsewhere, so nothing is lost from the shuffle.
+    -- Cheap on purpose: one table lookup, no allocation — this runs for all 255
+    -- slots synchronously inside the room-load black screen.
+    if state.protectScripted and PROTECTED_SOURCE_EMIDS[origEmId] then
+        protectedSkips = protectedSkips + 1
+        return false
+    end
+
     -- Trust the known EM_LIST structure — write to any non-zero emId slot.
     -- Pool lookup is for logging only; signature match is NOT required.
-    local origEntry, matchKind = findOriginalEnemyDef(listPtr, origEmId, true)
-    local origName = origEntry and origEntry.name or ("emId=" .. origEmId)
-
+    -- Build the row signature ONCE and hand it to findOriginalEnemyDef, which
+    -- used to read the very same 7 bytes itself. Pure reordering: both were
+    -- read-only and neither touched the list.
     local sourceSig = ""
     pcall(function()
         sourceSig = getEmListSignature(listPtr)
     end)
 
+    local origEntry, matchKind = findOriginalEnemyDef(listPtr, origEmId, true, sourceSig)
+    local origName = origEntry and origEntry.name or ("emId=" .. origEmId)
+
     local pick, nativePlan = chooseDirectListTarget(origEntry, origEmId, sourceSig)
-    if not pick or not pick.bytes then return false end
+
+    -- NEVER write a pick the engine cannot construct. Doing so does not "fail",
+    -- it leaves an EMPTY SPOT where the level authored an enemy. Redraw a few
+    -- times (each call re-randomises), and if the selection still cannot produce
+    -- anything usable, bail out — `return false` leaves the row exactly as the
+    -- level authored it, so the ORIGINAL enemy spawns. An unshuffled enemy is
+    -- always better than a missing one.
+    local tries = 0
+    while not pickIsUsable(pick) and tries < 6 do
+        tries = tries + 1
+        pick, nativePlan = chooseDirectListTarget(origEntry, origEmId, sourceSig)
+    end
+    if not pickIsUsable(pick) then
+        V("List rewrite KEEP ORIGINAL idx=" .. tostring(idx)
+            .. " emId=" .. tostring(origEmId)
+            .. " (no constructable pick after " .. tries .. " draws)")
+        return false
+    end
     if shouldSkipUnknownNativeRow(matchKind, nativePlan) then
         V("List rewrite SKIP unknown native row (no exact template) idx=" .. tostring(idx)
             .. " emId=" .. tostring(origEmId))
@@ -1584,6 +2061,7 @@ local function resetRoomTracking(reason)
     currentChoiceBySourceSig = {}
     slotMap = {}
     levelSwaps = 0
+    protectedSkips = 0
     settleCounter = SETTLE_CALLS
     hookErrors = 0
     roomLoadEvents = 0
@@ -1625,6 +2103,11 @@ if sym_readEmList and (state.enabled or INSTALL_HOOKS_WHEN_DISABLED) then
         function(ret)
             -- Post-hook: return value unchanged (it's from FMemory::Free / stack cleanup)
             pcall(function()
+                -- Snapshot FIRST, and do it whether or not the randomizer is
+                -- enabled: this is the only moment the room's authored rows are
+                -- in memory untouched, and a snapshot must exist for
+                -- `randomizer_restore` even if the scramble is currently off.
+                snapshotOriginalRows()
                 queueFullLevelRewrite("readEmList post")
             end)
         end)
@@ -1643,6 +2126,41 @@ else
         Log(TAG .. ": readEmList hook skipped (Randomizer disabled at startup)")
     end
 end
+
+-- ── SAVE GUARD HOOK ─────────────────────────────────────────────────────
+-- Installed UNCONDITIONALLY (not gated on state.enabled): if the randomizer is
+-- switched off mid-session the list may still hold a scramble from earlier, and
+-- that must not reach the save either. Uninstalling on toggle would reopen the
+-- exact hole this closes.
+pcall(function()
+    local sym_gamesave = Resolve("_ZN9cGameSave4saveEP14SAVE_DATA_HEADib", 0x5F44B38)
+    if not sym_gamesave or ptrval(sym_gamesave) == 0 then
+        Log(TAG .. ": [WARN] cGameSave::save not resolved — SCRAMBLE WILL BE SAVED")
+        return
+    end
+    local ok = pcall(function()
+        RegisterNativeHookAt(sym_gamesave, "cGameSave_save",
+            function(a1, a2, a3, a4)
+                pcall(function()
+                    local n = saveGuardToAuthored()
+                    if n > 0 then
+                        Log(TAG .. ": save guard — wrote " .. n .. " AUTHORED rows before save")
+                    end
+                end)
+            end,
+            function(ret)
+                pcall(function()
+                    local n = saveGuardRestoreScramble()
+                    if n > 0 then
+                        Log(TAG .. ": save guard — restored " .. n .. " randomized rows after save")
+                    end
+                end)
+                return ret
+            end)
+    end)
+    Log(TAG .. ": save guard on cGameSave::save @ " .. ToHex(sym_gamesave)
+        .. " — " .. (ok and "installed (scramble stays OUT of the save)" or "FAILED"))
+end)
 
 local pathHooksInstalled = false
 
@@ -1936,7 +2454,19 @@ local function installEmSetEventHook()
                     -- Avoid repeating the same template for the same source signature
                     -- on consecutive room loads when alternatives exist.
                     local pick, nativePlan = chooseRewriteTargetWithHistory(origEmId, sourceSig)
-                    if not pick then V("EmSetEvent: empty pool"); return end
+                    -- Same rule as the list path: an unconstructable pick would
+                    -- spawn NOTHING. Redraw, then fall back to leaving the row
+                    -- alone so the level's own enemy spawns instead of a gap.
+                    local etries = 0
+                    while not pickIsUsable(pick) and etries < 6 do
+                        etries = etries + 1
+                        pick, nativePlan = chooseRewriteTargetWithHistory(origEmId, sourceSig)
+                    end
+                    if not pickIsUsable(pick) then
+                        V("EmSetEvent: KEEP ORIGINAL emId=" .. tostring(origEmId)
+                            .. " (no constructable pick after " .. etries .. " draws)")
+                        return
+                    end
                     if shouldSkipUnknownNativeRow(matchKind, nativePlan) then
                         skippedUnknownSources = skippedUnknownSources + 1
                         if skippedUnknownSources <= 30 then
@@ -2043,19 +2573,96 @@ end
 -- COMMANDS
 -- ═══════════════════════════════════════════════════════════════════════
 
-RegisterCommand("randomizer", function()
-    state.enabled = not state.enabled
+-- Dump what the level ACTUALLY authored. `randomizer_snapshot` with no arg lists
+-- authored signatures the pool does not know (candidates to add as new enemies);
+-- pass "changed" or "all" to compare authored vs what is live in memory now.
+RegisterCommand("randomizer_snapshot", function(arg)
+    local mode = (type(arg) == "string" and arg ~= "" ) and arg or "unknown"
+    local rep = snapshotReport(mode, 80)
+    for line in rep:gmatch("[^\n]+") do Log(TAG .. ": " .. line) end
+    return rep
+end)
+
+-- Put this room back exactly as the level authored it, from the snapshot taken
+-- at room load. Does NOT disable the randomizer — the next room load will
+-- scramble again unless you also turn it off with `randomizer`.
+RegisterCommand("randomizer_restore", function()
+    local n, err = restoreOriginalRows()
+    local msg
+    if err then
+        msg = "restore FAILED: " .. err
+    else
+        msg = "restored " .. n .. " original enemy rows (snapshot from room load #"
+              .. tostring(snapshotGen) .. ")"
+    end
+    Log(TAG .. ": " .. msg)
+    Notify(TAG, err and "Restore failed" or ("Restored " .. n .. " rows"))
+    return msg
+end)
+
+-- Scripted-boss protection (the r10b boat-level fix). ON by default. Turning it
+-- OFF restores the old behaviour where scripted boss rows are shuffled too — which
+-- WILL break set-piece levels, so this exists for chaos runs, not as a default.
+RegisterCommand("randomizer_protect", function()
+    state.protectScripted = not state.protectScripted
+    saveConfig()
+    local msg = state.protectScripted
+        and ("scripted bosses PROTECTED (" .. protectedIdCount .. " boss ids kept as authored; still spawnable as replacements)")
+        or  "scripted bosses UNPROTECTED — set-piece levels (r10b boat, etc.) may not complete"
+    Log(TAG .. ": " .. msg)
+    Notify(TAG, state.protectScripted and "Scripted bosses PROTECTED" or "Scripted bosses UNPROTECTED")
+    return msg
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- THE ENABLE TOGGLE — one implementation, three callers
+-- ═══════════════════════════════════════════════════════════════════════
+-- OFF now PUTS THE LEVEL BACK. Previously all three entry points (this command,
+-- the debug-menu item, and SharedAPI.setEnabled) only stopped FUTURE swaps —
+-- every row already rewritten stayed rewritten until the next room load, so
+-- "turn it off" visibly did nothing to the enemies standing in front of you.
+-- The snapshot that makes reverting possible was already being taken at room
+-- load (snapshotOriginalRows) and already had a restore path, but nothing was
+-- wired to the toggle; you had to know about `randomizer_restore`.
+--
+-- Restoring is safe to do unconditionally on the OFF edge: restoreOriginalRows
+-- writes back only rows it snapshotted this room, and it no-ops with an error
+-- string when there is no snapshot yet (e.g. toggled off before any room load).
+--
+-- Deliberately NOT symmetric: turning it ON does not re-scramble the current
+-- room. The snapshot is the level's authored state, and re-randomising in place
+-- would rewrite rows for enemies that are already alive and initialised. The
+-- next room load applies the shuffle, which is the path the engine expects.
+local function setRandomizerEnabled(v)
+    local was = state.enabled
+    state.enabled = v and true or false
+
     if state.enabled then
         ensureHooksInstalled()
+    elseif was then
+        -- OFF edge: hand the level back exactly as it was authored.
+        local n, err = restoreOriginalRows()
+        if err then
+            Log(TAG .. ": OFF — could not restore originals: " .. tostring(err)
+                .. " (next room load will be vanilla regardless)")
+        else
+            Log(TAG .. ": OFF — restored " .. n .. " authored enemy rows")
+        end
     end
+
     slotMap = {}
     levelSwaps = 0
     settleCounter = 0
     hookErrors = 0
     saveConfig()
     V("TOGGLE: enabled=" .. tostring(state.enabled) .. " slotMap cleared")
+    return state.enabled
+end
+
+RegisterCommand("randomizer", function()
+    setRandomizerEnabled(not state.enabled)
     Log(TAG .. ": " .. (state.enabled and "ON" or "OFF"))
-    Notify(TAG, state.enabled and "ON" or "OFF")
+    Notify(TAG, state.enabled and "ON (next room load)" or "OFF — originals restored")
 end)
 
 RegisterCommand("rnd_hpmode", function(args)
@@ -2195,18 +2802,22 @@ end)
 
 if SharedAPI then
     SharedAPI.Randomizer = {
-        isEnabled  = function() return state.enabled end,
-        setEnabled = function(v)
-            state.enabled = v
-            if state.enabled then
-                ensureHooksInstalled()
-            end
-            slotMap = {}
-            levelSwaps = 0
-            settleCounter = 0
-            hookErrors = 0
-            saveConfig()
+        -- ── snapshot access (bridge-readable) ────────────────────────────
+        -- report(mode, limit): mode = "unknown" (authored sigs missing from the
+        -- pool -> new enemies to add), "changed" (authored vs live), "all".
+        snapshotReport = function(mode, limit) return snapshotReport(mode, limit) end,
+        -- raw rows for programmatic use: { [idx] = {emId,b2..b7,hpLo,hpHi} }
+        getSnapshot    = function() return originalRows end,
+        snapshotInfo   = function()
+            return { gen = snapshotGen, rows = snapshotCount }
         end,
+        restoreOriginals = function() return restoreOriginalRows() end,
+
+        isEnabled  = function() return state.enabled end,
+        -- Routed through the shared helper so the bridge/menu/command can never
+        -- drift apart again — in particular so OFF restores the authored rows
+        -- here too, not just from the `randomizer` command.
+        setEnabled = function(v) return setRandomizerEnabled(v) end,
         getHPMode  = function() return state.hpMode end,
         setHPMode  = function(m) state.hpMode = m; saveConfig() end,
         getRandomizeCutscenes = function() return state.randomizeCutscenes end,
@@ -2254,17 +2865,30 @@ if SharedAPI and SharedAPI.DebugMenu then
             -- Main toggle
             local st = state.enabled and "ON" or "OFF"
             api.AddItem("[" .. st .. "] Enemy Randomizer", function()
-                state.enabled = not state.enabled
-                if state.enabled then
-                    ensureHooksInstalled()
-                end
-                slotMap = {}
-                levelSwaps = 0
-                settleCounter = 0
-                hookErrors = 0
-                saveConfig()
+                -- Shared helper: OFF restores this room's authored enemies.
+                setRandomizerEnabled(not state.enabled)
                 api.Refresh()
             end)
+
+            -- Revert this room to the level's authored enemies, from the
+            -- snapshot taken at room load. Useful to A/B the scramble without
+            -- reloading, and to recover a room the shuffle made unplayable.
+            api.AddItem("Restore Original Enemies (" .. snapshotCount .. " rows)", function()
+                local n, err = restoreOriginalRows()
+                Log(TAG .. ": " .. (err and ("restore failed: " .. err)
+                                         or ("restored " .. n .. " rows")))
+                api.Refresh()
+            end)
+
+            -- Scripted-boss protection (r10b boat-level fix). Bosses stay
+            -- spawnable as replacements either way; this only controls whether a
+            -- level's OWN scripted boss row may be overwritten.
+            api.AddItem("[" .. (state.protectScripted and "ON" or "OFF") .. "] Protect Scripted Bosses",
+                function()
+                    state.protectScripted = not state.protectScripted
+                    saveConfig()
+                    api.Refresh()
+                end)
 
             -- HP Mode cycle
             api.AddItem("HP Mode: " .. state.hpMode, function()

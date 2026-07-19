@@ -26,6 +26,10 @@ namespace logger
     static std::mutex s_mutex;
     static int s_error_count = 0;
     static int s_line_count = 0;
+    // Minimum emitted level (0=debug 1=info 2=warn 3=error). DEBUG suppressed by
+    // default. std::atomic-free: guarded by s_mutex on write; the debug fast-out
+    // reads it unlocked (a benign race — worst case one extra/omitted debug line).
+    static int s_min_level = 1;
 
     // Circular buffer for recent lines (for log_tail)
     static std::deque<std::string> s_recent_lines;
@@ -281,6 +285,8 @@ namespace logger
 
     void log_debug(const char *source, const char *fmt, ...)
     {
+        if (s_min_level > 0) // DEBUG suppressed unless min level lowered to debug
+            return;
         std::lock_guard<std::mutex> lock(s_mutex);
         char buf[4096];
         va_list args;
@@ -288,6 +294,27 @@ namespace logger
         vsnprintf(buf, sizeof(buf), fmt, args);
         va_end(args);
         write_line("DEBUG", source, buf);
+    }
+
+    void set_min_level(int level)
+    {
+        if (level < 0) level = 0;
+        if (level > 3) level = 3;
+        s_min_level = level;
+        static const char *names[] = {"debug", "info", "warn", "error"};
+        log_info("LOG", "min log level = %s", names[level]);
+    }
+
+    int get_min_level() { return s_min_level; }
+
+    int level_from_string(const char *s)
+    {
+        if (!s) return 1;
+        if (!strcmp(s, "debug")) return 0;
+        if (!strcmp(s, "info")) return 1;
+        if (!strcmp(s, "warn")) return 2;
+        if (!strcmp(s, "error")) return 3;
+        return 1;
     }
 
     void log_raw(const char *text)

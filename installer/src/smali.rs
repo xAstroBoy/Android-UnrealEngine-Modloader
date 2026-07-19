@@ -329,14 +329,118 @@ fn bump_locals(content: &str) -> String {
     }).to_string()
 }
 
+// ── Target ABI ──────────────────────────────────────────────────────────
+// A single .so is one CPU arch, so the game's ABI decides which libmodloader.so
+// goes in and which lib/<abi>/ dir it lands in. 64-bit titles (RE4, Pinball FX)
+// take arm64-v8a; 32-bit titles (Face Your Fears 1/2) take armeabi-v7a.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Abi {
+    Arm64,
+    Arm32,
+}
+
+impl Abi {
+    /// APK lib/<dir>/ subdirectory.
+    pub fn lib_dir(self) -> &'static str {
+        match self {
+            Abi::Arm64 => "arm64-v8a",
+            Abi::Arm32 => "armeabi-v7a",
+        }
+    }
+    /// Modloader build output directory (build.bat emits both).
+    pub fn build_dir(self) -> &'static str {
+        match self {
+            Abi::Arm64 => "build",
+            Abi::Arm32 => "build32",
+        }
+    }
+    /// ELF e_machine: EM_AARCH64 (0xB7) vs EM_ARM (0x28).
+    pub fn elf_machine(self) -> u16 {
+        match self {
+            Abi::Arm64 => 0xB7,
+            Abi::Arm32 => 0x28,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Abi::Arm64 => "arm64-v8a (64-bit)",
+            Abi::Arm32 => "armeabi-v7a (32-bit)",
+        }
+    }
+}
+
+/// Detect a decompiled APK's ABI. A 64-bit process loads only lib/arm64-v8a/;
+/// if that directory is present the title is 64-bit, otherwise it is a 32-bit
+/// (armeabi-v7a) title.
+pub fn detect_apk_abi(decompiled: &Path) -> Abi {
+    if decompiled.join("lib").join("arm64-v8a").is_dir() {
+        Abi::Arm64
+    } else {
+        Abi::Arm32
+    }
+}
+
+/// Read a .so's ELF e_machine (little-endian bytes 18..20).
+fn elf_machine_of(path: &Path) -> Option<u16> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hdr = [0u8; 20];
+    f.read_exact(&mut hdr).ok()?;
+    if &hdr[0..4] != b"\x7fELF" {
+        return None;
+    }
+    Some(u16::from_le_bytes([hdr[18], hdr[19]]))
+}
+
+/// Ensure the modloader .so matches the target ABI. `so_path` is what the caller
+/// resolved (the arm64 default, or a --modloader-so override). If it already
+/// matches the ABI it is kept; otherwise the sibling ABI build is located
+/// (build/ <-> build32/, with or without a deploy/ subdir) so a 32-bit game
+/// automatically gets the armeabi-v7a build and vice-versa.
+pub fn adjust_so_for_abi(so_path: &Path, abi: Abi) -> Result<PathBuf> {
+    if elf_machine_of(so_path) == Some(abi.elf_machine()) {
+        return Ok(so_path.to_path_buf());
+    }
+    // Walk up to the build/ or build32/ directory the .so sits under, then look
+    // in the sibling build dir for the ABI we actually need.
+    let mut cur = so_path.parent();
+    while let Some(dir) = cur {
+        let dname = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if dname == "build" || dname == "build32" {
+            if let Some(base) = dir.parent() {
+                let want = base.join(abi.build_dir());
+                for cand in [
+                    want.join("deploy").join("libmodloader.so"),
+                    want.join("libmodloader.so"),
+                ] {
+                    if elf_machine_of(&cand) == Some(abi.elf_machine()) {
+                        return Ok(cand);
+                    }
+                }
+            }
+            break;
+        }
+        cur = dir.parent();
+    }
+    bail!(
+        "No {} libmodloader.so available (the target APK is {}). Build both ABIs \
+         with modloader/build.bat — it emits build/ for arm64-v8a and build32/ for \
+         armeabi-v7a — or pass --modloader-so pointing at the {} build.",
+        abi.lib_dir(),
+        abi.label(),
+        abi.lib_dir()
+    )
+}
+
 // ── Add libmodloader.so into APK ────────────────────────────────────────
 
-pub fn add_native_lib(decompiled: &Path, so_path: &Path) -> Result<()> {
-    let dest = decompiled.join("lib").join("arm64-v8a");
+pub fn add_native_lib(decompiled: &Path, so_path: &Path, abi: Abi) -> Result<()> {
+    let dest = decompiled.join("lib").join(abi.lib_dir());
     std::fs::create_dir_all(&dest)?;
     let target = dest.join("libmodloader.so");
     std::fs::copy(so_path, &target)?;
-    log::info!("Added libmodloader.so to lib/arm64-v8a/");
+    log::info!("Added libmodloader.so to lib/{}/", abi.lib_dir());
     Ok(())
 }
 

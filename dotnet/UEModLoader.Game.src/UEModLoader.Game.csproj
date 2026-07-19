@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Compiles the generated game proxies (Generated/*.cs, emitted by the
+       modloader's native generator from the live RE4 reflection graph) into
+       UEModLoader.Game.dll — the typed BP_*/A*/U* classes a modder references
+       alongside UEModLoader.dll. This is the SAME output the on-device Roslyn
+       path produces; built on PC because the Quest can't compile 2645 classes
+       without thrashing. Open the result in dnSpy to browse every class. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>UEModLoader.Game</AssemblyName>
+    <RootNamespace>UEModLoader.Game</RootNamespace>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="UEModLoader">
+      <HintPath>..\UEModLoader.Api\bin\out\UEModLoader.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

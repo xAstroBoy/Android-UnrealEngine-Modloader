@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The C# overhaul of RE4's in-game debug menu. Replaces the Lua DebugMenuAPI
+       mod. Builds one DLL that drops in mods_dotnet/. References the API
+       (UnrealMod + hooks) and the typed Game proxies (DebugMenu_C + the native
+       DebugManager draw API). -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>UEModLoader.DebugMenu</AssemblyName>
+    <RootNamespace>UEModLoader.DebugMenuMod</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="UEModLoader">
+      <HintPath>..\UEModLoader.Api\bin\out\UEModLoader.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UEModLoader.Game">
+      <HintPath>..\UEModLoader.Game.src\bin\Release\net8.0\UEModLoader.Game.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

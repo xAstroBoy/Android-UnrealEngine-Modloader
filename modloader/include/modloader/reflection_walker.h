@@ -83,6 +83,13 @@ namespace reflection
         uint16_t return_value_offset;
         ue::UFunction *raw; // live pointer to UFunction
 
+        // Native (C++) implementation thunk — the UFunction's Func pointer. For
+        // FUNC_Native functions this is the engine's real native "exec" function
+        // (callable/hookable directly, in addition to going through ProcessEvent).
+        // 0 for pure-Blueprint functions. See is_native().
+        void *native_func = nullptr;
+        bool is_native() const { return (flags & 0x400u /*FUNC_Native*/) != 0; }
+
         // Parameters (subset of properties with CPF_Parm)
         std::vector<PropertyInfo> params;
 

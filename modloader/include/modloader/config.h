@@ -34,6 +34,23 @@ namespace config
     // Log level: "debug", "info", "warn", "error" (default: "info")
     const std::string &log_level();
 
+    // Whether the crash guard suppresses faults inside guarded regions,
+    // filing them to modloader_recovered.log instead of dying (default: true).
+    // false = every fault is fatal (full report + tombstone) — bug-hunting mode.
+    bool crash_guard_enabled();
+
+    // Global instruction-skip recovery mode: "off" | "null" | "all" (default "all").
+    // Covers faults OUTSIDE the guarded regions — anywhere the APK maps.
+    const std::string &crash_guard_global();
+
+    // Recovered crashes attributed to one mod before its patches are reverted
+    // (auto-quarantine). 0 = never quarantine. Default 20.
+    int crash_guard_quarantine_threshold();
+
+    // Whether the C# / .NET mod subsystem boots (default true). No-op if the
+    // Mono runtime pack isn't installed.
+    bool dotnet_enabled();
+
     // ── Auto-dump settings ──────────────────────────────────────────────────
 
     // Whether to generate the SDK on boot (default: false)

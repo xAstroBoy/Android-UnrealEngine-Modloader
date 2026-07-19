@@ -9,13 +9,28 @@
 #include "modloader/reflection_walker.h"
 #include "modloader/process_event_hook.h"
 #include "modloader/native_hooks.h"
+#include "modloader/menu_bridge.h"
 #include "modloader/symbols.h"
+
+// Declared here (not in menu_bridge.h) so that header stays sol-free. Defined in
+// menu_bridge.cpp.
+namespace menu_bridge
+{
+    int root_add(const std::string &mod, const std::string &label, const std::string &type,
+                 sol::function cb, bool initial, const std::string &on, const std::string &off);
+    int navigate(const std::string &name, int parent, sol::function populate);
+    int item_add(const std::string &label, sol::function cb);
+}
 #include "modloader/pattern_scanner.h"
 #include "modloader/pak_mounter.h"
 #include "modloader/notification.h"
 #include "modloader/lua_dump_generator.h"
 #include "modloader/adb_bridge.h"
 #include "modloader/mod_tracker.h"
+#include "modloader/codepatch.h"
+#include "modloader/arm64_asm.h"
+#include "modloader/csharp_proxy_generator.h"
+#include "modloader/dotnet_host.h"
 #include "modloader/object_monitor.h"
 #include "modloader/logger.h"
 #include "modloader/paths.h"
@@ -430,14 +445,28 @@ namespace lua_bindings
     {
 
         // ── Logging ──────────────────────────────────────────────────────────
-        lua.set_function("Log", [](const std::string &msg)
-                         { logger::log_info("LUA", "%s", msg.c_str()); });
-
-        lua.set_function("LogWarn", [](const std::string &msg)
-                         { logger::log_warn("LUA", "%s", msg.c_str()); });
-
-        lua.set_function("LogError", [](const std::string &msg)
-                         { logger::log_error("LUA", "%s", msg.c_str()); });
+        // Every line is tagged with the MOD'S NAME (origin) — the logger already
+        // prepends the timestamp. DEBUG is suppressed unless the level is lowered
+        // (SetLogLevel("debug") or the `log_level` bridge command / config).
+        // A `Log` table (Log.info/warn/error/debug) is provided alongside the
+        // flat LogXxx functions.
+        auto log_tag = [](const sol::this_environment &te) -> std::string {
+            std::string m = mod_from_env(te);
+            return m.empty() ? std::string("LUA") : m;
+        };
+        lua.set_function("Log", [log_tag](sol::this_environment te, const std::string &msg)
+                         { logger::log_info(log_tag(te).c_str(), "%s", msg.c_str()); });
+        lua.set_function("LogInfo", [log_tag](sol::this_environment te, const std::string &msg)
+                         { logger::log_info(log_tag(te).c_str(), "%s", msg.c_str()); });
+        lua.set_function("LogWarn", [log_tag](sol::this_environment te, const std::string &msg)
+                         { logger::log_warn(log_tag(te).c_str(), "%s", msg.c_str()); });
+        lua.set_function("LogError", [log_tag](sol::this_environment te, const std::string &msg)
+                         { logger::log_error(log_tag(te).c_str(), "%s", msg.c_str()); });
+        lua.set_function("LogDebug", [log_tag](sol::this_environment te, const std::string &msg)
+                         { logger::log_debug(log_tag(te).c_str(), "%s", msg.c_str()); });
+        // SetLogLevel("debug"|"info"|"warn"|"error") — turns DEBUG output on/off.
+        lua.set_function("SetLogLevel", [](const std::string &level)
+                         { logger::set_min_level(logger::level_from_string(level.c_str())); });
 
         // ── Notifications ───────────────────────────────────────────────────
         lua.set_function("Notify", [](const std::string &title, const std::string &body,
@@ -2098,10 +2127,15 @@ namespace lua_bindings
         // ── InstallCrashGuard — sigsetjmp safe-call guard on ONE function ───
         // Installs a callback-less hook so dispatch_full() runs the original
         // inside the sigsetjmp guard: a SIGSEGV in it recovers (returns 0)
-        // instead of killing the game. The built-in guard table is skipped on
-        // RE4 (guarding the render path black-screens VR), so crashy functions
-        // must be guarded individually. E.g. cModel::initJoint, which faults
-        // when the cut police NPC (em07/PL07) spawns with no native model data.
+        // instead of killing the game. Crash guard v2 (crash_guard.cpp) makes
+        // this ACTIVE again — the handler files the fault to
+        // modloader_recovered.log and siglongjmps back. The built-in guard
+        // table is still skipped on RE4 (guarding the render path black-screens
+        // VR), so crashy functions are guarded individually here. E.g.
+        // cModel::initJoint, which faults when the cut police NPC (em07/PL07)
+        // spawns with no native model data. NOTE: for the whole-process
+        // unguarded-null family, the global instruction-skip mode
+        // (SetCrashGuardGlobalMode) now covers it without a per-function hook.
         // Sig: InstallCrashGuard(addr, "name") -> bool
         lua.set_function("InstallCrashGuard", [](void* addr, const std::string& name) -> bool {
             return native_hooks::install_safe_call_guard(addr, name.c_str()) != 0;
@@ -2121,6 +2155,90 @@ namespace lua_bindings
         lua.set_function("InstallCutVillagerFix", []() -> bool {
             return native_hooks::install_cut_villager_fix();
         });
+
+        // ── InstallCrossoverEnemyRemap — ids 0x60-0x6F (above-base pool) ─────
+        // Those ids sit OUTSIDE ArmEmCallProlog's switch, so the villager
+        // jump-table fix can't reach them and the global EmInitFunc stays stale
+        // -> cEmMgr::construct runs the previous enemy's init -> stack smash
+        // (PC==LR==0xA54AB68). This remaps the id arg (W2) at construct entry to
+        // a real base enemy so the whole enemy is valid. Pass construct's entry.
+        // Sig: InstallCrossoverEnemyRemap(constructEntry) -> bool
+        // Sig: InstallGameRoomInitVCallGuard(siteAddr) -> bool
+        // gameRoomInit BLRs vtable[0x90] unguarded; the BASE cEm vtable has NULL
+        // there, so a bare cEm makes room init jump to 0 (tombstone: fault 0x0,
+        // #01 gameRoomInit()+2260). Redirects a NULL to a no-op stub.
+        // Sig: InstallEmSetFromListIdRemap(entryAddr) -> bool
+        // Remaps unbuildable enemy ids at EmSetFromList2 entry (BEFORE construct).
+        // Sig: InstallEmSetFromListSanitize(entryAddr, pgAddr) -> bool
+        // EmSetFromList() has no args; it reads ids from the global spawn list.
+        // Cleans the list in place before the 256-slot pass.
+        // Sig: InstallLifeDownKeepAliveFix(lifeDownSet2Addr) -> bool
+        // Sig: SetEmKillable(emId, bool) / GetKeepAliveClearedCount()
+        // LifeDownSet2 floors HP at 1 when arg4 bit0 ("keep alive") is set — the
+        // real reason U3 was immortal. Damage was always landing.
+        lua.set_function("InstallLifeDownKeepAliveFix", [](void* addr) -> bool {
+            return native_hooks::install_lifedown_keepalive_fix(
+                reinterpret_cast<uintptr_t>(addr));
+        });
+        lua.set_function("SetEmKillable", [](uint32_t id, bool on) {
+            native_hooks::set_em_killable(id, on);
+        });
+        lua.set_function("GetKeepAliveClearedCount", []() -> uint64_t {
+            return native_hooks::keepalive_cleared_count();
+        });
+        lua.set_function("InstallEmSetFromListSanitize", [](void* entry, void* pg) -> bool {
+            return native_hooks::install_emsetfromlist_sanitize(
+                reinterpret_cast<uintptr_t>(entry), reinterpret_cast<uintptr_t>(pg));
+        });
+        lua.set_function("InstallEmSetFromListIdRemap", [](void* entry) -> bool {
+            return native_hooks::install_emsetfromlist_id_remap(
+                reinterpret_cast<uintptr_t>(entry));
+        });
+        lua.set_function("InstallGameRoomInitVCallGuard", [](void* site) -> bool {
+            return native_hooks::install_gameroominit_vcall_guard(
+                reinterpret_cast<uintptr_t>(site));
+        });
+        lua.set_function("InstallCrossoverEnemyRemap", [](void* construct_entry) -> bool {
+            return native_hooks::install_crossover_enemy_remap(reinterpret_cast<uintptr_t>(construct_entry));
+        });
+
+        // ── InstallAsyncGcSingletonGuard — GGCSingleton NULL at load ────────
+        // FAsyncLoadingThread::Run polls GGCSingleton+8 every tick; if the GC
+        // singleton isn't built yet it faults at 0x8 and the level never loads
+        // (black screen). Redirect the null read to 0 ("GC idle"). Pass the LDAR
+        // site. Sig: InstallAsyncGcSingletonGuard(ldarSite) -> bool
+        lua.set_function("InstallAsyncGcSingletonGuard", [](void* site) -> bool {
+            return native_hooks::install_async_gc_singleton_guard(reinterpret_cast<uintptr_t>(site));
+        });
+
+        // ── Debug-menu bridge: Lua mods add entries to the C# MODS tab ───────
+        // AddMenuEntry(mod, label, "button"|"toggle", callback, [initState],
+        //   [onText], [offText]) -> id. The callback runs on the game-thread Lua
+        // tick when the entry is clicked (a toggle callback receives the NEW
+        // bool state). SetMenuEntryState(id, bool) updates a toggle's shown state
+        // (e.g. if the underlying value changes elsewhere).
+        // Root (flat) item: AddMenuEntry(mod, label, "button"|"toggle", cb, [init], [on], [off]) -> id
+        lua.set_function("AddMenuEntry",
+            [](std::string mod, std::string label, std::string type, sol::object cb,
+               sol::optional<bool> init, sol::optional<std::string> on,
+               sol::optional<std::string> off) -> int {
+                sol::function fn = cb.is<sol::function>() ? cb.as<sol::function>() : sol::function();
+                return menu_bridge::root_add(mod, label, type, fn, init.value_or(false),
+                                             on.value_or(std::string()), off.value_or(std::string()));
+            });
+        // Open a dynamic sub-page: MenuNavigate(title, populateFn) -> pageId. populate()
+        // runs immediately + on every re-entry; inside it call MenuItem(...).
+        lua.set_function("MenuNavigate", [](std::string name, sol::object populate) -> int {
+            sol::function fn = populate.is<sol::function>() ? populate.as<sol::function>() : sol::function();
+            return menu_bridge::navigate(name, -1, fn);
+        });
+        // Add an item to the sub-page currently being populated: MenuItem(label, [cb]).
+        // cb nil = a non-interactive header/label row.
+        lua.set_function("MenuItem", [](std::string label, sol::object cb) -> int {
+            sol::function fn = cb.is<sol::function>() ? cb.as<sol::function>() : sol::function();
+            return menu_bridge::item_add(label, fn);
+        });
+        lua.set_function("SetMenuEntryState", [](int id, bool st) { menu_bridge::set_state(id, st); });
 
         // ── InstallEm32SubObjectGuard — the cut-enemy spawn SIGSEGV ──────────
         // em32's init (sub_5E49AA0) calls SetObj00 for two sub-object models,
@@ -2201,9 +2319,10 @@ namespace lua_bindings
         // ── InstallLaserSightFix — aiming at a crossover enemy killed the game
         // GetWepTargetPos derefs getPartsPtr's NULL result (ADD X1,X0,#0x80 ->
         // MTXMultVec -> fault 0x80), every frame the laser is on that target.
-        // A crash guard CANNOT fix this: the handler's siglongjmp recovery was
-        // removed on purpose, so install_safe_call_guard is inert. This
-        // neutralises the pointer instead — no lock-on, no crash.
+        // This still neutralises the pointer at the source (no lock-on, no
+        // crash) — cheaper than recovering the same fault every frame. (Crash
+        // guard v2 WOULD now catch it via global instruction-skip, but a
+        // per-frame source fix beats a per-frame signal round-trip.)
         // Sig: InstallLaserSightFix(addrOfAddX1X0_0x80) -> bool
         lua.set_function("InstallLaserSightFix", [](void* site) -> bool {
             return native_hooks::install_laser_sight_fix(reinterpret_cast<uintptr_t>(site));
@@ -2305,6 +2424,64 @@ namespace lua_bindings
         lua.set_function("IsDualFireEnabled", []() -> bool {
             return native_hooks::is_dualfire_enabled();
         });
+        // ── InstallPrimaryHandFallback — two-handed weapons fire one-handed ──
+        // AVR4GamePlayerProp::GetPrimaryHand only checks the PRIMARY grip, so a
+        // weapon held by the forestock alone returns NULL and every weapon's
+        // PreBio4Tick sends the trigger to DryFire (click, no shot). This hook
+        // returns the hand from whichever grip IS held.
+        // Sig: InstallPrimaryHandFallback(getPrimaryHand, getAnyCurrentGrip,
+        //                                 getCurrentHand, groupOff) -> bool
+        lua.set_function("InstallPrimaryHandFallback",
+            [](void* gph, void* anygrip, void* curhand, uint32_t group_off,
+               sol::optional<void*> gfh, sol::optional<void*> gvt) -> bool {
+            return native_hooks::install_primary_hand_fallback(
+                reinterpret_cast<uintptr_t>(gph), reinterpret_cast<uintptr_t>(anygrip),
+                reinterpret_cast<uintptr_t>(curhand), group_off,
+                reinterpret_cast<uintptr_t>(gfh.value_or(nullptr)),
+                reinterpret_cast<uintptr_t>(gvt.value_or(nullptr)));
+        });
+        // Sig: InstallFiringHandVtableFallback(vtableSlotAddr) -> bool
+        // Swaps ONE vtable entry (GetFiringHand) instead of patching code —
+        // avoids both the shared-function aliasing crash and Dobby's 16-byte
+        // inline patch clobbering a neighbouring function.
+        lua.set_function("InstallFiringHandVtableFallback", [](void* slot) -> bool {
+            return native_hooks::install_firing_hand_vtable_fallback(
+                reinterpret_cast<uintptr_t>(slot));
+        });
+        // Sig: InstallFastFmodf() -> bool  — speeds up the enemy-AI hot path
+        lua.set_function("InstallFastFmodf", []() -> bool {
+            return native_hooks::install_fast_fmodf();
+        });
+        lua.set_function("SetFastFmodfEnabled", [](bool on) {
+            native_hooks::set_fast_fmodf_enabled(on);
+        });
+        lua.set_function("GetFastFmodfStats", []() -> std::string {
+            char b[96];
+            snprintf(b, sizeof(b), "fast=%llu slow=%llu",
+                     (unsigned long long)native_hooks::g_fmodf_fast.load(),
+                     (unsigned long long)native_hooks::g_fmodf_slow.load());
+            return std::string(b);
+        });
+        // Sig: SetPrimaryHandFallbackEnabled(bool)
+        lua.set_function("SetPrimaryHandFallbackEnabled", [](bool on) {
+            native_hooks::set_primary_hand_fallback_enabled(on);
+        });
+        // Sig: GetPrimaryHandFallbackCount() -> number (how often it kicked in)
+        lua.set_function("GetPrimaryHandFallbackCount", []() -> uint64_t {
+            return native_hooks::g_ph_fallbacks.load();
+        });
+        // Sig: GetTryFireStats() -> "calls,ok,lastSelf,lastRet" (diagnostic)
+        // Tells whether TryFire is REACHED at all and what it returns — the one
+        // thing a backtrace can't answer for "weapon won't fire" cases.
+        lua.set_function("GetTryFireStats", []() -> std::string {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "calls=%llu ok=%llu lastSelf=0x%llX lastRet=%llu",
+                     (unsigned long long)native_hooks::g_df_calls.load(),
+                     (unsigned long long)native_hooks::g_df_ok.load(),
+                     (unsigned long long)native_hooks::g_df_last_self.load(),
+                     (unsigned long long)native_hooks::g_df_last_ret.load());
+            return std::string(buf);
+        });
 
         // ── SetEnemyPoolMultiplier — lift the per-level enemy cap ────────────
         // EmSetEvent hands out cEm slots from a FIXED pool and returns the errEm
@@ -2317,6 +2494,11 @@ namespace lua_bindings
         // Sig: SetEnemyPoolMultiplier(mult) -> bool
         lua.set_function("SetEnemyPoolMultiplier", [](uint32_t mult) -> bool {
             return native_hooks::set_enemy_pool_multiplier(mult);
+        });
+
+        // Persistent enemy pool: allocate once, reuse across room loads.
+        lua.set_function("SetEnemyPoolPersist", [](bool on) -> bool {
+            return native_hooks::set_enemy_pool_persist(on);
         });
 
         // ── IsEmIdSupported — can the engine actually construct this em id? ──
@@ -2508,6 +2690,129 @@ namespace lua_bindings
             reinterpret_cast<char*>(addr),
             reinterpret_cast<char*>(addr) + 8
         ); });
+
+        // ── GENERIC STATIC PATCHING (Lua-driven; no dedicated native patcher) ──
+        // These give a mod the full "static bytepatch / ARM64 replacement" power
+        // that used to require a bespoke C++ install_*_fix. Every write is
+        // i-cache-correct and REVERSIBLE: note_code_write captures the original
+        // bytes so unload/disable/quarantine restores them, and the crash guard
+        // can attribute a fault to the patching mod. hex args are lowercase byte
+        // hex ("d503201f"); asm args are one-instruction-per-line AArch64 text.
+
+        // PatchBytes(addr, hex) — overwrite code with raw bytes. Reversible.
+        lua.set_function("PatchBytes", [](sol::this_environment te, void *addr,
+                                          const std::string &hex) -> bool {
+            if (!ue::is_mapped_ptr(addr) || hex.size() < 2) return false;
+            mod_tracker::note_code_write(mod_from_env(te), addr, hex.size() / 2);
+            return codepatch::write_code_hex(addr, hex, "");
+        });
+
+        // PatchData(addr, hex) — overwrite READ-ONLY data (jump tables/.rodata).
+        lua.set_function("PatchData", [](sol::this_environment te, void *addr,
+                                         const std::string &hex) -> bool {
+            if (!ue::is_mapped_ptr(addr) || hex.size() < 2) return false;
+            // Track as a code write so it reverts with the mod; write_data does
+            // the RW mprotect (no i-cache flush needed for data).
+            mod_tracker::note_code_write(mod_from_env(te), addr, hex.size() / 2);
+            std::vector<uint8_t> bytes;
+            for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                auto hv = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                    return -1; };
+                int hi = hv(hex[i]), lo = hv(hex[i + 1]);
+                if (hi < 0 || lo < 0) return false;
+                bytes.push_back((uint8_t)((hi << 4) | lo));
+            }
+            return codepatch::write_data(addr, bytes.data(), bytes.size(), "");
+        });
+
+        // PatchNop(addr, count?) — NOP out `count` instructions (default 1).
+        lua.set_function("PatchNop", [](sol::this_environment te, void *addr,
+                                        sol::optional<int> count) -> bool {
+            int n = count.value_or(1);
+            if (!ue::is_mapped_ptr(addr) || n <= 0) return false;
+            mod_tracker::note_code_write(mod_from_env(te), addr, (size_t)n * 4);
+            return codepatch::nop_code(addr, n, "");
+        });
+
+        // PatchAsm(addr, text) — assemble AArch64 text AT addr (PC-relative
+        // branches resolve) and write it. Returns (ok, err). This is the "arm
+        // replacement" primitive: e.g. PatchAsm(site, "mov x2, xzr\nb 0x5e4a36c").
+        lua.set_function("PatchAsm", [](sol::this_environment te, void *addr,
+                                        const std::string &text)
+                             -> std::tuple<bool, std::string> {
+            if (!ue::is_mapped_ptr(addr)) return {false, "unmapped addr"};
+            std::vector<uint8_t> bytes;
+            std::string err;
+            if (!arm64::assemble_bytes(text, reinterpret_cast<uintptr_t>(addr), bytes, err))
+                return {false, err};
+            mod_tracker::note_code_write(mod_from_env(te), addr, bytes.size());
+            bool ok = codepatch::write_code(addr, bytes.data(), bytes.size(), "");
+            return {ok, ok ? std::string() : std::string("write failed")};
+        });
+
+        // Asm(text, pc?) — assemble to a hex string WITHOUT writing (compose /
+        // inspect). pc is the address the code would live at (for branches).
+        lua.set_function("Asm", [](const std::string &text, sol::optional<int64_t> pc)
+                             -> std::tuple<std::string, std::string> {
+            std::vector<uint8_t> bytes;
+            std::string err;
+            uintptr_t at = pc ? (uintptr_t)*pc : 0;
+            if (!arm64::assemble_bytes(text, at, bytes, err))
+                return {std::string(), err};
+            static const char *hx = "0123456789abcdef";
+            std::string out;
+            out.reserve(bytes.size() * 2);
+            for (uint8_t b : bytes) { out += hx[b >> 4]; out += hx[b & 0xF]; }
+            return {out, std::string()};
+        });
+
+        // PatchBranch(addr, target) — write `B target` at addr (redirect flow).
+        lua.set_function("PatchBranch", [](sol::this_environment te, void *addr,
+                                           void *target) -> bool {
+            if (!ue::is_mapped_ptr(addr)) return false;
+            uint32_t w = 0;
+            if (!arm64::b(reinterpret_cast<uintptr_t>(addr),
+                          reinterpret_cast<uintptr_t>(target), w))
+                return false; // out of ±128MB range
+            mod_tracker::note_code_write(mod_from_env(te), addr, 4);
+            return codepatch::write_code(addr, &w, 4, "");
+        });
+
+        // RestorePatch(addr) — revert one patched address immediately.
+        lua.set_function("RestorePatch", [](void *addr) -> bool {
+            return codepatch::restore_addr(addr);
+        });
+
+        // ── .NET / C# bridge from Lua ────────────────────────────────────────
+        // GenerateCSharpProxies(dir?) — emit the faithful typed C# proxies (real
+        // classes/fields/params/enums + traced native functions) from the live
+        // reflection graph, for compiling into the single UEModLoader.dll.
+        lua.set_function("GenerateCSharpProxies", [](sol::optional<std::string> dir) -> std::string {
+            return csharp_gen::generate(dir.value_or(""));
+        });
+        lua.set_function("DotnetStatus", []() -> std::string { return dotnet_host::status(); });
+
+        // WrapBridgeCommand(name, fn) — ENHANCE an existing bridge command
+        // (built-in or custom). fn(args, callOriginal) receives the args and a
+        // callOriginal() thunk that runs the stock command; return the reply
+        // (call the original and augment it, replace it, or wrap work around it).
+        lua.set_function("WrapBridgeCommand", [](sol::this_environment te, const std::string &name,
+                                                 sol::function callback) {
+            mod_tracker::track_command(mod_from_env(te), name);
+            adb_bridge::register_command_wrapper(
+                name, [callback](const std::string &args,
+                                 const std::function<std::string()> &call_original) -> std::string {
+                    sol::protected_function_result r = callback(args, call_original);
+                    if (r.valid() && r.return_count() > 0) {
+                        sol::object r0 = r[0];
+                        if (r0.get_type() == sol::type::string) return r0.as<std::string>();
+                    }
+                    return std::string("ok");
+                });
+        });
 
         // ── Address helpers ─────────────────────────────────────────────────
         lua.set_function("GetLibBase", []() -> sol::lightuserdata_value

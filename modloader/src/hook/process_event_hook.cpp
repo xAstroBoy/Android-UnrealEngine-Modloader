@@ -11,6 +11,8 @@
 #include "modloader/reflection_walker.h"
 #include "modloader/class_rebuilder.h"
 #include "modloader/lua_delayed_actions.h"
+#include "modloader/dotnet_host.h"
+#include "modloader/menu_bridge.h"
 #include "modloader/lua_ue4ss_globals.h"
 #include "modloader/mod_loader.h"
 #include "modloader/types.h"
@@ -395,6 +397,15 @@ namespace pe_hook
                 // Tick delayed actions (ExecuteWithDelay, LoopAsync, etc.)
                 // MUST be inside s_draining guard — see comment above.
                 lua_delayed::tick_game_thread();
+
+                // Run any queued debug-menu callbacks (a Lua entry the C# menu was
+                // clicked). Same game thread, same safe deferred context as Lua
+                // delayed actions — never called inline from the C# menu hook.
+                menu_bridge::tick();
+
+                // Drive C# mod OnUpdate/OnLateUpdate (no-op if the .NET host is
+                // unavailable). Same game thread, same drain guard as Lua work.
+                dotnet_host::tick();
 
                 // Notify class rebuilder for instance tracking (lightweight check)
                 rebuilder::tick(self, func, parms);

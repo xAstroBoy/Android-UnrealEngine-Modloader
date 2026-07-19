@@ -106,15 +106,14 @@ void add_em3f_mesh_path_fix(uint32_t key, int32_t comparison_index);
 // killing the game. Needed because install_builtin_crash_guards() is skipped on
 // this title (guarding the render path black-screens VR). Main user:
 // cModel::initJoint, which faults when the cut police NPC (em07/PL07) spawns.
-// WARNING — THIS IS INERT. It installs a callback-less hook so the original runs
-// under dispatch_full's sigsetjmp, but crash_handler.cpp DELIBERATELY REMOVED all
-// five siglongjmp recovery paths ("Crashes are meant to be seen and fixed, not
-// hidden"), so nothing ever jumps back and a fault inside the guarded original
-// still kills the process. Proven: a tombstone with thunk_4 -> dispatch_full ->
-// GetWepTargetPos -> fault 0x80 in it. Do NOT reach for this expecting protection
-// — fix the actual null (byte patch, or one DobbyInstrument that neutralises the
-// pointer, as install_em32_subobject_guard and install_laser_sight_fix do).
-// Kept only because its try/catch still guards C++ exceptions, a different thing.
+// ACTIVE as of crash guard v2 (crash_guard.cpp): the callback-less hook runs the
+// original under dispatch_full's sigsetjmp, and crash_guard::try_recover files
+// the fault to modloader_recovered.log then siglongjmps back — the game keeps
+// running and this returns 0. (The v1 recovery was removed for hiding crashes;
+// v2 restores it but every suppressed fault is logged and toggleable.) For the
+// whole-process unguarded-null family, SetCrashGuardGlobalMode covers it without
+// a per-function hook, and a per-frame source fix (byte patch / DobbyInstrument,
+// as install_laser_sight_fix does) still beats recovering the same fault 60x/sec.
 HookId install_safe_call_guard(void* addr, const char* name);
 // Cut villager ganados (em ids 6/7/8/0xA/0xB/0xD/0x33/0x37): they share em10.das
 // with id 9 but have no ArmEmCallProlog case, so EmInitFunc was left STALE and
@@ -195,6 +194,11 @@ uint64_t null_guard_substitutions();
 // Does NOT bound ARRAY mode's `+= 496*idx` — that needs the part count.
 bool install_getpartsptr_guard(uintptr_t getparts);
 uint64_t getpartsptr_dummy_count();
+// Pointers the guard refused as impossible (non-canonical / unaligned / tiny) or
+// ARRAY indices past kMaxPartIdx. Distinct from the dummy count, which counts
+// legitimate NULLs the engine never checked: a nonzero value here means garbage
+// was actively in flight (see the IKInit/moveWepDown tombstone).
+uint64_t getpartsptr_reject_count();
 
 // CArmSoundBlock::ExtractTrackIndex (0x61AF06C) calls strtol on its cursor BEFORE
 // applying the end-of-name-table bound it then checks four instructions later. An
@@ -234,17 +238,91 @@ bool install_dualfire_arm(uintptr_t tryfire, uintptr_t itemmgr,
                           uintptr_t pg_addr, uint32_t armed_off);
 void set_dualfire_enabled(bool on);
 bool is_dualfire_enabled();
+
+// Primary-hand fallback: lets a two-handed weapon fire while held by ONE grip.
+// GetPrimaryHand only inspects the primary grip, so a forestock-only hold returns
+// NULL and every PreBio4Tick routes the trigger to DryFire. This returns the hand
+// from whichever grip IS held instead. Do NOT "fix" this by NOPing the NULL check
+// in PreBio4Tick — cObjLauncher::launch() needs a real hand and faults on NULL.
+bool install_primary_hand_fallback(uintptr_t getprimaryhand, uintptr_t anygrip,
+                                   uintptr_t getcurrenthand, uint32_t group_off,
+                                   uintptr_t getforestockhand, uintptr_t group_vtbl);
+bool install_firing_hand_vtable_fallback(uintptr_t vtable_slot);
+void set_primary_hand_fallback_enabled(bool on);
+
+// Replace bionic's fmodf with a 3-instruction hardware-FP version. The enemy AI
+// (cEmMgr::move -> per-enemy move) calls it constantly for angle wrapping and it
+// dominates the game thread. Out-of-range/NaN/zero-divisor inputs still use the
+// original, so results are unchanged.
+bool install_fast_fmodf();
+void set_fast_fmodf_enabled(bool on);
+extern std::atomic<uint64_t> g_fmodf_fast;
+extern std::atomic<uint64_t> g_fmodf_slow;
+extern std::atomic<uint64_t> g_ph_fallbacks;
+
+// TryFire instrumentation — see df_tryfire in native_hooks.cpp. Diagnostic only:
+// distinguishes "TryFire never runs" (input/grip layer blocks it) from
+// "TryFire runs and returns 0" (a weapon-side gate rejects the shot).
+extern std::atomic<uint64_t> g_df_calls;
+extern std::atomic<uint64_t> g_df_ok;
+extern std::atomic<uint64_t> g_df_last_self;
+extern std::atomic<uint64_t> g_df_last_ret;
 // True if em `id` has a real init. cEmMgr::construct calls the EmInitFunc global
 // WITHOUT a null check, so an id with no ArmEmCallProlog case runs the previous
 // enemy's init over the wrong archive — or jumps to NULL (pc=0). Ask the jump
 // table so the list can't rot. Ids 75/78 (em4b/em4e = vehicles, Houdai) are
 // genuinely unimplemented and must not be spawned.
 bool is_em_id_supported(uint32_t id);
+// Remap crossover enemy ids 0x60-0x6F (the Randomizer's above-base pool) at
+// cEmMgr::construct entry to a supported base enemy. These ids are OUTSIDE
+// ArmEmCallProlog's switch (id-3 > 0x4C), so the villager jump-table fix can't
+// reach them; they leave the global EmInitFunc stale -> construct runs the
+// previous enemy's init on the wrong data -> stack smash (PC==LR==0xA54AB68).
+// Rewriting the id arg (W2) at entry makes the WHOLE construct build a real
+// enemy. Ids whose .das already points at a base archive map to it (0x68->em18,
+// 0x66->em46, 0x6C/6D/6F->em4c/4d/4f); the ema-series maps to em09 (ganado).
+// Unsupported targets fall back to em09. Pass cEmMgr::construct's entry address.
+bool install_crossover_enemy_remap(uintptr_t construct_entry);
+
+// gameRoomInit BLRs vtable[0x90] with no null check; the BASE cEm vtable has no
+// entry there, so any enemy left as a bare cEm jumps to 0 during room init
+// (tombstone: SEGV_MAPERR fault 0x0, #01 gameRoomInit()+2260). Instrument the
+// load so a NULL is redirected to a no-op stub. Site = 0x5F43B38.
+bool install_gameroominit_vcall_guard(uintptr_t site);
+
+// EmSetFromList2(id, flags) @0x5EE9A6C runs BEFORE cEmMgr::construct, so the
+// construct remap is too late — an id the room cannot build faults inside the
+// spawn-list read itself. Applies the same crossover LUT to X0 at entry.
+bool install_emsetfromlist_id_remap(uintptr_t entry);
+
+// EmSetFromList() takes NO arguments — it reads every enemy id from the global
+// spawn list (pG + 32*i + 21661, 256 slots). Sanitises that list in place before
+// the pass runs, so an unbuildable id never reaches construct.
+bool install_emsetfromlist_sanitize(uintptr_t entry, uintptr_t pg_addr);
+
+// THE "unkillable boss" fix. LifeDownSet2 floors HP at 1 when its 4th arg has
+// bit0 set ("keep this enemy alive") — found with a hardware watchpoint on a live
+// U3's HP: one writer, libUE4+0x5EEF1F8. Damage always landed; the clamp is what
+// made it immortal. Clears that bit for opt-in em ids so HP can reach 0 and the
+// normal death (with animation) runs. install_at only — LifeDownSet2 opens with
+// `str d8,[sp,#-0x50]!` and instrumenting that smashes the stack.
+bool install_lifedown_keepalive_fix(uintptr_t lifedownset2);
+void set_em_killable(uint32_t em_id, bool on);
+uint64_t keepalive_cleared_count();
+// Guard FAsyncLoadingThread::Run's `LDAR W8,[X8]` (X8 = GGCSingleton+8): when the
+// GC singleton isn't up yet (startup / level transition) GGCSingleton is NULL and
+// this faults at 0x8 (level never finishes loading, black screen). Redirect the
+// null read to a zeroed word = "GC idle". Pass the LDAR site (0x68957DC RVA).
+bool install_async_gc_singleton_guard(uintptr_t ldar_site);
 // Lift the per-level live-enemy cap. EmSetEvent returns errEm ("pool full") once
 // the fixed cEm pool is exhausted; cEmMgr::arrayAlloc(n) sizes that pool as
 // stride*n AND sets count=n, so scaling its argument scales both together.
 // Takes effect on the next level load. mult is clamped to 1..16.
 bool set_enemy_pool_multiplier(uint32_t mult);
+// Persistent pool: allocate the enemy pool once and reuse it across room
+// loads (no free -> no dangling pointers, no realloc -> no per-room leak).
+// Pass false for the stock allocate-and-abandon behaviour.
+bool set_enemy_pool_persist(bool on);
 
 // Get info about all installed hooks
 struct HookInfo {

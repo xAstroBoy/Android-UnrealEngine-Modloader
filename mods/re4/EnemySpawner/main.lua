@@ -1036,6 +1036,26 @@ local function spawnEnemy(enemy, count)
                 break
             else
                 lastErr = result
+                -- FAIL FAST on an id the room cannot build. The candidate list is
+                -- 19 POSITIONS — retrying makes sense when a spot is blocked, but
+                -- "EmSetEvent returned NULL" means the EM ID itself is bad, and no
+                -- position will change that. Retrying called the engine 19 more
+                -- times with the same bad id and smashed the stack:
+                --     SIGSEGV  PC = LR = 0x79496f4c40, SP = 0x79496f4c30
+                --     (PC executing ON the stack)
+                -- preceded by "#1 failed after 19 attempts: EmSetEvent returned NULL".
+                --
+                -- Hit reliably with the cut-content NPCs — Krauser (NPC) is em 10
+                -- (= PL0A_Krauser), and 6/7/8/0xA/0xB/0xD/0x33/0x37 have no
+                -- ArmEmCallProlog case of their own (install_cut_villager_fix
+                -- reroutes them to _prologEm09), so EmSetEvent legitimately fails
+                -- in rooms that never authored them.
+                if type(result) == "string"
+                   and (result:find("EmSetEvent returned NULL", 1, true)
+                        or result:find("errEm", 1, true)) then
+                    V("spawnEnemy: bad em id — not retrying %d more positions", #candidates - candidateIndex)
+                    break
+                end
             end
         end
 
@@ -1343,12 +1363,140 @@ V("Init: nativeReady=%s", tostring(nativeReady))
 --     [EMPOOL] cEmMgr::arrayAlloc: 60 -> 240 slots (x4)
 -- Set this back to 4 only if crashes persist with it at 1 — i.e. only once the
 -- evidence says it is innocent.
-local POOL_MULT = 1
+-- ═══════════════════════════════════════════════════════════════════════
+-- WHY x4 BLEW UP, AND THE ACTUAL FIX (IDA-verified)
+-- ═══════════════════════════════════════════════════════════════════════
+-- The pool is not just enemies. SetMine()/the launcher allocate their live
+-- projectiles from the SAME cEmMgr pool:
+--     SetMine (0x5ECC8D0):
+--         v7 = count; do { if (--v7 < 0) return 0; ... } while (slot in use);
+-- return 0 -> cObjMine::setBullet does nothing -> DRY FIRE. So "I can only
+-- place N mines" IS the pool running out. Mines are worst because an armed
+-- mine holds its slot until it detonates, while a rocket frees on impact.
+--
+-- Raising the multiplier is therefore the right lever — but x4 previously
+-- caused a 32-tombstone storm, and here is why:
+--     gameRoomInit (0x5F43268):
+--         0x5f43518  str xzr, [x20,#8]     ; EmMgr+8 (poolBase) = NULL
+--         0x5f43530  bl  cEmMgr::arrayAlloc
+--     cEmMgr::arrayAlloc (0x5D90680):
+--         if (this[1]) { memFree(this[1]); this[1] = 0; }   <- never runs
+--         this[1] = memAlloc(stride * count);
+-- gameRoomInit NULLs the pool pointer immediately BEFORE arrayAlloc, so the
+-- free is unreachable and the ENTIRE previous pool is orphaned on every room
+-- load (60 * 4388 = ~263 KB). Multiplying the count multiplies the leak — that
+-- is what actually exhausted memory at x4, not the extra enemies.
+-- (The same null-then-check pattern leaks ModInfoMgr, PartsMgr, ObjMgr,
+-- LightMgr, SatMgr, EatMgr and CtrlMgr too — engine-wide, not our doing.)
+--
+-- FIX_POOL_LEAK NOPs that one store so arrayAlloc's own free finally runs.
+-- Nothing between the store and the call reads EmMgr+8, so it is safe.
+--
+-- ORDER MATTERS: fix the leak FIRST, then raise the multiplier. With the leak
+-- fixed the pool is freed and reallocated cleanly each load, so a bigger pool
+-- costs a constant amount instead of compounding.
+--
+-- RESIDUAL RISK, stated honestly: the devs may have been leaking deliberately
+-- to dodge dangling pointers into the old pool. arrayAlloc clears pPL/pSUB/
+-- pSUB2 and gameRoomInit clears the active-list head right there, so nothing
+-- obvious survives — but if you see use-after-free style crashes on room load,
+-- set FIX_POOL_LEAK back to false first, before touching POOL_MULT.
+-- ═══════════════════════════════════════════════════════════════════════
+-- FIX_POOL_LEAK = false  — THE "LEAK" IS LOAD-BEARING. DO NOT RE-ENABLE.
+-- ═══════════════════════════════════════════════════════════════════════
+-- I turned this on, and the FIRST room load after it crashed:
+--     00:16:27  pool-leak FIXED + x16 armed
+--     00:22:52  ROOM LOAD #9
+--     00:22:53  arrayAlloc crashed (signal 11)
+--     00:22:53  [GRIGUARD] gameRoomInit: NULL vtable[0x90] on a bare cEm
+--
+-- Why. The allocator is NOT a fixed arena (that guess was wrong) — it is UE4's
+-- heap with an 8-byte header:
+--     mem_alloc  -> FMemory::Malloc(size+8); returns ptr+8
+--     Mem_free_h -> hdr at p-8; if heapId > 0xC it silently does nothing
+-- so size was never the issue. The issue is WHO STILL POINTS AT THE OLD POOL.
+-- Immediately after arrayAlloc, gameRoomInit does:
+--     construct(slot, 0)                  ; rebuild the PLAYER into the pool
+--     (*(*(void**)pPL + 144))(pPL)        ; then call through pPL
+-- pPL (and pSUB/pSUB2, mine parents, SceAt refs...) point INTO the pool.
+-- gameRoomInit NULLing EmMgr+8 makes arrayAlloc's free unreachable ON PURPOSE:
+-- the old buffer is ABANDONED so every stale pointer still lands on valid
+-- memory until it is re-established. Freeing it turns a bounded leak into a
+-- use-after-free — which is exactly what the crash was.
+--
+-- So the stock leak (~stride*count per room load) is the price of safety, and
+-- the multiplier is bounded by how much leak per room load you can accept:
+--     x4  -> ~1.0 MB per room load
+--     x20 -> ~5.3 MB per room load   (adds up fast over a long session)
+--
+-- The RIGHT fix is neither leak nor free: allocate the big pool ONCE and REUSE
+-- it across room loads (skip the alloc entirely when the existing buffer is
+-- already large enough). Nothing is freed, so no dangling pointers, and nothing
+-- new is allocated, so no leak. That needs the native hook to be able to skip
+-- arrayAlloc's body — a modloader rebuild, not a mod push.
+local FIX_POOL_LEAK = false
+-- "INFINITE" MINES.
+-- The dry-fire is SetMine's `if (--v7 < 0) return 0;` — it gave up after
+-- scanning `count` slots. You cannot simply NOP that check: the loop would walk
+-- off the end of the pool array and dereference garbage (instant SIGSEGV), and
+-- forcing the occupied-test false would hand back a slot that a LIVE enemy is
+-- using. The branch is unreachable when there is always a free slot, so the
+-- byte-level fix is to make the array big enough that it never runs out.
+--
+-- Cost is linear and now bounded, because FIX_POOL_LEAK stops the pool being
+-- orphaned each room load: slots * 4388 bytes, freed and reallocated per load.
+--   x3  ~=  180 slots  ~= 0.8 MB
+--   x20 ~= 1200 slots  ~= 5.3 MB      <- effectively unlimited mines
+-- cEmMgr::move's first loop scans every slot per frame, but that is a flags
+-- test (ldr/tst/b.eq) per slot — ~1200 of those is nothing.
+--
+-- HOW BIG CAN IT ACTUALLY GO — measured, not guessed:
+--   x16 (60 -> 960 slots = 4.2 MB) CRASHED. Log:
+--       [EMPOOL] cEmMgr::arrayAlloc: 60 -> 960 slots (x16)
+--       SAFE-CALL RECOVERY: Hook '__em_pool_mult' original crashed (signal 11)
+--   arrayAlloc allocates from the game's own FIXED ARENA, not the system heap,
+--   and never null-checks:
+--       v4 = memAlloc(stride*count);        // NULL when the arena can't fit it
+--       if (count) memClear(this, v4, ...); // memClear(NULL, 4.2MB) -> SIGSEGV
+--   So the ceiling is the arena, not the 4096-slot clamp in the native hook.
+--   4.2 MB is over it. Walk this up one step at a time and watch for
+--   "[EMPOOL] cEmMgr::arrayAlloc: N -> M slots" followed by a SAFE-CALL
+--   RECOVERY on '__em_pool_mult' — that pairing means the alloc failed.
+--     x4  ->  240 slots ~= 1.0 MB   (~225 mines, 5x the stock 45)
+--     x8  ->  480 slots ~= 2.1 MB   (try next if x4 is stable)
+--     x16 ->  960 slots ~= 4.2 MB   CONFIRMED TOO BIG
+-- x20 is viable now because the modloader allocates the pool ONCE and REUSES it
+-- (native em_pool_arrayalloc). No free -> no dangling pointers; no realloc ->
+-- no per-room leak. The old "leak per room load" ceiling no longer applies.
+--   x20 -> ~1200 slots ~= 5.3 MB, allocated a single time for the session.
+-- SetEnemyPoolPersist(false) reverts to stock allocate-and-abandon if needed.
+local POOL_MULT     = 20
+
+if FIX_POOL_LEAK then
+    pcall(function()
+        local sym = Resolve("_Z12gameRoomInitv", 0x05F43268)
+        if not sym or IsNull(sym) then
+            LogWarn(TAG .. ": gameRoomInit not resolved — pool leak NOT fixed")
+            return
+        end
+        local addr = Offset(sym, 0x2B0)          -- the str xzr,[x20,#8]
+        local cur  = ReadU32(addr)
+        if cur ~= 0xF900069F and cur ~= 0xD503201F then
+            LogWarn(TAG .. ": unexpected word " .. string.format("0x%08X", cur or 0)
+                .. " at gameRoomInit+0x2B0 (expected 0xF900069F) — refusing to patch")
+            return
+        end
+        WriteU32(addr, 0xD503201F)               -- NOP
+        Log(TAG .. ": pool-leak FIXED @ " .. ToHex(addr)
+            .. " (gameRoomInit no longer orphans the pool; arrayAlloc frees it)")
+    end)
+end
+
 if SetEnemyPoolMultiplier then
     pcall(function()
         local ok = SetEnemyPoolMultiplier(POOL_MULT)
         Log(TAG .. ": enemy pool x" .. POOL_MULT .. " — " .. (ok and "armed" or "FAILED")
-            .. " (applies on next level load; removes the 'Pool full' cap)")
+            .. " (applies on next level load; more simultaneous mines/rockets)")
     end)
 else
     LogWarn(TAG .. ": SetEnemyPoolMultiplier missing — rebuild the modloader; "

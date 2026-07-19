@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Produces the SINGLE dependency modders reference: UEModLoader.dll (API +
+    generated game proxies). Targets net8.0 to match the on-device .NET 8
+    CoreCLR runtime the host loads via hostfxr. The native bridge is P/Invoke
+    into libmodloader's ueml_* exports; the host calls the [UnmanagedCallersOnly]
+    entry points in Host.cs.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>UEModLoader</AssemblyName>
+    <RootNamespace>UEModLoader</RootNamespace>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <Version>1.0.0</Version>
+    <Authors>UEModLoader</Authors>
+    <Description>C# modding API + generated game proxies for the Quest UE ModLoader (MelonLoader-style, CoreCLR).</Description>
+    <!-- Invariant globalization — matches the host runtimeconfig; avoids ICU. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!-- The API dll is proxy-FREE; the game proxies are generated + compiled into
+       a SEPARATE UEModLoader.Game.dll ON-DEVICE by ProxyCompiler. So exclude any
+       local Generated/ sources from this build. -->
+  <ItemGroup>
+    <Compile Remove="Generated/**/*.cs" />
+  </ItemGroup>
+
+  <!-- Roslyn — lets the modloader compile the generated proxies on-device
+       (runs on the device's CoreCLR). Its dlls deploy next to UEModLoader.dll. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.8.0" />
+  </ItemGroup>
+
+</Project>

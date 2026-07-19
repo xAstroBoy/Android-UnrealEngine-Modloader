@@ -44,4 +44,9 @@ namespace mod_tracker
     // MUST run on the game thread — same rule as load_mod/reload_mod.
     ReleaseStats release_mod(const std::string &mod);
 
+    // Crash-guard attribution: which mod byte-patched code at/near this PC?
+    // (containment, or nearest patch ending within 0x100 bytes above the PC)
+    bool find_patch_near(uintptr_t pc, std::string &mod_out,
+                         uintptr_t &addr_out, size_t &size_out);
+
 } // namespace mod_tracker

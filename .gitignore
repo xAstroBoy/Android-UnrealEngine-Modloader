@@ -145,3 +145,23 @@ lsposed-module/app/build/
 lsposed-module/build/
 lsposed-module/.gradle/
 lsposed-module/local.properties
+
+# ── Rust build output (PCBridge) ──────────────────────────────────────
+# 439MB of compiled deps; .rlib/.rmeta files run to 28MB each and would
+# permanently bloat history (GitHub warns >50MB, hard-rejects >100MB).
+PCBridge/target/
+*.rlib
+*.rmeta
+*.pdb
+*.exe
+
+# ── .NET build output ─────────────────────────────────────────────────
+# 31MB of bin/. The C# SOURCE under dotnet/*.src/ stays tracked.
+dotnet/**/bin/
+dotnet/**/obj/
+
+# ── Device pulls / dumps (huge + copyrighted game data) ───────────────
+logs/tombstones/
+symbol_dump.txt
+gnames_dump.txt
+gobjects_dump.txt

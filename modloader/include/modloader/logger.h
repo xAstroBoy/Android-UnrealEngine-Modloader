@@ -25,6 +25,14 @@ void log_debug(const char* source, const char* fmt, ...);
 // Raw write — no timestamp, no formatting
 void log_raw(const char* text);
 
+// Minimum level that is actually emitted. 0=debug 1=info 2=warn 3=error.
+// DEBUG is SUPPRESSED by default (min level = info); flip it on at runtime via
+// the `log`/`log_level` bridge command or the config `log_level` key.
+void set_min_level(int level);
+int  get_min_level();
+// Parse "debug"/"info"/"warn"/"error" → level int (defaults to info).
+int  level_from_string(const char* s);
+
 // Get the last N lines of the log (for ADB bridge log_tail command)
 std::string get_tail(int lines);
 

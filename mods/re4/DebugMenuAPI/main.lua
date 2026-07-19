@@ -165,6 +165,31 @@ local function get_active_menu(dm)
     return (ok and type(v) == "number") and v or nil
 end
 
+--- Is the debug menu actually ON SCREEN right now?
+---
+--- CRITICAL, and not the same question as get_active_menu(). "ActiveMenu" is the
+--- last PAGE NUMBER the menu was on; it keeps its value after you close the menu.
+--- The confirm handler used to proceed on that alone, so with the menu CLOSED
+--- every trigger pull in normal gameplay still dispatched a confirm against
+--- whatever item was selected when you closed it — silently toggling that option
+--- while you were just trying to shoot. (Found because Auto-Fire kept switching
+--- itself off: the menu had been closed on the Rapidfire page.)
+---
+--- UMG is authoritative here, so ask the widget: a closed menu is either not in
+--- the viewport or not visible.
+local function is_menu_open(dm)
+    if not dm then return false end
+    local ok1, inv = pcall(function() return dm:Call("IsInViewport") end)
+    if ok1 and type(inv) == "boolean" and not inv then return false end
+    local ok2, vis = pcall(function() return dm:Call("IsVisible") end)
+    if ok2 and type(vis) == "boolean" then return vis end
+    -- Neither query answered. Prefer the old permissive behaviour over a menu
+    -- that can never be used, but say so loudly — this is the gate that stops
+    -- gameplay trigger pulls from firing menu actions.
+    V("is_menu_open: no usable visibility query — assuming OPEN")
+    return true
+end
+
 --- Read CurrentIndex from DebugMenu_C.
 local function get_current_index(dm)
     local ok, v = pcall(function() return dm:Get("CurrentIndex") end)
@@ -217,13 +242,45 @@ end
 -- the bottom). The SizeBox_* names the old code tried don't exist on this build,
 -- so we grow the render target directly. Keep it SQUARE (1:1, same aspect as the
 -- 500x500 default) to avoid the horizontal squ/stretch a non-square DrawSize causes.
-local MENU_DRAW = { X = 2000, Y = 2000 }
-local function ensure_viewport(dm)
+-- AUTO-FIT: the render target is sized to the PAGE, not pinned to one value.
+-- 2000 was a fixed compromise — fine for short pages, but long ones (Randomizer,
+-- Enemy Spawner) ran past the bottom and buried entries, and wide labels clipped.
+--
+-- It stays SQUARE on purpose (see the note above): a non-square DrawSize stretches
+-- the panel horizontally on this build, so we can't just grow Y for tall pages.
+-- Instead we work out the side each axis would need and take the larger, so a tall
+-- page and a wide page both get a big enough square.
+local MENU_DRAW_MIN = 2000     -- never shrink below the known-good size
+local MENU_DRAW_MAX = 3400     -- beyond this the panel gets unwieldy in VR
+local ROW_PX        = 78       -- approx vertical cost of one option row
+local CHAR_PX       = 26       -- approx horizontal cost of one label character
+local CHROME_PX     = 620      -- title + padding + [Back]
+
+local function fit_size(rows, longest)
+    rows    = math.max(rows or 0, 1)
+    longest = math.max(longest or 0, 8)
+    local need_y = CHROME_PX + rows * ROW_PX
+    local need_x = 400 + longest * CHAR_PX
+    local side   = math.max(need_y, need_x)
+    if side < MENU_DRAW_MIN then side = MENU_DRAW_MIN end
+    if side > MENU_DRAW_MAX then side = MENU_DRAW_MAX end
+    return side
+end
+
+-- Last size we fitted to. Refresh paths (toggle flip, selector cycle, api.Refresh)
+-- call ensure_viewport with no metrics; without this they'd snap a fitted 2800-wide
+-- page back down to the minimum and re-bury the rows we just made room for.
+local _fit_side = MENU_DRAW_MIN
+
+--- rows/longest optional — omitted REUSES the current page's fitted size.
+local function ensure_viewport(dm, rows, longest)
     pcall(function()
         local widget_comp = dm:Get("Widget")
         if widget_comp and widget_comp:IsValid() then
+            if rows then _fit_side = fit_size(rows, longest) end
+            local side = _fit_side
             pcall(function() widget_comp:Set("bDrawAtDesiredSize", false) end)
-            pcall(function() widget_comp:Call("SetDrawSize", MENU_DRAW) end)
+            pcall(function() widget_comp:Call("SetDrawSize", { X = side, Y = side }) end)
             pcall(function() widget_comp:Call("RequestRedraw") end)
         end
     end)
@@ -348,16 +405,20 @@ local function build_page(dm, page)
         _build_page = nil
     end
 
-    -- Create one widget per item
+    -- Create one widget per item, tracking the widest label for the auto-fit below.
+    local longest = #tostring(page.name or "Mods")
     if #page.items == 0 then
         V("build_page: no items, creating placeholder")
         pcall(function() dm:Call("CreateActiveOption", "(No mods registered)") end)
     else
         V("build_page: creating %d option widgets", #page.items)
         for _, item in ipairs(page.items) do
-            pcall(function() dm:Call("CreateActiveOption", make_display(item)) end)
+            local label = make_display(item)
+            if #label > longest then longest = #label end
+            pcall(function() dm:Call("CreateActiveOption", label) end)
         end
     end
+    local row_count = math.max(#page.items, 1) + 1   -- items + [Back]
 
     -- Cosmetics: title + VBoxList settings
     pcall(function()
@@ -374,15 +435,17 @@ local function build_page(dm, page)
             local vbl = pw:Get("DebugVBoxList")
             V("build_page: DebugVBoxList=%s", tostring(vbl))
             if vbl then
-                vbl:Set("MaxVisible", 50)
+                -- Show the whole page rather than a fixed window, so nothing is
+                -- buried below the fold on long pages.
+                vbl:Set("MaxVisible", math.max(row_count, 50))
                 vbl:Set("FirstVisible", 0)
                 vbl:Call("UpdateListView")
             end
         end
     end)
 
-    -- Force render target update after dynamic content change
-    ensure_viewport(dm)
+    -- Force render target update after dynamic content change, sized to THIS page.
+    ensure_viewport(dm, row_count, longest)
 end
 
 --- Idempotent build of a custom page.
@@ -655,31 +718,66 @@ local function setup_hooks()
     -- A and R Trigger all mean "confirm", so a press that lights up more than one
     -- must still be a single action.
     local confirm_armed   = true    -- true → the next press will act
-    local confirm_press_t = -1
-    -- Safety valve: if a release event is ever lost we would wedge the menu
-    -- forever, so a press held longer than this re-arms. Long enough that no
-    -- normal tap repeats, short enough that the menu can never feel dead.
+    -- Timestamp of the LAST confirm event of any kind (pressed 0 or 1), NOT of
+    -- the press. That distinction is the whole fix — see below.
+    local confirm_evt_t   = -1
+
+    -- ── SAFETY VALVE — measured on EVENT SILENCE, not hold duration ──────
+    -- The valve exists because a lost release event would wedge the menu
+    -- forever. The first version re-armed when the PRESS had been held longer
+    -- than this... and then fell through and dispatched the action again. So a
+    -- genuinely held button repeated the action every CONFIRM_REARM_SEC.
+    --
+    -- That is not hypothetical: with Rapidfire's Auto-Fire on (the menu confirm
+    -- shares the fire input, so "pressed" becomes "held"), holding the trigger
+    -- over a toggle flipped it on/off/on/off every ~2s. The log showed
+    -- PATCHED/restored/PATCHED/restored, and it looked like something external
+    -- was reverting the patch. It was this.
+    --
+    -- A held button keeps DELIVERING BndEvt(pressed=1) every frame, so:
+    --     button still held      -> events keep arriving -> gap stays tiny
+    --     release event lost     -> events stop entirely -> gap grows
+    -- Keying the valve on the gap since the last event of ANY kind therefore
+    -- tells the two apart, and a held button can never re-arm itself.
     local CONFIRM_REARM_SEC = 2.0
 
     local function on_confirm_post(self, func, parms)
         local pressed = ReadU8(parms)
-        V("BndEvt Confirm: pressed=%d armed=%s", pressed, tostring(confirm_armed))
+
+        -- GATE 1: is the menu even on screen? These BndEvt delegates fire for
+        -- every trigger pull whether the menu is open or not, so without this a
+        -- gameplay shot dispatches a confirm on the last-selected item. Bail
+        -- before touching the arm state so the next genuine press still works.
+        if not is_menu_open(get_dm()) then
+            confirm_armed = true
+            return
+        end
+
+        local ok_t, now = pcall(os.clock)
+        now = (ok_t and type(now) == "number") and now or 0
+
+        -- Evaluate the valve BEFORE stamping this event, or the gap is always 0.
+        local silent_for = (confirm_evt_t >= 0) and (now - confirm_evt_t) or 0
+        confirm_evt_t = now
+
+        V("BndEvt Confirm: pressed=%d armed=%s silent=%.2fs",
+          pressed, tostring(confirm_armed), silent_for)
+
         if pressed == 0 then
             confirm_armed = true      -- release → re-arm for the next press
             return
         end
-        local ok_t, now = pcall(os.clock)
-        now = (ok_t and type(now) == "number") and now or 0
         if not confirm_armed then
-            if now - confirm_press_t > CONFIRM_REARM_SEC then
-                V("BndEvt Confirm: held %.1fs with no release — re-arming", now - confirm_press_t)
+            if silent_for > CONFIRM_REARM_SEC then
+                -- No confirm event at all for that long: the release was lost
+                -- (a held button would have kept them coming). Safe to re-arm.
+                V("BndEvt Confirm: %.1fs of silence — lost release, re-arming", silent_for)
                 confirm_armed = true
             else
                 return                -- same press still held → ignore the repeat
             end
         end
-        confirm_armed   = false
-        confirm_press_t = now
+        confirm_armed = false
 
         pcall(function()
             local dm = get_dm()
@@ -786,6 +884,45 @@ local function setup_shared_api()
     local api = {}
     api.VERSION = VERSION
 
+    -- ── C# MODS-tab bridge: DISABLED ─────────────────────────────────
+    -- The C# DebugMenuPlus is off. These are pinned to nil (NOT rawget) so every
+    -- code path below — item forwarding, NavigateTo, AddItem — falls through to
+    -- the in-Lua implementation instead of routing into a bridge nothing renders.
+    -- Do not restore these to rawget(_G, ...): those bindings are provided by the
+    -- NATIVE modloader and exist even with no C# mod loaded, so a rawget here
+    -- silently hands the menu to a bridge with no renderer (that is the bug that
+    -- made the menu impossible to open).
+    local AddMenuEntry      = nil
+    local SetMenuEntryState = nil
+    local MenuNavigate      = nil
+    local MenuItem          = nil
+
+    local function bridge_to_cs(item)
+        if not AddMenuEntry or item.cs_id then return end
+        local ok, id = pcall(function()
+            if item.type == "toggle" then
+                local st = false
+                pcall(function() st = item.getter() == true end)
+                return AddMenuEntry(item.mod, item.name, "toggle",
+                    function(newstate) pcall(item.setter, newstate) end, st, "ON", "OFF")
+            elseif item.type == "action" then
+                return AddMenuEntry(item.mod, item.name, "button",
+                    function() pcall(item.callback, item) end)
+            elseif item.type == "selector" then
+                return AddMenuEntry(item.mod, item.name, "button", function()
+                    if item.options and #item.options > 0 then
+                        item.sel_index = ((item.sel_index or 0) + 1) % #item.options
+                        pcall(item.callback, item.options[item.sel_index + 1], item.sel_index, item)
+                    end
+                end)
+            elseif item.type == "submenu" then
+                return AddMenuEntry(item.mod, item.name, "button",
+                    function() pcall(item.callback) end)
+            end
+        end)
+        if ok and id then item.cs_id = id end
+    end
+
     -- De-duplicate: a mod that re-registers (hot-reload) should REPLACE its
     -- prior entry, not stack a duplicate onto the Mods page.
     local function add_root_item(item)
@@ -794,6 +931,7 @@ local function setup_shared_api()
             if list[i].mod == item.mod and list[i].name == item.name then table.remove(list, i) end
         end
         table.insert(list, item)
+        bridge_to_cs(item)
         return item
     end
 
@@ -881,6 +1019,15 @@ local function setup_shared_api()
     ---@param opts {populate: function, name?: string}
     function api.NavigateTo(opts)
         opts = opts or {}
+        -- C# menu present → build the sub-page in the bridge. populate() runs
+        -- synchronously inside MenuNavigate (AddItem → MenuItem lands on it), and
+        -- the bridge raises the new page as C#'s pending-navigation target.
+        if MenuNavigate then
+            MenuNavigate(opts.name or _submenu_name or "Mods", function()
+                if type(opts.populate) == "function" then pcall(opts.populate) end
+            end)
+            return
+        end
         local byte = next_page_byte
         next_page_byte = next_page_byte + 1
         V("NavigateTo: byte=%d, name=%s", byte, tostring(opts.name or _submenu_name or "?"))
@@ -911,6 +1058,12 @@ local function setup_shared_api()
     ---@param name      string         Display label
     ---@param callback  function|nil   Confirm action (nil = label / separator)
     function api.AddItem(name, callback)
+        -- C# menu present → add to the bridge sub-page being populated. A nil
+        -- callback becomes a non-interactive header row.
+        if MenuItem then
+            MenuItem(name, callback)
+            return
+        end
         if not _build_page then
             Warn("AddItem() called outside a populate() callback")
             return
@@ -1169,11 +1322,22 @@ local function init()
     Log("  'Mods' injection: deferred 200/500/1000/2000ms + lazy on scroll")
 
     setup_shared_api()
-    setup_hooks()
     setup_bridge()
 
-    -- Schedule a startup injection attempt (in case menu is already open)
+    -- THE LUA MENU OWNS THE DEBUG MENU. Unconditionally.
+    --
+    -- This used to stand down whenever `AddMenuEntry` existed, on the assumption
+    -- that it meant the C# DebugMenuPlus was driving. That was WRONG and it is why
+    -- the menu stopped opening at all: AddMenuEntry is a NATIVE modloader binding
+    -- (menu_bridge, registered in lua_bindings.cpp), so it is present whether or not
+    -- any C# mod is loaded. The gate therefore always tripped, this menu always
+    -- disabled itself, and if the C# side wasn't there to take over, nothing built
+    -- the menu — no hooks, no injection, nothing opens.
+    --
+    -- No gate. The Lua menu always installs its hooks and its deferred injection.
+    setup_hooks()
     schedule_mods_injection()
+    Log("in-Lua menu ACTIVE (owns the debug menu)")
 
     Log("Ready — mods register via SharedAPI.DebugMenu")
 end

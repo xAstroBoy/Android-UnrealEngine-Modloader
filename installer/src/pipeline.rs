@@ -153,12 +153,17 @@ pub fn patch_local_apk(
     let decompiled = work_dir.path().join("decompiled");
     smali::decompile(&apk, &decompiled)?;
 
+    // Pick the modloader build matching the APK's ABI (32- vs 64-bit).
+    let abi = smali::detect_apk_abi(&decompiled);
+    let so_path = smali::adjust_so_for_abi(&so_path, abi)?;
+    log::info!("Target ABI: {} — using {}", abi.label(), so_path.display());
+
     // 2. Smart injection — tries profile targets, manifest auto-detect, common UE activities
     log::info!("[2/5] Injecting modloader...");
     let target = smali::find_injection_target(&decompiled, game_profile)?;
     smali::inject_loadlibrary(&decompiled, &target)?;
 
-    smali::add_native_lib(&decompiled, &so_path)?;
+    smali::add_native_lib(&decompiled, &so_path, abi)?;
     smali::fix_manifest(&decompiled)?;
 
     // 3. Recompile
@@ -233,12 +238,17 @@ pub fn install(
     let decompiled = work_dir.path().join("decompiled");
     smali::decompile(&apk, &decompiled)?;
 
+    // Pick the modloader build matching the APK's ABI (32- vs 64-bit).
+    let abi = smali::detect_apk_abi(&decompiled);
+    let so_path = smali::adjust_so_for_abi(so_path, abi)?;
+    log::info!("Target ABI: {} — using {}", abi.label(), so_path.display());
+
     // 5. Smart injection — tries profile targets, manifest auto-detect, common UE activities
     report(4, "Injecting modloader...");
     let target = smali::find_injection_target(&decompiled, game_profile)?;
     log::info!("Injection target: {}", target);
     smali::inject_loadlibrary(&decompiled, &target)?;
-    smali::add_native_lib(&decompiled, so_path)?;
+    smali::add_native_lib(&decompiled, &so_path, abi)?;
     smali::fix_manifest(&decompiled)?;
 
     // 6. Recompile

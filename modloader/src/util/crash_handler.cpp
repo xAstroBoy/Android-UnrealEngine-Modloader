@@ -9,6 +9,9 @@
 // Posts a notification before dying
 
 #include "modloader/crash_handler.h"
+#include "modloader/crash_guard.h"
+#include "modloader/arch.h"
+#include "modloader/memtrace.h"
 #include "modloader/safe_call.h"
 #include "modloader/logger.h"
 #include "modloader/paths.h"
@@ -19,6 +22,7 @@
 #include <cstring>
 #include <cstdint>
 #include <unistd.h>
+#include <fcntl.h>
 #include <ucontext.h>
 #include <unwind.h>
 #include <dlfcn.h>
@@ -28,34 +32,49 @@
 #include <setjmp.h>
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CRASH-HIDING RECOVERY REMOVED (intentionally).
+// CRASH GUARD v2 — recovery RESTORED, with the v1 objections fixed.
 //
-// This handler used to consult FIVE siglongjmp "recovery" guards — safe_call
-// regions, hook installation, hooked-original calls, ProcessEvent/Call, and mod
-// loading. On a fatal signal inside any of them, it jumped back to a checkpoint
-// that RESUMED execution while returning a fake default (nil / 0 / skip-the-mod).
-// That silently swallowed real SIGSEGV/SIGBUS faults — a dangling-pointer deref
-// inside a hooked game function, a UFunction, or a mod became an invisible
-// "return nil" instead of a crash, so genuine bugs never surfaced.
+// History: v1 consulted five siglongjmp guards (safe_call, hook install,
+// hooked-original calls, ProcessEvent/Call, mod load) and silently resumed any
+// fault inside them. It was removed because it HID crashes (a dangling deref
+// became an invisible "return nil") and its logging could flood the log. But
+// removing it meant this RE4 port — whose engine derefs NULL in thousands of
+// call sites (see the engine null audit) — died to faults the guards existed
+// to absorb.
 //
-// ALL FIVE are now GONE. A fatal fault is never resumed: the handler writes a
-// crash report (for faults inside libmodloader.so) and chains to the platform
-// handler so debuggerd produces a real tombstone.
+// v2 (crash_guard.cpp) restores the recovery under a different contract:
+//   - crash_guard::try_recover() runs FIRST for every fatal signal. If a
+//     guard region is armed on the faulting thread AND the guard is enabled,
+//     the crash is FILED (signal, fault, pc, registers, backtrace → ring
+//     buffer → modloader_recovered.log, rate-limited per site) and THEN
+//     suppressed via siglongjmp. Crashes stay visible; the game stays alive.
+//   - it is toggleable at runtime (config "crash_guard_enabled", Lua
+//     SetCrashGuardEnabled). Disabled = every fault is fatal, as in the
+//     removed-recovery era, for bug-hunting with real tombstones.
+//   - unguarded faults are UNCHANGED: report below (for faults inside
+//     libmodloader.so) + chain to the platform handler → real tombstone.
 //
-// The one legitimate use of the old recovery — safe_call::probe_read /
-// safe_memcpy testing unknown pointers during boot-time offset discovery — was
-// FIXED at the root instead of recovered: those primitives now test readability
-// through the kernel (pread on /proc/self/mem, which returns an error rather
-// than raising SIGSEGV), so the scanner probes garbage addresses without ever
-// faulting. A readability test that crashes on unreadable memory was itself the
-// bug. The inert scaffolding still in safe_call.cpp / native_hooks.cpp /
-// lua_uobject.cpp / mod_loader.cpp (sigsetjmp checkpoints never jumped to) is
-// harmless; its try/catch still guards C++ exceptions, a separate category from
-// these hardware faults. Crashes are meant to be seen and fixed, not hidden.
+// safe_call::probe_read / safe_memcpy stay non-faulting (pread on
+// /proc/self/mem) — boot-time offset scans never enter the signal path.
 // ═══════════════════════════════════════════════════════════════════════════
 
 namespace crash_handler
 {
+
+    // ── MASTER TOGGLE ───────────────────────────────────────────────────────
+    // TRUE = the handler is installed in REPORT-ONLY mode: it captures every
+    // fault async-signal-safely to modloader_crash.log (signal, fault addr, PC,
+    // registers, backtrace — works even with a corrupt game heap) and then
+    // CHAINS to the old handler / debuggerd for a real tombstone. It does NOT
+    // recover — recovery is the crash GUARD, which is a SEPARATE switch and
+    // stays OFF (init.cpp) so faults remain fatal. This is what "fix the crash
+    // handler" means: we finally SEE the fault instead of a silent death (with
+    // the handler off, the game's own Oculus/UE4 handler ate the fault and
+    // exited with nothing). Set false only to hand faults straight to debuggerd
+    // with no modloader report at all.
+    static bool s_handler_enabled = true;
+    void set_enabled(bool e) { s_handler_enabled = e; }
+    bool enabled() { return s_handler_enabled; }
 
     // Previous handlers, captured when we install()/reinstall() on top. A fatal
     // fault chains to these (the VR runtime / debuggerd) so a real tombstone is
@@ -190,6 +209,133 @@ namespace crash_handler
         return "unknown code";
     }
 
+    // ── ASYNC-SIGNAL-SAFE crash dump ─────────────────────────────────────────
+    // Writes signal + fault addr + PC (lib+offset) + registers + backtrace using
+    // ONLY open/write/snprintf-to-a-stack-buffer — NO malloc, NO stdio, NO
+    // heap. Safe even when the GAME'S heap is corrupt (the exact case the old
+    // fprintf report could not handle, so it skipped game crashes entirely and
+    // we saw nothing). This is what captures the enemy/null-deref fault so it can
+    // be fixed at the source. dladdr takes only the linker lock; capture_backtrace
+    // walks via the pre-opened /proc/self/mem (crash_guard::init). Recovery is
+    // independent and stays OFF — this only REPORTS, it never resumes.
+    static void async_safe_dump(int sig, siginfo_t *info, ucontext_t *uc)
+    {
+        int fd = open(paths::crash_log().c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd < 0) return;
+        char b[1536];
+        int n;
+
+        // ── PHASE 1: RAW values only — NO dladdr, NO backtrace ───────────────
+        // Front-loaded and fsync'd FIRST so the PC + registers ALWAYS land, even
+        // if the fancy annotation below re-faults (an earlier version died in
+        // dladdr/unwind and lost the PC). This block calls nothing that can page
+        // fault: just field reads + snprintf + write.
+        uintptr_t pc = uc ? arch::uc_pc(uc) : 0;
+        uintptr_t lr = uc ? arch::uc_lr(uc) : 0;
+        uintptr_t sp = uc ? arch::uc_sp(uc) : 0;
+        uintptr_t base = s_modloader_base, end = s_modloader_end;
+        bool pc_in_mod = (pc >= base && pc < end);
+        n = snprintf(b, sizeof(b),
+                     "=== MODLOADER CRASH (async-safe, report-only) ===\n"
+                     "Signal: %s (%d)  code: %d  fault_addr: 0x%lx\n"
+                     "PC = 0x%016lx  %s%s0x%lx\n"
+                     "LR = 0x%016lx\nSP = 0x%016lx\n"
+                     "libmodloader.so: 0x%lx - 0x%lx\n",
+                     signal_name(sig), sig, info ? info->si_code : 0,
+                     (unsigned long)(info ? (uintptr_t)info->si_addr : 0),
+                     (unsigned long)pc,
+                     pc_in_mod ? "libmodloader.so+" : "(game/other) ",
+                     pc_in_mod ? "0x" : "",
+                     (unsigned long)(pc_in_mod ? pc - base : pc),
+                     (unsigned long)lr, (unsigned long)sp,
+                     (unsigned long)base, (unsigned long)end);
+        write(fd, b, n);
+        if (uc)
+            for (int i = 0; i < arch::UC_NGREG; i++)
+            {
+                n = snprintf(b, sizeof(b), "%c%-2d = 0x%016llx\n",
+                             arch::UC_NGREG == 16 ? 'R' : 'X', i,
+                             (unsigned long long)arch::uc_reg(uc, i));
+                write(fd, b, n);
+            }
+        fsync(fd);   // PC + registers are now durable regardless of what follows
+
+        // ── PHASE 2: annotate PC's library (dladdr — linker lock only) ───────
+        if (uc && dladdr)
+        {
+            Dl_info dl;
+            if (dladdr((void *)pc, &dl) && dl.dli_fname)
+            {
+                const char *ls = strrchr(dl.dli_fname, '/');
+                ls = ls ? ls + 1 : dl.dli_fname;
+                n = snprintf(b, sizeof(b), "PC library: %s + 0x%lx%s%s\n", ls,
+                             (unsigned long)(pc - (uintptr_t)dl.dli_fbase),
+                             dl.dli_sname ? "  near: " : "",
+                             dl.dli_sname ? dl.dli_sname : "");
+                write(fd, b, n);
+            }
+            fsync(fd);
+        }
+
+        // ── PHASE 2.5: STACK RETURN-ADDRESS SCAN ─────────────────────────────
+        // The saved {x29,x30} pair was smashed (fp=0x33, lr=garbage) so the
+        // unwinder is blind. Scan raw stack words and print any that point into
+        // libUE4's executable range — that is the real call chain leading to the
+        // corruption site (the caller that returned into garbage is the first
+        // libUE4 return address here). Reading the live stack is safe (mapped);
+        // bounded to 4 KB. dladdr under the linker lock is acceptable while dying.
+        if (sp)
+        {
+            write(fd, "=== STACK RETURN-ADDR SCAN (SP .. SP+4KB) ===\n", 46);
+            const uintptr_t *stk = (const uintptr_t *)sp;
+            for (int i = 0; i < 512; i++)
+            {
+                uintptr_t v = stk[i];
+                if (v < 0x10000) continue;
+                Dl_info d;
+                if (dladdr((void *)v, &d) && d.dli_fname)
+                {
+                    const char *ls = strrchr(d.dli_fname, '/');
+                    ls = ls ? ls + 1 : d.dli_fname;
+                    if (strstr(ls, "libUE4.so") || strstr(ls, "libmodloader.so"))
+                    {
+                        n = snprintf(b, sizeof(b), "  SP+0x%04x = %s+0x%lx%s%s\n",
+                                     i * 8, ls, (unsigned long)(v - (uintptr_t)d.dli_fbase),
+                                     d.dli_sname ? "  " : "", d.dli_sname ? d.dli_sname : "");
+                        write(fd, b, n);
+                    }
+                }
+            }
+            fsync(fd);
+        }
+
+        // ── PHASE 3: backtrace (unwind CAN fault on bad frames) — LAST ───────
+        write(fd, "=== BACKTRACE ===\n", 18);
+        void *frames[64];
+        int depth = capture_backtrace(frames, 64);
+        for (int i = 0; i < depth; i++)
+        {
+            Dl_info d;
+            if (dladdr(frames[i], &d) && d.dli_fname)
+            {
+                const char *ls = strrchr(d.dli_fname, '/');
+                ls = ls ? ls + 1 : d.dli_fname;
+                n = snprintf(b, sizeof(b), "#%02d  0x%lx  %s + 0x%lx  (%s)\n", i,
+                             (unsigned long)(uintptr_t)frames[i],
+                             d.dli_sname ? d.dli_sname : "?",
+                             (unsigned long)((uintptr_t)frames[i] - (uintptr_t)d.dli_fbase), ls);
+            }
+            else
+            {
+                n = snprintf(b, sizeof(b), "#%02d  0x%lx  ?\n", i, (unsigned long)(uintptr_t)frames[i]);
+            }
+            write(fd, b, n);
+        }
+        write(fd, "=== END (chaining to debuggerd) ===\n", 36);
+        fsync(fd);
+        close(fd);
+    }
+
     static void crash_handler_fn(int sig, siginfo_t *info, void *ucontext_raw)
     {
         // ── SIGABRT BOOT GRACE PERIOD ────────────────────────────────────────
@@ -210,21 +356,48 @@ namespace crash_handler
             return;
         }
 
-        // NOTE: ALL five siglongjmp recovery guards that used to sit here —
-        // safe_call regions, hook install, hooked-original call, ProcessEvent/
-        // Call, and mod load — have been REMOVED (see the file-top banner). No
-        // fatal fault is resumed anymore. Memory probing that used to fault-and-
-        // recover (safe_call::probe_read / safe_memcpy) is now non-faulting
-        // (/proc/self/mem), so the boot-time offset scanner needs no recovery.
-        // Everything else that faults is a real bug: we report it (if it's ours)
-        // and let it become a tombstone so it can be found and fixed.
+        // ── CRASH GUARD v2 RECOVERY DISPATCH ────────────────────────────────
+        // If a guard region (hook install / hooked original / safe_call /
+        // ProcessEvent call / mod load) is armed on THIS thread and the guard
+        // is enabled, this files the crash into the recovered-crash ring and
+        // siglongjmps back to the checkpoint — it does not return in that
+        // case. If NO guard is armed but global instruction-skip mode covers
+        // the fault, the ucontext is patched (fault neutralized, pc advanced)
+        // and try_recover returns true — we return from the handler and the
+        // faulting thread resumes. Everything below only runs for genuinely
+        // fatal faults, or when the guard is toggled off.
+        if (crash_guard::try_recover(sig, info, ucontext_raw))
+            return;
+
+        // ── RE-ENTRANCY GUARD ───────────────────────────────────────────────
+        // If we fault AGAIN while already writing a crash report on this thread
+        // (e.g. the unwind/dladdr in async_safe_dump hit bad memory), do NOT run
+        // the whole report path again — that risks the malloc-based fprintf on a
+        // corrupt heap and an infinite fault loop. Restore the default action and
+        // re-raise so debuggerd takes it cleanly. The first pass already fsync'd
+        // the PC + registers to modloader_crash.log.
+        static thread_local int t_in_handler = 0;
+        if (t_in_handler)
+        {
+            signal(sig, SIG_DFL);
+            raise(sig);
+            return;
+        }
+        t_in_handler = 1;
+
+        // ── LAST-GASP MEMORY-TRACE FLUSH ────────────────────────────────────
+        // The fault is fatal. Before we die, flush whatever the hardware
+        // watchpoints still have in their perf rings to memtrace_live.log —
+        // async-signal-safe (raw reads + write() to a pre-opened fd). This is
+        // the crash-point evidence that used to vanish with the process.
+        memtrace::crash_drain(sig);
 
         // Determine if crash PC is inside libmodloader.so or game code.
         ucontext_t *uc = static_cast<ucontext_t *>(ucontext_raw);
         bool is_modloader_crash = false;
         if (uc)
         {
-            uintptr_t pc = static_cast<uintptr_t>(uc->uc_mcontext.pc);
+            uintptr_t pc = arch::uc_pc(uc);
             is_modloader_crash = pc_in_modloader(pc);
         }
 
@@ -237,9 +410,12 @@ namespace crash_handler
         // control the heap state.
         if (!is_modloader_crash)
         {
-            // Game-side crash — skip crash report entirely (fprintf uses malloc,
-            // which is NOT async-signal-safe and will corrupt/deadlock the heap).
-            // Chain directly to the original handler.
+            // Game-side crash. The game heap may be corrupt so we must NOT touch
+            // malloc/stdio — but we STILL capture the fault, async-signal-safely,
+            // so the enemy/null-deref bug is diagnosable (this is exactly what the
+            // old "skip and chain" left us blind to). Then chain to debuggerd for
+            // a full tombstone. Recovery is off → the crash stays fatal.
+            async_safe_dump(sig, info, uc);
             goto chain_to_old_handler;
         }
 
@@ -265,7 +441,7 @@ namespace crash_handler
                 // Resolve crashing library via dladdr
                 if (uc)
                 {
-                    uintptr_t crash_pc = static_cast<uintptr_t>(uc->uc_mcontext.pc);
+                    uintptr_t crash_pc = arch::uc_pc(uc);
                     Dl_info crash_dl;
                     if (dladdr(reinterpret_cast<void *>(crash_pc), &crash_dl) && crash_dl.dli_fname)
                     {
@@ -286,7 +462,7 @@ namespace crash_handler
                 ucontext_t *uc_reg = static_cast<ucontext_t *>(ucontext_raw);
                 if (uc_reg)
                 {
-                    uintptr_t pc = static_cast<uintptr_t>(uc_reg->uc_mcontext.pc);
+                    uintptr_t pc = arch::uc_pc(uc_reg);
                     uintptr_t pc_offset = (pc >= s_modloader_base) ? (pc - s_modloader_base) : 0;
 
                     fprintf(f, "\n=== CRASH PC ===\n");
@@ -318,10 +494,10 @@ namespace crash_handler
                     }
 
                     fprintf(f, "\n=== REGISTERS ===\n");
-                    for (int i = 0; i < 31; i++)
+                    for (int i = 0; i < arch::UC_NGREG; i++)
                     {
-                        uintptr_t reg_val = static_cast<uintptr_t>(uc_reg->uc_mcontext.regs[i]);
-                        fprintf(f, "X%-2d = 0x%016llx", i,
+                        uintptr_t reg_val = arch::uc_reg(uc_reg, i);
+                        fprintf(f, "%c%-2d = 0x%016llx", arch::UC_NGREG == 16 ? 'R' : 'X', i,
                                 (unsigned long long)reg_val);
                         // Annotate registers pointing into libmodloader.so
                         if (pc_in_modloader(reg_val))
@@ -341,8 +517,8 @@ namespace crash_handler
                         }
                         fprintf(f, "\n");
                     }
-                    fprintf(f, "SP  = 0x%016llx\n", (unsigned long long)uc_reg->uc_mcontext.sp);
-                    fprintf(f, "PC  = 0x%016llx\n", (unsigned long long)uc_reg->uc_mcontext.pc);
+                    fprintf(f, "SP  = 0x%016llx\n", (unsigned long long)arch::uc_sp(uc_reg));
+                    fprintf(f, "PC  = 0x%016llx\n", (unsigned long long)arch::uc_pc(uc_reg));
                 }
 
                 // Backtrace with addr2line hints
@@ -381,6 +557,13 @@ namespace crash_handler
                         fprintf(f, "#%02d  %p  ???\n", i, frames[i]);
                     }
                 }
+
+                // Crash-guard statistics (atomics only — async-signal-safe reads)
+                fprintf(f, "\n=== CRASH GUARD ===\n");
+                fprintf(f, "Enabled: %s\n", crash_guard::enabled() ? "yes" : "no");
+                fprintf(f, "Crashes recovered before this fatal one: %llu "
+                           "(see modloader_recovered.log)\n",
+                        (unsigned long long)crash_guard::total_recovered());
 
                 // Safe-call statistics
                 fprintf(f, "\n=== SAFE-CALL STATS ===\n");
@@ -489,9 +672,18 @@ namespace crash_handler
 
     void install()
     {
+        if (!s_handler_enabled)
+        {
+            logger::log_warn("CRASH", "Crash handler DISABLED (flag) — faults go straight to debuggerd (real tombstones)");
+            return;
+        }
         // Install a big alt-stack on THIS thread up front so the handler survives
         // stack overflow/smash from the very first guarded call.
         ensure_thread_sigaltstack();
+
+        // Crash guard v2: pre-open /proc/self/mem for the async-safe backtrace
+        // walk and announce the recovered-crash log path.
+        crash_guard::init();
 
         // Find our own library's address range first
         dl_iterate_phdr(find_modloader_cb, nullptr);
@@ -528,6 +720,7 @@ namespace crash_handler
 
     void reinstall()
     {
+        if (!s_handler_enabled) return;   // flag off — never take over the signal handlers
         // Re-assert our signal handler on top of whatever replaced it.
         // The Oculus VR runtime (libvrapi.so) and Frida both install their own
         // SIGSEGV handlers after our initial install(). This overwrites ours,

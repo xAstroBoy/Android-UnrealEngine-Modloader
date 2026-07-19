@@ -234,10 +234,11 @@ namespace mod_tracker
         // 3. Delayed actions (LoopAsync / ExecuteWithDelay loops)
         stats.delayed_actions = lua_delayed::cancel_all_for_mod(mod);
 
-        // 4. Custom bridge commands
+        // 4. Custom bridge commands (and any wrapper the mod put on a command).
         for (const auto &cmd : res.commands)
         {
             adb_bridge::unregister_command(cmd);
+            adb_bridge::unregister_command_wrapper(cmd);
             stats.commands++;
         }
 
@@ -259,6 +260,39 @@ namespace mod_tracker
                              stats.delayed_actions, stats.commands, stats.code_patches);
         }
         return stats;
+    }
+
+    // ═══ Crash-guard attribution ════════════════════════════════════════════
+    // Which mod byte-patched code at (or shortly before) this PC? Containment
+    // wins; otherwise the nearest patch within 0x100 bytes below the PC (a
+    // fault a few instructions after a bad patch is still that patch's doing).
+    bool find_patch_near(uintptr_t pc, std::string &mod_out,
+                         uintptr_t &addr_out, size_t &size_out)
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        bool found = false;
+        uintptr_t best_dist = 0x100;
+        for (const auto &kv : s_mods)
+        {
+            for (const auto &p : kv.second.code_patches)
+            {
+                if (pc < p.addr)
+                    continue;
+                uintptr_t end = p.addr + p.original.size();
+                uintptr_t dist = (pc < end) ? 0 : (pc - end);
+                if (dist <= best_dist)
+                {
+                    best_dist = dist;
+                    mod_out = kv.first;
+                    addr_out = p.addr;
+                    size_out = p.original.size();
+                    found = true;
+                    if (dist == 0)
+                        return true; // containment — exact culprit
+                }
+            }
+        }
+        return found;
     }
 
 } // namespace mod_tracker
