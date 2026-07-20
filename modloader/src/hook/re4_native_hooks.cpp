@@ -1367,9 +1367,60 @@ uint64_t null_guard_substitutions() {
 // which is not a field I have identified yet. That is a strong candidate for the
 // still-unsolved EmSetFromList garbage-pointer tombstones (27/28) — do not claim
 // it is fixed.
-alignas(16) static uint8_t g_dummy_parts[0x800];   // seen derefs: +0xBC, +0x80, +0x1D8, +264
+// ── THE DUMMY PART ──────────────────────────────────────────────────────
+// v1 was `uint8_t g_dummy_parts[0x800]`, zero-filled, returned as-is. It did not
+// remove the null deref, it RELOCATED it — tombstone_17:
+//     #00 MTXInverse+40      fault 0x30   (x0 = 0x18)
+//     #01 MotionMove+1616    #03 cEm10::move+4100   #05 cEmMgr::move+180
+//     5f8708c  MOV  X20, X0            ; X20 = a getPartsPtr result = our dummy
+//     5f87050  LDUR X8, [X20,#-0x50]   ; reads a POINTER out of the part
+//     5f87058  ADD  X0, X8, #0x18      ; X8 was 0  ->  X0 = 0x18
+//     5f8705c  BL   MTXInverse         ; derefs 0x18+0x18 = 0x30  -> SIGSEGV
+//
+// Two distinct defects, both fixed here:
+//   1. NEGATIVE OFFSETS. Callers index BACKWARDS off a part pointer (-0x50
+//      above). A bare array meant those reads fell off the front of the object
+//      into whatever unrelated static happened to precede it. So the returned
+//      pointer now sits in the MIDDLE of a larger arena, with slack on both
+//      sides — every in-struct offset a caller can plausibly use stays inside
+//      memory we own.
+//   2. ZERO FILL. A part is a mixed struct: some slots are read as pointers,
+//      some as floats, some as flags. Zeros are safe for floats and flags and
+//      FATAL for pointers. So the arena is filled with the returned pointer
+//      itself — read as a pointer it is valid and lands back inside the arena,
+//      so chained derefs are safe too.
+//      THE TRADE, STATED HONESTLY: those same bytes read as a float are the
+//      halves of an address. The high half (0x00000075) is always a harmless
+//      ~1e-43 denormal, but the low half depends on where the loader put us —
+//      usually tiny (~1e-28), occasionally huge (a base ending 0xFDC2.... gives
+//      -3.2e37). So a part that falls through to this dummy may render
+//      degenerately or produce inf/NaN geometry. That is a VISUAL failure on an
+//      entity that was already broken, traded against a GUARANTEED SIGSEGV on
+//      every pointer-shaped read, which is what zero fill gave us. Worth it, but
+//      it is a trade and not a clean win — do not read this dummy as "correct".
+//
+// Sized generously: parts are ~496 bytes in ARRAY mode and the largest offset
+// seen is +0x1D8, so 0x1000 of slack each way covers the whole struct in both
+// directions with room to spare.
+alignas(16) static uint8_t   g_dummy_arena[0x2000];
+static constexpr size_t      kDummyMid = 0x1000;   // returned pointer sits here
+static std::atomic<uint64_t> g_dummy_ptr{0};
 static std::atomic<bool>     s_dummy_parts_ready{false};
 static std::atomic<uint64_t> s_getparts_dummies{0};
+
+// Idempotent: concurrent callers may both run this, and both write identical
+// bytes, so a race produces the same arena either way.
+static uint64_t dummy_part() {
+    if (!s_dummy_parts_ready.load(std::memory_order_acquire)) {
+        uint64_t self = reinterpret_cast<uint64_t>(g_dummy_arena) + kDummyMid;
+        for (size_t o = 0; o + 8 <= sizeof(g_dummy_arena); o += 8)
+            *reinterpret_cast<uint64_t*>(g_dummy_arena + o) = self;
+        g_dummy_ptr.store(self, std::memory_order_relaxed);
+        s_dummy_parts_ready.store(true, std::memory_order_release);
+        return self;
+    }
+    return g_dummy_ptr.load(std::memory_order_relaxed);
+}
 
 // A NULL check is NOT enough here, and a tombstone proved it:
 //     #00 getparts_safe+68            <- `*(self + 264)`, fault 0x0040026039045611
@@ -1414,14 +1465,10 @@ static constexpr int kMaxPartIdx = 512;
 static std::atomic<uint64_t> s_getparts_rejects{0};
 
 static uint64_t getparts_safe(uint64_t self, int idx) {
-    // Self-pointing chain: any caller that walks the dummy's own +264 link stays
-    // inside the dummy instead of falling off into NULL. Same trick as the em32
-    // null-model buffer.
-    if (!s_dummy_parts_ready.load(std::memory_order_acquire)) {
-        *reinterpret_cast<void**>(g_dummy_parts + 264) = g_dummy_parts;
-        s_dummy_parts_ready.store(true, std::memory_order_release);
-    }
-    uint64_t dummy = reinterpret_cast<uint64_t>(g_dummy_parts);
+    // Every slot self-points, so the +264 link the old code special-cased is
+    // covered along with every other pointer-shaped read (including the
+    // negative-offset ones that produced tombstone_17).
+    uint64_t dummy = dummy_part();
 
     // IN: reject anything that cannot be a model before touching it. This is the
     // check whose absence produced the tombstone above.

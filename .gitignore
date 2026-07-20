@@ -149,11 +149,13 @@ lsposed-module/local.properties
 # ── Rust build output (PCBridge) ──────────────────────────────────────
 # 439MB of compiled deps; .rlib/.rmeta files run to 28MB each and would
 # permanently bloat history (GitHub warns >50MB, hard-rejects >100MB).
+# EXCEPTION: the shipped PCBridge binary itself IS tracked (4MB) so people can
+# run it without a Rust toolchain — it is force-added, so these rules do not
+# apply to it any more (gitignore never applies to already-tracked files).
 PCBridge/target/
 *.rlib
 *.rmeta
 *.pdb
-*.exe
 
 # ── .NET build output ─────────────────────────────────────────────────
 # 31MB of bin/. The C# SOURCE under dotnet/*.src/ stays tracked.
