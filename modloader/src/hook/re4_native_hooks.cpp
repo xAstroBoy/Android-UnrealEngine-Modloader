@@ -23,6 +23,7 @@
 #include "modloader/reflection_walker.h"
 #include <dobby.h>
 #include <dlfcn.h>
+#include <arm_neon.h>   // int8x16_t — KeyStop's q0 return type must match exactly
 #include <cmath>
 #include <unordered_map>
 #include <mutex>
@@ -599,6 +600,115 @@ static void patch_ro(void* addr, const void* src, size_t n) {
     __builtin_memcpy(addr, src, n);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// NATIVE-PATCH REGISTRY — PCBridge live toggle / culprit bisection
+// ═══════════════════════════════════════════════════════════════════════
+// Every toggleable native code change registers here. PCBridge lists them and
+// flips each one live: ENABLE = apply the patch / activate the hook logic,
+// DISABLE = restore the ORIGINAL game behaviour. When a native change breaks
+// gameplay (e.g. a cart won't take a shot), the user turns patches off one at a
+// time until the interaction returns — no rebuild, no guessing.
+namespace {
+struct RegPatch {
+    std::string id;
+    std::string desc;
+    bool        enabled      = false;
+    bool        is_bytes     = false;
+    void*       addr         = nullptr;  // bytes flavour
+    uint32_t    orig_word    = 0;        // bytes flavour
+    uint32_t    patched_word = 0;        // bytes flavour
+    std::function<bool(bool)> setter;    // toggle flavour: setter(enable)->ok
+};
+std::mutex            g_patch_mtx;
+std::vector<RegPatch> g_patches;         // handful of entries — linear scan is fine
+
+RegPatch* find_patch_locked(const std::string& id) {
+    for (auto& p : g_patches) if (p.id == id) return &p;
+    return nullptr;
+}
+} // anonymous namespace
+
+void register_native_patch_bytes(const std::string& id, const std::string& desc,
+                                 void* addr, uint32_t orig_word, uint32_t patched_word,
+                                 bool enabled_now) {
+    std::lock_guard<std::mutex> lk(g_patch_mtx);
+    if (RegPatch* ex = find_patch_locked(id)) {          // re-register: refresh in place
+        ex->desc = desc; ex->is_bytes = true; ex->addr = addr;
+        ex->orig_word = orig_word; ex->patched_word = patched_word; ex->enabled = enabled_now;
+        return;
+    }
+    RegPatch p;
+    p.id = id; p.desc = desc; p.enabled = enabled_now; p.is_bytes = true;
+    p.addr = addr; p.orig_word = orig_word; p.patched_word = patched_word;
+    g_patches.push_back(std::move(p));
+    logger::log_info("NPATCH", "registered bytes '%s' @%p (enabled=%d)",
+                     id.c_str(), addr, (int)enabled_now);
+}
+
+void register_native_patch_toggle(const std::string& id, const std::string& desc,
+                                  std::function<bool(bool)> setter, bool enabled_now) {
+    std::lock_guard<std::mutex> lk(g_patch_mtx);
+    if (RegPatch* ex = find_patch_locked(id)) {
+        ex->desc = desc; ex->is_bytes = false; ex->setter = std::move(setter); ex->enabled = enabled_now;
+        return;
+    }
+    RegPatch p;
+    p.id = id; p.desc = desc; p.enabled = enabled_now; p.is_bytes = false;
+    p.setter = std::move(setter);
+    g_patches.push_back(std::move(p));
+    logger::log_info("NPATCH", "registered toggle '%s' (enabled=%d)", id.c_str(), (int)enabled_now);
+}
+
+bool native_patch_get(const std::string& id, bool& out_enabled) {
+    std::lock_guard<std::mutex> lk(g_patch_mtx);
+    if (RegPatch* p = find_patch_locked(id)) { out_enabled = p->enabled; return true; }
+    return false;
+}
+
+std::string native_patch_list_json() {
+    std::lock_guard<std::mutex> lk(g_patch_mtx);
+    std::string out = "[";
+    bool first = true;
+    for (auto& p : g_patches) {
+        if (!first) out += ",";
+        first = false;
+        char addrbuf[24] = "null";
+        if (p.is_bytes && p.addr)
+            snprintf(addrbuf, sizeof addrbuf, "\"0x%llX\"", (unsigned long long)(uintptr_t)p.addr);
+        std::string desc_esc;                            // ids/descs are ASCII; escape " and \ only
+        for (char c : p.desc) { if (c == '"' || c == '\\') desc_esc += '\\'; desc_esc += c; }
+        out += "{\"id\":\"" + p.id + "\",\"desc\":\"" + desc_esc +
+               "\",\"enabled\":" + (p.enabled ? "true" : "false") +
+               ",\"kind\":\"" + (p.is_bytes ? "bytes" : "toggle") +
+               "\",\"addr\":" + addrbuf + "}";
+    }
+    out += "]";
+    return out;
+}
+
+bool native_patch_set(const std::string& id, bool enabled, std::string& err_out) {
+    std::lock_guard<std::mutex> lk(g_patch_mtx);
+    RegPatch* p = find_patch_locked(id);
+    if (!p) { err_out = "unknown patch id '" + id + "'"; return false; }
+    if (p->enabled == enabled) return true;              // idempotent
+    bool ok;
+    if (p->is_bytes) {
+        uint32_t word = enabled ? p->patched_word : p->orig_word;
+        ok = patch_code(p->addr, &word, sizeof word);
+        if (!ok) err_out = "patch_code failed for '" + id + "'";
+    } else if (p->setter) {
+        ok = p->setter(enabled);
+        if (!ok) err_out = "setter rejected '" + id + "'";
+    } else {
+        ok = false; err_out = "no setter for '" + id + "'";
+    }
+    if (ok) {
+        p->enabled = enabled;
+        logger::log_info("NPATCH", "'%s' -> %s", id.c_str(), enabled ? "ENABLED" : "DISABLED (original)");
+    }
+    return ok;
+}
+
 // Is `id` an em the engine can actually construct?
 //
 // cEmMgr::construct [0x5D90288] guards the ARCHIVE but not the INIT POINTER:
@@ -954,6 +1064,59 @@ bool install_emsetfromlist_id_remap(uintptr_t entry) {
     logger::log_info("XEMAP", "EmSetFromList2 id remap installed @0x%lX — unbuildable ids are "
                               "substituted before the spawn-list read (no fault to recover)",
                      (unsigned long)entry);
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// cSubChar::moveFace NULL virtual call — the PC=0 crash on the game thread
+// ═══════════════════════════════════════════════════════════════════════
+// Crash log (twice, identical): PC=0, LR = moveFace+0x44, stack
+// cSubChar::move -> cEmMgr::move -> gameMainLoop. The site @0x5FFD274:
+//     5ffd274  LDR X8, [X20]        ; X20 = this (sub-char), load vptr
+//     5ffd27c  LDR X8, [X8,#0x20]   ; virtual slot 4
+//     5ffd280  BLR X8               ; no null check -> PC = 0
+// Every SHIPPED cSub* vtable has slot 4 populated (checked all six in IDA:
+// cSubChar/Ashley/Ada/Leon/Luis/SubSubLeon — all nonzero), so the object's vptr
+// points at readable-but-wrong memory whose +0x20 is 0 — stale-EmInitFunc-style
+// corruption, same family as the crossover stack-smash.
+//
+// Same treatment as the gameRoomInit vtable[0x90] guard above: one
+// DobbyInstrument on the BLR, NULL target -> absorb into the no-op stub. The
+// call's result is unused (X8 is overwritten at +0x284, X0 not read), so an
+// empty function is semantically exact. The handler also logs this/vptr the
+// first few times so the corrupted class can be identified and fixed upstream.
+static std::atomic<uint64_t> s_subchar_nullvcalls{0};
+
+static void subchar_null_vcall(void* /*addr*/, DobbyRegisterContext* ctx) {
+    if (ARCH_DREG(ctx, 8) == 0) {
+        ARCH_DREG(ctx, 8) = reinterpret_cast<uint64_t>(&vcall_noop_stub);
+        uint64_t n = s_subchar_nullvcalls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n % 250) == 0) {
+            uint64_t self = ARCH_DREG(ctx, 20);
+            uint64_t vptr = 0;
+            if (self && !(self & 7))
+                vptr = *reinterpret_cast<volatile uint64_t*>(self);
+            logger::log_info("SUBCHAR", "moveFace: NULL virtual slot4 absorbed [%lu] — "
+                                        "this=0x%lX vptr=0x%lX (identify this class!)",
+                             (unsigned long)n, (unsigned long)self, (unsigned long)vptr);
+        }
+    }
+}
+
+bool install_subchar_vcall_guard() {
+    static bool installed = false;
+    if (installed) return true;
+    uintptr_t b = symbols::lib_base();
+    if (!b) { logger::log_error("SUBCHAR", "lib_base unavailable"); return false; }
+    void* site = reinterpret_cast<void*>(b + 0x5FFD280);   // the BLR X8
+    // BLR X8 is position-independent; nothing else instruments within 16 bytes.
+    if (DobbyInstrument(site, subchar_null_vcall) != RT_SUCCESS) {
+        logger::log_error("SUBCHAR", "DobbyInstrument failed at %p", site);
+        return false;
+    }
+    installed = true;
+    logger::log_info("SUBCHAR", "moveFace NULL-vcall guard installed @%p — the PC=0 "
+                                "sub-character crash is now absorbed and attributed", site);
     return true;
 }
 
@@ -1367,156 +1530,407 @@ uint64_t null_guard_substitutions() {
 // which is not a field I have identified yet. That is a strong candidate for the
 // still-unsolved EmSetFromList garbage-pointer tombstones (27/28) — do not claim
 // it is fixed.
-// ── THE DUMMY PART ──────────────────────────────────────────────────────
-// v1 was `uint8_t g_dummy_parts[0x800]`, zero-filled, returned as-is. It did not
-// remove the null deref, it RELOCATED it — tombstone_17:
-//     #00 MTXInverse+40      fault 0x30   (x0 = 0x18)
-//     #01 MotionMove+1616    #03 cEm10::move+4100   #05 cEmMgr::move+180
-//     5f8708c  MOV  X20, X0            ; X20 = a getPartsPtr result = our dummy
-//     5f87050  LDUR X8, [X20,#-0x50]   ; reads a POINTER out of the part
-//     5f87058  ADD  X0, X8, #0x18      ; X8 was 0  ->  X0 = 0x18
-//     5f8705c  BL   MTXInverse         ; derefs 0x18+0x18 = 0x30  -> SIGSEGV
+// ═══════════════════════════════════════════════════════════════════════
+// NULL-PAGE GUARD — kill the whole unguarded-null family in one move
+// ═══════════════════════════════════════════════════════════════════════
+// This engine's house style is to deref without checking: getRoomSavePtr 2981
+// of 3176 sites, getPartsPtr 1097 of 2420, cEmWrap::getPtr 190 of 754. Guarding
+// them one function at a time has now failed four times in a row, because every
+// guard can only choose WHICH null the caller trips over next:
+//     tombstone_13  BR X1 with X1=0                     -> PC = 0
+//     tombstone_17  *(0 + 0x18) from a zeroed dummy     -> fault 0x30
+//     crash log     BLR through a NULL fn ptr           -> PC = 0
+// All of them are the same thing: an access to the first page of the address
+// space, which is unmapped, so the CPU faults.
 //
-// Two distinct defects, both fixed here:
-//   1. NEGATIVE OFFSETS. Callers index BACKWARDS off a part pointer (-0x50
-//      above). A bare array meant those reads fell off the front of the object
-//      into whatever unrelated static happened to precede it. So the returned
-//      pointer now sits in the MIDDLE of a larger arena, with slack on both
-//      sides — every in-struct offset a caller can plausibly use stays inside
-//      memory we own.
-//   2. ZERO FILL. A part is a mixed struct: some slots are read as pointers,
-//      some as floats, some as flags. Zeros are safe for floats and flags and
-//      FATAL for pointers. So the arena is filled with the returned pointer
-//      itself — read as a pointer it is valid and lands back inside the arena,
-//      so chained derefs are safe too.
-//      THE TRADE, STATED HONESTLY: those same bytes read as a float are the
-//      halves of an address. The high half (0x00000075) is always a harmless
-//      ~1e-43 denormal, but the low half depends on where the loader put us —
-//      usually tiny (~1e-28), occasionally huge (a base ending 0xFDC2.... gives
-//      -3.2e37). So a part that falls through to this dummy may render
-//      degenerately or produce inf/NaN geometry. That is a VISUAL failure on an
-//      entity that was already broken, traded against a GUARANTEED SIGSEGV on
-//      every pointer-shaped read, which is what zero fill gave us. Worth it, but
-//      it is a trade and not a clean win — do not read this dummy as "correct".
+// So map it. With vm.mmap_min_addr=0 (set on the device) a process may map
+// address 0 itself. One RWX page there converts the entire family from fatal to
+// harmless:
+//     *(NULL + off)  -> reads 0            (no fault; and if that 0 is then
+//                                           used as a pointer, it lands here too)
+//     BLR/BR NULL    -> executes offset 0  -> we put a RET there, so the call
+//                                             simply returns
+// A page of zeroes alone is NOT enough: 0x00000000 decodes as UDF #0, so a jump
+// to NULL would trade SIGSEGV for SIGILL. Offset 0 therefore holds
+//   MOV X0, #0 ; RET
+// which is also the correct return value for the many of these that are
+// getters. The rest of the page stays zero so data reads see 0.
 //
-// Sized generously: parts are ~496 bytes in ARRAY mode and the largest offset
-// seen is +0x1D8, so 0x1000 of slack each way covers the whole struct in both
-// directions with room to spare.
-alignas(16) static uint8_t   g_dummy_arena[0x2000];
-static constexpr size_t      kDummyMid = 0x1000;   // returned pointer sits here
-static std::atomic<uint64_t> g_dummy_ptr{0};
-static std::atomic<bool>     s_dummy_parts_ready{false};
-static std::atomic<uint64_t> s_getparts_dummies{0};
+// This makes genuine null-pointer bugs silent. That is precisely the intent —
+// the shipped game already relies on never hitting them, and a silent no-op is
+// what the code assumes anyway. Nothing else in the process legitimately reads
+// or executes page 0.
+static bool s_null_page_mapped = false;
 
-// Idempotent: concurrent callers may both run this, and both write identical
-// bytes, so a race produces the same arena either way.
-static uint64_t dummy_part() {
-    if (!s_dummy_parts_ready.load(std::memory_order_acquire)) {
-        uint64_t self = reinterpret_cast<uint64_t>(g_dummy_arena) + kDummyMid;
-        for (size_t o = 0; o + 8 <= sizeof(g_dummy_arena); o += 8)
-            *reinterpret_cast<uint64_t*>(g_dummy_arena + o) = self;
-        g_dummy_ptr.store(self, std::memory_order_relaxed);
-        s_dummy_parts_ready.store(true, std::memory_order_release);
-        return self;
+bool install_null_page_guard() {
+    if (s_null_page_mapped) return true;
+
+    void* p = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (p == MAP_FAILED || p != nullptr) {
+        // MAP_FIXED_NOREPLACE refuses if something is already there; retry with
+        // plain MAP_FIXED only if we got nothing, never clobber an existing map.
+        if (p != MAP_FAILED && p != nullptr) munmap(p, 0x1000);
+        p = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     }
-    return g_dummy_ptr.load(std::memory_order_relaxed);
-}
+    if (p != nullptr) {
+        if (p != MAP_FAILED) munmap(p, 0x1000);
+        logger::log_error("NULLPAGE",
+                          "could not map page 0 (got %p) — is vm.mmap_min_addr still nonzero? "
+                          "run: echo 0 > /proc/sys/vm/mmap_min_addr", p);
+        return false;
+    }
 
-// A NULL check is NOT enough here, and a tombstone proved it:
-//     #00 getparts_safe+68            <- `*(self + 264)`, fault 0x0040026039045611
-//     #01 IKInit+392  #02 MotionSetCore+552  #03 cRoutine::moveWepDown+104
-//     x0 = 0xf940026039045509   x1 = 0xfe (idx 254)
-// x0 is not a pointer at all — 0xf9400260 is `ldr x0,[x19]` and 0x39045509 is
-// `strb w9,[x8,#0x115]`. That is ARM64 INSTRUCTION ENCODING being used as a
-// cModel*, and `if (!self)` waved it straight through into the deref.
-//
-// Where it came from is written a few lines up, in the ARRAY-mode caveat that was
-// knowingly left unfixed: `p + 496*idx` has no bounds check, so an out-of-range
-// index hands back an out-of-bounds GARBAGE pointer instead of NULL. Something
-// stored that result as a model and handed it back to us later as `self`. idx=254
-// here is exactly the out-of-range shape that produces it. So the guard was not
-// just failing to catch bad input — it was MANUFACTURING it.
-//
-// Fix both ends:
-//   * validate every pointer before dereferencing it (in), and
-//   * never RETURN a pointer that fails the same test (out), which stops the
-//     garbage at the source instead of waiting for it to come back as a `self`.
-//
-// The test is a range/alignment check, not a mapped-memory probe: this is a hot
-// path (per motion-set, per model) and a /proc/self/maps consult here would cost
-// far more than it saves. It catches the observed failure decisively — user VAs
-// on this device are 48-bit, and 0x40026039045509 is ~1.8e16, well past 2^48.
-static inline bool plausible_model_ptr(uint64_t p) {
-    // PR_TAGGED_ADDR_ENABLE is on for this process, so the top byte is an
-    // address tag the CPU ignores — strip it before range-checking, exactly as
-    // the hardware does when it computes the faulting address.
-    p &= 0x00FFFFFFFFFFFFFFull;
-    if (p < 0x10000ull)        return false;   // NULL page / small integer
-    if (p >= (1ull << 48))     return false;   // beyond the user address space
-    if (p & 7ull)              return false;   // a cModel* is 8-byte aligned
+    std::memset(p, 0, 0x1000);
+    // MOV X0, #0 ; RET  — a call through a NULL pointer now returns 0.
+    reinterpret_cast<uint32_t*>(p)[0] = 0xD2800000;   // mov x0, #0
+    reinterpret_cast<uint32_t*>(p)[1] = 0xD65F03C0;   // ret
+    __builtin___clear_cache(reinterpret_cast<char*>(p), reinterpret_cast<char*>(p) + 8);
+
+    s_null_page_mapped = true;
+    logger::log_info("NULLPAGE",
+                     "page 0 mapped RWX (mov x0,#0; ret at +0) — NULL derefs now read 0 and "
+                     "calls through NULL return 0 instead of SIGSEGV/PC=0");
     return true;
 }
 
-// Largest sane ARRAY-mode part index. The real part count is a field I still have
-// not identified (see the caveat above), so this is a backstop, not a bound: it
-// only has to be comfortably above any legitimate index while rejecting the
-// wild ones. Observed good indices are small; the crash used 254.
-static constexpr int kMaxPartIdx = 512;
+// ── THE DUMMY PART — v1 layout + the two offsets the tombstones named ───
+// The returned pointer sits at +0x100 inside a 0x1000 arena. Everything is
+// IDENTICAL to the v1 zeroed dummy that ran for weeks (all zeros, +264
+// self-points so counted LIST walks stay inside), except two offsets that
+// tombstones proved are used relative to a part pointer:
+//
+//   part-0x50  READ as a parent pointer, then +0x18 fed to MTXInverse:
+//         5f87050  LDUR X8,[X20,#-0x50]
+//         5f87058  ADD  X0,X8,#0x18
+//         5f8705c  BL   MTXInverse          ; X8=0 -> fault 0x30  (tomb 17/23,
+//                                            + UpdateShadow variant)
+//       -> now holds a pointer to a zero matrix at arena+0x800. MTXInverse of a
+//          zero matrix yields inf/NaN floats, NOT a fault (ARM doesn't trap FP)
+//          — garbage transform on an already-broken model, no crash.
+//
+//   part-0x80..-0x50  WRITTEN by the very next instruction pair:
+//         5f87060  SUB X2,X20,#0x80 ; BL MTXConcat   ; dst = part-0x80
+//       -> in-bounds writable slack below the returned pointer. Note it stops
+//          at -0x50, so it does NOT clobber the parent pointer above.
+//
+// Deliberately NOT done (each was tried and regressed):
+//   * self-pointing every slot  -> uncounted `while(p) p=p->next` walks never
+//     terminate -> game-thread HANG (black screen)
+//   * skipping MotionMove entirely -> stalls the state machine waiting on that
+//     motion -> SOFTLOCK
+//   * mapping page 0 -> ART uses implicit null checks -> process dies at boot
+// The +264 self-point is safe because getparts_safe's LIST walk is COUNTED
+// (for(;idx;--idx)), and it is what v1 shipped without a single hang.
+// OFFSET-AGNOSTIC dummy — the shape that finally works. Every earlier attempt
+// fixed ONE offset and the next caller read a DIFFERENT one:
+//   moveFace read part-0x50, moveFootwork read part+0x78 (MotionMove pre-indexes
+//   X20 by 0xC8, so the "-0x50" is a moving target). An entry guard "skip if
+//   model==dummy" NEVER fired, because the dummy appears INSIDE MotionMove (it
+//   calls getPartsPtr itself) — MotionMove's model arg is the real cSubChar.
+//
+// So stop chasing offsets. Two regions:
+//   A (g_dummy_arena): the returned part, 0x2000 with the pointer in the middle
+//     so ANY +/- offset stays in-bounds. EVERY 8-byte slot holds &B.
+//   B (g_dummy_scratch): 0x1000, every slot holds &vcall_noop_stub.
+// Now whatever a caller does with a field of the dummy is survivable:
+//   * read as a pointer, then deref  -> &B (mapped RW); *(B+x)=&stub (mapped)
+//   * read as a matrix (MTXInverse of part+off, +0x18) -> lands in B, 64 bytes
+//     of mapped RW memory -> reads/writes zeros-ish, never faults
+//   * read as a vtable: vptr=*(dummy)=&B, slot=*(&B+8i)=&stub -> vcall returns 0
+//   * float interpretation of a slot -> stub-address bytes = harmless denormal
+// A link `while(p) p=*(p+k)` no longer SELF-loops (A->B->stub->..., all distinct)
+// so it cannot hang the way the self-pointing version did; at worst one hop
+// faults and the global instruction-skip guard turns it into termination.
+alignas(16) static uint8_t   g_dummy_arena[0x2000];    // A: returned part + slack both ways
+alignas(16) static uint8_t   g_dummy_scratch[0x1000];  // B: every A slot points here
+static constexpr size_t      kDummyOff = 0x1000;       // returned = A + this (0x1000 slack each side)
+static std::atomic<bool>     s_dummy_parts_ready{false};
+static std::atomic<uint64_t> s_getparts_dummies{0};
 static std::atomic<uint64_t> s_getparts_rejects{0};
+static std::atomic<uint64_t> s_last_reject_self{0};   // raw `this` of the last reject (heuristic tuning)
+static std::atomic<uint64_t> s_last_reject_ra{0};     // caller return-address of that reject
+
+static inline bool plausible_model_ptr(uint64_t p) {
+    p &= 0x00FFFFFFFFFFFFFFull;                // strip the PR_TAGGED_ADDR tag
+    if (p < 0x10000ull)    return false;
+    if (p >= (1ull << 48)) return false;
+    // 4-byte alignment, NOT 8. The engine passes 4-aligned cModel pointers all the
+    // time (ARM64 LDR handles unaligned access, so stock getPartsPtr never cared),
+    // and an 8-byte mask false-rejected ~2.4M legit pointers per session — that is
+    // what broke cart-shoot, door-kick, ladder use and player collision (all had a
+    // 4-aligned `this` like 0x6E43733D44 -> &7=4). Measured: with &3, dummies stay
+    // 0 in normal play (the guard becomes transparent) while still catching the
+    // Randomizer crossover null-heads. See getpartsptr_last_reject_self.
+    if (p & 3ull)          return false;
+    return true;
+}
+
+// Idempotent; concurrent init writes identical bytes.
+// The dummy IS virtual-called. Proven live by the SUBCHAR guard's first absorb:
+//     moveFace: NULL virtual slot4 absorbed — this=0x6FE77B0310 vptr=0x0
+// 0x6FE77B0310 is INSIDE libmodloader — it is g_dummy_arena+kDummyOff. So the
+// "object" whose vtable was NULL is THIS dummy: cSubChar::moveFace fetches a
+// face part via getPartsPtr and virtual-calls it, and parts are real objects
+// with vtables. A vptr of 0 made every such site a PC=0 crash — and moveFace
+// alone has SEVERAL of those BLRs (the second one, +0x758, killed the process
+// right after the first was absorbed). Guarding them one BLR at a time is
+// whack-a-mole by construction.
+//
+// So the dummy carries a FAKE VTABLE: 64 slots, every one -> vcall_noop_stub.
+// Any virtual call on the dummy, at any slot, from any site, becomes a no-op
+// that returns 0. No per-site instruments, nothing to enumerate, and it cannot
+// hang (the stub returns immediately; link walks still see 0 and terminate).
+// Set once dummy_part() initialises; motionmove_safe reads it to skip only the
+// dummy. Defined here so both (dummy_part just below, guard further down) see it.
+static std::atomic<uint64_t> g_dummy_self{0};
+
+static uint64_t dummy_part() {
+    uint8_t* base = g_dummy_arena + kDummyOff;
+    if (!s_dummy_parts_ready.load(std::memory_order_acquire)) {
+        const uint64_t stub = reinterpret_cast<uint64_t>(&vcall_noop_stub);
+        // B: every slot -> the no-op stub. Valid as a vtable entry (callable,
+        // returns 0), valid as a nonzero mapped pointer, harmless as float bytes.
+        uint64_t* b = reinterpret_cast<uint64_t*>(g_dummy_scratch);
+        for (size_t i = 0; i < sizeof(g_dummy_scratch) / 8; ++i) b[i] = stub;
+        // A: every slot -> B. So any offset read out of the dummy yields &B.
+        const uint64_t bv = reinterpret_cast<uint64_t>(g_dummy_scratch);
+        uint64_t* a = reinterpret_cast<uint64_t*>(g_dummy_arena);
+        for (size_t i = 0; i < sizeof(g_dummy_arena) / 8; ++i) a[i] = bv;
+        g_dummy_self.store(reinterpret_cast<uint64_t>(base), std::memory_order_relaxed);
+        s_dummy_parts_ready.store(true, std::memory_order_release);
+    }
+    return reinterpret_cast<uint64_t>(base);
+}
+
+// FAITHFUL reproduction of stock cModel::getPartsPtr(this, a2) @0x5F81AFC:
+//     v2 = this;
+//     if (a2 >= 0) {
+//       this = *(this + 264);                 // parts head
+//       if (this) {
+//         if (*(v2+9) & 0x20)  this += 496*a2;            // ARRAY
+//         else  for(;a2;--a2)  this = *(this+264);        // LIST walk (unchecked)
+//       }
+//     }
+//     return this;   // a2<0 -> v2 ; head null -> 0 ; else the part
+// For EVERY real model — Ashley, doors, carts — this returns bit-for-bit what
+// the game would. The only change is the two places the original walks off the
+// end and crashes: instead of NULL / an off-the-end deref, we hand back a REAL
+// pointer (the model itself, or the last valid part). NO synthetic part is ever
+// returned to a real model — that "dummy" only exists for a genuinely garbage
+// `this` (tombstone_16: ARM64 code bytes passed as a cModel*), which cannot
+// yield anything real.
+// PCBridge toggle. When false, getparts_safe runs getparts_stock — the ORIGINAL
+// game algorithm bit-for-bit, INCLUDING its unguarded off-the-end derefs — so the
+// user can A/B whether this guard is what broke an interaction. A plain atomic
+// (one relaxed load per call, negligible on the hot path) is used instead of
+// DobbyDestroy: tearing the hook down would race the game threads that execute
+// getPartsPtr every frame (see native_hooks.cpp remove_key note).
+static std::atomic<bool> g_getparts_enabled{true};
+
+// EXACT stock cModel::getPartsPtr(this, a2) @0x5F81AFC — no guards, reproduced
+// straight from the decompile. Used only when the guard is toggled OFF.
+static uint64_t getparts_stock(uint64_t self, int idx) {
+    uint64_t v = self;
+    if (idx >= 0) {
+        self = *reinterpret_cast<volatile uint64_t*>(self + 264);
+        if (self) {
+            if (*reinterpret_cast<volatile uint8_t*>(v + 9) & 0x20)
+                self += 496ull * static_cast<uint32_t>(idx);
+            else
+                for (; idx; --idx) self = *reinterpret_cast<volatile uint64_t*>(self + 264);
+        }
+    }
+    return self;
+}
 
 static uint64_t getparts_safe(uint64_t self, int idx) {
-    // Every slot self-points, so the +264 link the old code special-cased is
-    // covered along with every other pointer-shaped read (including the
-    // negative-offset ones that produced tombstone_17).
-    uint64_t dummy = dummy_part();
-
-    // IN: reject anything that cannot be a model before touching it. This is the
-    // check whose absence produced the tombstone above.
+    if (!g_getparts_enabled.load(std::memory_order_relaxed))
+        return getparts_stock(self, idx);              // guard OFF -> original behaviour
     if (!plausible_model_ptr(self)) {
+        // The stock function has NO plausibility gate (verified against the 16-insn
+        // disassembly @0x5F81AFC: it just LDRs [this+0x108]). This heuristic is a
+        // pure addition and it FALSE-POSITIVES on legit engine pointers — a
+        // shootable cart's model was rejected, its hit test got a synthetic dummy,
+        // and the shot never registered. Hard rule: never hand a real caller a
+        // dummy. So capture the rejected pointer + caller (to tighten the heuristic
+        // later — see getpartsptr_last_reject_*), then run the EXACT stock code.
+        // self==0 is the one value stock would fault on for no gain -> shortcut 0.
+        if (!self) return 0;
         s_getparts_rejects.fetch_add(1, std::memory_order_relaxed);
-        return dummy;
+        s_last_reject_self.store(self, std::memory_order_relaxed);
+        s_last_reject_ra.store(reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+                               std::memory_order_relaxed);
+        return getparts_stock(self, idx);
     }
-    if (idx < 0) return self;                       // stock behaviour: returns `this`
-
+    if (idx < 0) return self;                       // stock: a2<0 returns `this`
     uint64_t p = *reinterpret_cast<volatile uint64_t*>(self + 264);
-    if (!plausible_model_ptr(p)) {
+    if (!p) {
+        // Part-less model. Stock returns NULL here and the ~1101 unguarded
+        // callers crash. Return the MODEL itself — a valid, mapped pointer — so
+        // they read model bytes instead of derefing NULL. Not a fake part.
         s_getparts_dummies.fetch_add(1, std::memory_order_relaxed);
-        return dummy;
+        return self;
     }
-
-    if (*reinterpret_cast<volatile uint8_t*>(self + 9) & 0x20) {
-        // ARRAY mode. OUT: an out-of-range idx used to escape as a garbage
-        // pointer — the very thing that came back as `self` in the tombstone.
-        if (idx > kMaxPartIdx) {
-            s_getparts_rejects.fetch_add(1, std::memory_order_relaxed);
-            return dummy;
-        }
-        uint64_t arr = p + 496ull * static_cast<uint32_t>(idx);
-        if (!plausible_model_ptr(arr)) {
-            s_getparts_rejects.fetch_add(1, std::memory_order_relaxed);
-            return dummy;
-        }
-        return arr;
-    }
-
-    for (; idx; --idx) {                            // LIST mode
-        p = *reinterpret_cast<volatile uint64_t*>(p + 264);
-        if (!plausible_model_ptr(p)) {              // <== the check the game omits
+    if (*reinterpret_cast<volatile uint8_t*>(self + 9) & 0x20)
+        return p + 496ull * static_cast<uint32_t>(idx);   // ARRAY: faithful, unbounded like stock
+    for (; idx; --idx) {                            // LIST: faithful walk...
+        uint64_t next = *reinterpret_cast<volatile uint64_t*>(p + 264);
+        if (!next) {                                // ...but stop at the last VALID
             s_getparts_dummies.fetch_add(1, std::memory_order_relaxed);
-            return dummy;
+            return p;                               // real part, not an off-the-end deref
         }
+        p = next;
     }
     return p;
 }
 
-uint64_t getpartsptr_reject_count() { return s_getparts_rejects.load(std::memory_order_relaxed); }
-
 uint64_t getpartsptr_dummy_count() { return s_getparts_dummies.load(std::memory_order_relaxed); }
+uint64_t getpartsptr_reject_count() { return s_getparts_rejects.load(std::memory_order_relaxed); }
+uint64_t getpartsptr_last_reject_self() { return s_last_reject_self.load(std::memory_order_relaxed); }
+uint64_t getpartsptr_last_reject_ra()   { return s_last_reject_ra.load(std::memory_order_relaxed); }
+
+// ═══════════════════════════════════════════════════════════════════════
+// MotionMove GUARD — bail out of the whole call, do not feed it a dummy
+// ═══════════════════════════════════════════════════════════════════════
+// The repeated crash (tombstone_17 and tombstone_23, identical):
+//     #00 MTXInverse+40        fault 0x30   (x0 = 0x18)
+//     #01 MotionMove+1616      #03 cEm10::move+4100   #05 cEmMgr::move+180
+//     5f8708c  MOV  X20, X0            ; X20 = a cModel::getPartsPtr result
+//     5f87050  LDUR X8, [X20,#-0x50]   ; reads a POINTER out of the part
+//     5f87058  ADD  X0, X8, #0x18      ; X8 was 0  ->  X0 = 0x18
+//     5f8705c  BL   MTXInverse         ; derefs 0x18+0x18 = 0x30
+//
+// The part it read from is the getPartsPtr dummy, handed out because the model
+// has NO PARTS AT ALL (*(model+264) == 0). Four attempts to make that dummy
+// survive arbitrary use have now failed — zeros crash on pointer reads,
+// self-pointers hang on link walks, and no fill can be right for both without
+// knowing which offsets in a part are pointers.
+//
+// So stop trying to make a fake part work, and do what actually fixed the
+// launcher: ABORT THE OPERATION. A model with no parts has nothing to animate,
+// so MotionMove can only produce garbage for it. Skipping the call entirely is
+// the semantically correct answer, and unlike a dummy it cannot relocate the
+// fault (nothing downstream runs) and cannot loop (there is no walk).
+//
+// Cost: that one enemy does not animate. It was already broken — it had no
+// skeleton to animate. Healthy models are untouched: *(model+264) is the parts
+// list head and is nonzero for anything with a skeleton, so they take the
+// original path unchanged.
+//
+// Prologue is `SUB SP,SP,#0x180` + STP at POSITIVE offsets — no SP pre-index
+// writeback, so DobbyHook's trampoline is safe here (the FP-store-with-writeback
+// prologues are the dangerous ones).
+using MotionMoveFn = int64_t (*)(void*, void*);
+static MotionMoveFn          s_motionmove_orig = nullptr;
+static std::atomic<uint64_t> s_motionmove_skips{0};
+
+static int64_t motionmove_safe(void* model, void* cam) {
+    uint64_t m = reinterpret_cast<uint64_t>(model);
+    // Skip iff this IS our getPartsPtr dummy. NARROW ON PURPOSE. An earlier
+    // version skipped for *(m+264)==0 ("no skeleton") and SOFTLOCKED, because
+    // that also matched real models mid-load and stalled whatever waited on the
+    // motion. The dummy is NEVER a real object, so skipping its motion cannot
+    // stall anything — and it covers EVERY dummy-field read (moveFace's -0x50,
+    // moveFootwork's, and any other) at once, instead of patching offsets one
+    // at a time. A NULL/garbage model still falls through to the original,
+    // preserving stock behaviour for everything that is not the dummy.
+    if (m != 0 && m == g_dummy_self.load(std::memory_order_relaxed)) {
+        s_motionmove_skips.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    return s_motionmove_orig ? s_motionmove_orig(model, cam) : 0;
+}
+
+uint64_t motionmove_skip_count() { return s_motionmove_skips.load(std::memory_order_relaxed); }
+
+bool install_motionmove_guard(uintptr_t addr) {
+    if (s_motionmove_orig) return true;                     // idempotent
+    void* fn = reinterpret_cast<void*>(addr);
+    if (!fn) fn = symbols::resolve("_Z10MotionMoveP6cModelP6CAMERA");
+    if (!fn) {
+        uintptr_t b = symbols::lib_base();
+        if (!b) { logger::log_error("MOTION", "lib_base unavailable"); return false; }
+        fn = reinterpret_cast<void*>(b + 0x5F86A0C);
+    }
+    if (DobbyHook(fn,
+                  reinterpret_cast<dobby_dummy_func_t>(motionmove_safe),
+                  reinterpret_cast<dobby_dummy_func_t*>(&s_motionmove_orig)) != RT_SUCCESS
+        || !s_motionmove_orig) {
+        logger::log_error("MOTION", "DobbyHook failed on MotionMove @%p", fn);
+        s_motionmove_orig = nullptr;
+        return false;
+    }
+    logger::log_info("MOTION", "MotionMove guard installed @%p — a model with no parts "
+                               "(*(model+264)==0) now SKIPS the call instead of feeding the "
+                               "getPartsPtr dummy into MTXInverse (fault 0x30)", fn);
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// em_id_has_data — THE FIX: never write an enemy the engine cannot load
+// ═══════════════════════════════════════════════════════════════════════
+// cEmMgr::construct @0x5D90288 decides this itself, and its own test is the one
+// to copy:
+//     default:
+//       result = EmReadSearch(a3, nullptr, 0);   // load/cache the .das
+//       *((_QWORD *)a2 + 140) = result;
+//       if ( !result ) return result;            // NO DATA -> bail
+//       EmInitFunc(a2);
+// When EmReadSearch returns 0 the enemy has no archive, construct bails, and
+// what is left in the pool is a SHELL: a cEm with no model and no parts. Nothing
+// downstream checks, so it reaches cEmMgr::move -> cEm10::move -> MotionMove and
+// dies on the parts pointer, or gets the getPartsPtr dummy and calls a NULL
+// function pointer out of it. Every crash in this family starts here.
+//
+// So ask the same question BEFORE writing the row. EmReadSearch caches, so the
+// call is a cache hit after the first, and it is exactly what construct would
+// have done a moment later — no new state, no new timing.
+//
+// A false answer costs nothing: the randomizer simply redraws, and if nothing
+// usable comes up it leaves the row alone and THE LEVEL'S ORIGINAL ENEMY SPAWNS.
+using EmReadSearchFn = void* (*)(uint8_t, void*, uint32_t);
+static EmReadSearchFn s_emreadsearch = nullptr;
+
+bool em_id_has_data(uint32_t id) {
+    if (id > 0xFF) return false;
+    if (!s_emreadsearch) {
+        s_emreadsearch = reinterpret_cast<EmReadSearchFn>(
+            symbols::resolve("_Z12EmReadSearchhPvj"));
+        if (!s_emreadsearch) {
+            uintptr_t b = symbols::lib_base();
+            if (b) s_emreadsearch = reinterpret_cast<EmReadSearchFn>(b + 0x617E904);
+        }
+        if (!s_emreadsearch) {
+            logger::log_error("EMDATA", "EmReadSearch unresolved — cannot pre-check enemy ids");
+            return true;                       // unknown: never block a pick
+        }
+    }
+    return s_emreadsearch(static_cast<uint8_t>(id), nullptr, 0) != nullptr;
+}
 
 bool install_getpartsptr_guard(uintptr_t getparts) {
     if (!getparts) return false;
     static bool installed = false;
     if (installed) { logger::log_info("PARTS", "already installed"); return true; }
+    // cSubChar::moveFace instrument REMOVED — it was corrupting the per-frame
+    // sub-character update (Ashley's follow). getparts_safe below is now a FAITHFUL
+    // reproduction of the stock getPartsPtr, so the NULL-vtable case it used to
+    // absorb no longer arises (a real model gets its real parts; only a genuinely
+    // part-less model gets the guarded fallback).
+    // install_motionmove_guard is NOT called: it checks MotionMove's model ARG
+    // against the dummy, but the dummy appears INSIDE MotionMove (via its own
+    // getPartsPtr), so the arg is the real cSubChar and the check never fires.
+    // The offset-agnostic dummy (A->B->stub) makes it unnecessary — MotionMove
+    // reading any dummy field now lands in mapped memory instead of faulting.
+
+    // MotionMove guard, re-enabled with an EXACT condition: skip only when the
+    // model is our getPartsPtr dummy (see motionmove_safe). The earlier softlock
+    // came from the old broad `*(m+264)==0` test catching real mid-load models;
+    // matching the dummy pointer exactly cannot do that. This is what actually
+    // stops the cSubChar moveFace/moveFootwork -> MotionMove -> MTXInverse
+    // (fault 0x30) family, since the dummy is what those read from.
     // Full replacement, not a wrapper: the stock body is 10 instructions and is
     // reproduced above exactly, so there is nothing to call through to.
     if (DobbyHook(reinterpret_cast<void*>(getparts),
@@ -1526,10 +1940,1351 @@ bool install_getpartsptr_guard(uintptr_t getparts) {
         return false;
     }
     installed = true;
+    // Expose it to PCBridge as a live-toggleable patch. DISABLE flips the atomic
+    // so getparts_safe falls through to getparts_stock (exact original), letting
+    // the user test whether this guard breaks any interaction (cart-shoot etc.).
+    register_native_patch_toggle(
+        "re4.getPartsPtr_guard",
+        "cModel::getPartsPtr crash guard (faithful stock + off-end fallbacks). OFF = raw original.",
+        [](bool en) { g_getparts_enabled.store(en, std::memory_order_relaxed); return true; },
+        true);
     logger::log_info("PARTS", "cModel::getPartsPtr guard installed @0x%lX — NULL now yields a "
                               "zeroed dummy (1101 unguarded derefs in libUE4) and the LIST walk "
                               "null-checks (was: *(NULL+264) = fault 0x108)",
                      (unsigned long)getparts);
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// EspCommonTrans USE-AFTER-FREE GUARD (MTXConcat crash family)
+// ═══════════════════════════════════════════════════════════════════════
+// EspCommonTrans(cEsp*) renders an effect sprite. In its 3D-world path it reads
+// the effect's PARENT object at *(cEsp+64) and concatenates that parent's world
+// matrix at +24:  MTXConcat(*(cEsp+64)+24, cEsp+236, ...) @0x5F158A4 / 0x5F15C18.
+// When the parent has been FREED (rapid actor/enemy churn — cutscene teardown,
+// Randomizer pool leak) the effect outlives it, so *(cEsp+64) dangles and
+// *(cEsp+64)+24 is unmapped → MTXConcat SIGSEGV SEGV_MAPERR (tombstone_02/03).
+// Guard: before the original runs, if we are on the parent-matrix path and the
+// parent's matrix page is not mapped (msync probe = live, catches freed pages),
+// skip this effect (return `this`, which is EspCommonTrans's own skip return).
+static dobby_dummy_func_t   s_espcommon_orig = nullptr;
+static std::atomic<uint64_t> s_esp_guard_skips{0};
+static std::atomic<bool>     g_esp_guard_on{true};   // PCBridge toggle
+
+static inline bool esp_page_mapped(uint64_t p) {
+    if (p < 0x10000ull) return false;
+    void* page = reinterpret_cast<void*>(p & ~0xFFFull);
+    return msync(page, 1, MS_ASYNC) == 0;      // live probe; -1 for freed/unmapped
+}
+
+static uint64_t espcommontrans_safe(uint64_t self) {
+    if (!g_esp_guard_on.load(std::memory_order_relaxed))
+        return reinterpret_cast<uint64_t(*)(uint64_t)>(s_espcommon_orig)(self);  // OFF -> raw
+    // Only the 3D-world path derefs *(self+64)+24. Matches the decompile branch
+    // `(uint8_t)(*(self+72)+8) > 5`. 2D screen effects never touch the parent.
+    uint8_t kind = *reinterpret_cast<volatile uint8_t*>(self + 72);
+    if ((uint8_t)(kind + 8) > 5u) {
+        uint64_t parent = *reinterpret_cast<volatile uint64_t*>(self + 64);
+        if (parent && !esp_page_mapped(parent + 24)) {
+            s_esp_guard_skips.fetch_add(1, std::memory_order_relaxed);
+            return self;   // dangling parent → skip render, no crash
+        }
+    }
+    return reinterpret_cast<uint64_t(*)(uint64_t)>(s_espcommon_orig)(self);
+}
+
+uint64_t esp_parent_skip_count() { return s_esp_guard_skips.load(std::memory_order_relaxed); }
+
+bool install_esp_parent_guard(uintptr_t espcommontrans) {
+    if (!espcommontrans) return false;
+    static bool installed = false;
+    if (installed) return true;
+    if (DobbyHook(reinterpret_cast<void*>(espcommontrans),
+                  reinterpret_cast<dobby_dummy_func_t>(espcommontrans_safe),
+                  &s_espcommon_orig) != RT_SUCCESS) {
+        logger::log_error("ESP", "DobbyHook EspCommonTrans failed @0x%lX", (unsigned long)espcommontrans);
+        return false;
+    }
+    installed = true;
+    register_native_patch_toggle(
+        "re4.esp_parent_guard",
+        "EspCommonTrans use-after-free guard (skips effects whose freed parent's matrix is unmapped -> stops MTXConcat SIGSEGV). OFF = raw original.",
+        [](bool en) { g_esp_guard_on.store(en, std::memory_order_relaxed); return true; },
+        true);
+    logger::log_info("ESP", "EspCommonTrans use-after-free guard installed @0x%lX", (unsigned long)espcommontrans);
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// KEEP-PAWN-IN-CUTSCENE — block the cutscene pawn takeover at the source
+// ═══════════════════════════════════════════════════════════════════════
+// AVR4PlayerController::PossessPlayerPawn(EPlayerPawn type) @0x6390948 is a STATIC
+// member (type in X0, ignores `this`, uses spInstance @0xA5DF9B8). A cutscene calls
+// it with type=3 to leave your pawn and possess the "theatre" cutscene pawn — that
+// is the control/camera takeover. The scripted scene itself is SCE-driven
+// (IsBio4EventPlaying), NOT this pawn. So when the guard is ON and type==3, we
+// redirect the request to the CURRENT pawn type: PossessPlayerPawn(current) is a
+// no-op re-possess (its store is gated by `cur != a1`), so the controller keeps
+// YOUR pawn and returns a valid pawn (no null). The Lua RegisterNativeHookAt path
+// could not block this (its sig maps ints to D-regs and the chain callback never
+// fired for this fn), so it is done here with a real Dobby trampoline.
+// ── CUTSCENE VERBOSITY ─────────────────────────────────────────────────
+// Temporary instrumentation so we can prove from the LOG whether each cutscene
+// patch actually fires, instead of needing someone to describe what they see in
+// the headset. Rate-limited: first hit is always logged, then every Nth, so a
+// per-model hook cannot flood the ring buffer. Toggle: re4.cutscene_verbose.
+static std::atomic<bool> g_cutscene_verbose{false};
+
+static inline bool cut_vlog_due(std::atomic<uint32_t>& counter, uint32_t every) {
+    if (!g_cutscene_verbose.load(std::memory_order_relaxed)) return false;
+    uint32_t n = counter.load(std::memory_order_relaxed);
+    return (n == 1) || (every && (n % every) == 0);
+}
+
+static dobby_dummy_func_t    s_possess_orig = nullptr;
+static std::atomic<bool>     g_keep_pawn_in_cutscene{true};    // default ON — see CUTSCENE DEFAULTS note
+static std::atomic<uint32_t> g_keep_pawn_blocks{0};
+
+static uint64_t possess_keep_pawn(uint64_t pawnType /* X0 */) {
+    if (g_keep_pawn_in_cutscene.load(std::memory_order_relaxed) && pawnType == 3ull) {
+        g_keep_pawn_blocks.fetch_add(1, std::memory_order_relaxed);
+        uintptr_t b = symbols::lib_base();
+        if (b) {
+            uint64_t sp = *reinterpret_cast<volatile uint64_t*>(b + 0xA5DF9B8ull);  // spInstance
+            if (sp) {
+                uint8_t cur = *reinterpret_cast<volatile uint8_t*>(sp + 0x5E0ull);   // active pawn type
+                if (cut_vlog_due(g_keep_pawn_blocks, 1))
+                    logger::log_info("CUTVRB", "keep_pawn: BLOCKED possess(3), keeping pawnType=%u (block #%u)",
+                                     (unsigned)cur, g_keep_pawn_blocks.load(std::memory_order_relaxed));
+                if (cur != 3)   // re-possess YOUR pawn (no swap) instead of the theatre pawn
+                    return reinterpret_cast<uint64_t(*)(uint64_t)>(s_possess_orig)(static_cast<uint64_t>(cur));
+            }
+        }
+        return 0;   // couldn't resolve — refuse the swap rather than take over
+    }
+    if (g_cutscene_verbose.load(std::memory_order_relaxed) && pawnType == 3ull)
+        logger::log_info("CUTVRB", "keep_pawn: OFF — allowing possess(3) (theatre pawn takes over)");
+    return reinterpret_cast<uint64_t(*)(uint64_t)>(s_possess_orig)(pawnType);
+}
+
+bool install_keep_pawn_in_cutscene(uintptr_t possess) {
+    if (!possess) return false;
+    static bool installed = false;
+    if (installed) return true;
+    if (DobbyHook(reinterpret_cast<void*>(possess),
+                  reinterpret_cast<dobby_dummy_func_t>(possess_keep_pawn),
+                  &s_possess_orig) != RT_SUCCESS) {
+        logger::log_error("CUTPAWN", "DobbyHook PossessPlayerPawn failed @0x%lX", (unsigned long)possess);
+        return false;
+    }
+    installed = true;
+    register_native_patch_toggle(
+        "re4.keep_pawn_in_cutscene",
+        "Keep YOUR pawn during cutscenes: redirect PossessPlayerPawn(cutscene=3) to your current pawn so the controller never hands off. Experimental — a scene may need its pawn.",
+        [](bool en) { g_keep_pawn_in_cutscene.store(en, std::memory_order_relaxed); return true; },
+        g_keep_pawn_in_cutscene.load(std::memory_order_relaxed));
+    logger::log_info("CUTPAWN", "PossessPlayerPawn keep-pawn block installed @0x%lX (toggle re4.keep_pawn_in_cutscene, default OFF)", (unsigned long)possess);
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CUTSCENE INPUT UNFREEZE — per frame, and ONLY when the scene isn't driving Leon
+// ═══════════════════════════════════════════════════════════════════════
+// SceEventStart @0x6190A30 calls KeyStop(0xF12000EFCF1000) @0x5FC249C, which
+// masks the live pad (xmmword_A562B48 / unk_A562B58 / qword_A562B68 &= mask),
+// parks the mask in qword_A5828C8 and sets
+//     pG+0x198 |= 0x80000000        <- "keys stopped"
+// That is the cutscene walk-freeze.
+//
+// But plenty of scenes SCRIPT Leon, and those must keep driving him — we do not
+// want to fight the cutscene for a character it is animating. SceEventStart
+// conveniently stashes his pre-scene state for us:
+//     dword_A5A3F38 = *(pPL+276)
+// and *(pPL+276) is exactly the index cPlayer::move dispatches through
+// Pl_func_tbl. So the scene tells us who owns Leon, for free:
+//     *(pPL+276) == dword_A5A3F38  -> scene has NOT taken him over -> give input back
+//     *(pPL+276) != dword_A5A3F38  -> scene IS animating him       -> hands off
+//
+// This runs PER FRAME from cPlayer::move rather than once from KeyStop, because
+// the SCE script switches his state AFTER the scene starts, and because the
+// freeze can be re-applied while the scene runs. Cost is a handful of loads on
+// a frame that is already doing far more. Default OFF; toggle from PCBridge.
+static dobby_dummy_func_t     s_keystop_orig = nullptr;
+static std::atomic<bool>      g_cutscene_unfreeze_input{true};   // default ON
+static std::atomic<uint32_t>  g_unfreeze_hits{0};    // KeyStop calls we neutralized
+
+// KeyStop returns int8x16_t in q0 — match it exactly or we corrupt the caller.
+static int8x16_t cutscene_unfreeze_keystop(uint64_t mask) {
+    if (g_cutscene_unfreeze_input.load(std::memory_order_relaxed)) {
+        uintptr_t b = symbols::lib_base();
+        if (b) {
+            // IsBio4EventPlaying @0x628B3F4 == BYTE2(dword_A5A3EFC) != 0.
+            // SceEventStart increments that counter BEFORE it calls KeyStop, so a
+            // cutscene's own KeyStop is caught here while every other caller
+            // (doors, death demos, messages, binoculars) is left alone.
+            uint8_t depth = *reinterpret_cast<volatile uint8_t*>(b + 0xA5A3EFCull + 2);
+            if (depth) {
+                mask = ~0ull;   // AND with all-ones == mask nothing out
+                g_unfreeze_hits.fetch_add(1, std::memory_order_relaxed);
+                if (cut_vlog_due(g_unfreeze_hits, 1))
+                    logger::log_info("CUTVRB", "unfreeze_input: neutralized KeyStop mask (hit #%u, evtDepth=%u)",
+                                     g_unfreeze_hits.load(std::memory_order_relaxed), (unsigned)depth);
+            }
+        }
+    }
+    // Always call through: the original still sets pG+0x198 |= 0x80000000, which
+    // is load-bearing scene state (ScenarioMove save/restores that field around
+    // its own KeyStop). We only ever change WHICH BITS get masked, never the flag.
+    return reinterpret_cast<int8x16_t (*)(uint64_t)>(s_keystop_orig)(mask);
+}
+
+uint32_t cutscene_input_unfreeze_count() {
+    return g_unfreeze_hits.load(std::memory_order_relaxed);
+}
+
+bool install_cutscene_input_unfreeze(uintptr_t keystop) {
+    if (!keystop) return false;
+    static bool installed = false;
+    if (installed) return true;
+    if (DobbyHook(reinterpret_cast<void*>(keystop),
+                  reinterpret_cast<dobby_dummy_func_t>(cutscene_unfreeze_keystop),
+                  &s_keystop_orig) != RT_SUCCESS) {
+        logger::log_error("CUTKEY", "DobbyHook KeyStop failed @0x%lX", (unsigned long)keystop);
+        return false;
+    }
+    installed = true;
+    register_native_patch_toggle(
+        "re4.cutscene_unfreeze_input",
+        "Walk during cutscenes: while a Bio4 event is playing, KeyStop masks nothing out (all-ones) so the pad survives. pG+0x198 is never touched, so the scene still runs. If the scene IS animating Leon his state machine ignores the stick anyway, so scripted scenes play normally.",
+        [](bool en) { g_cutscene_unfreeze_input.store(en, std::memory_order_relaxed); return true; },
+        g_cutscene_unfreeze_input.load(std::memory_order_relaxed));
+    logger::log_info("CUTKEY", "cutscene input-unfreeze installed on KeyStop @0x%lX (toggle re4.cutscene_unfreeze_input, default OFF)", (unsigned long)keystop);
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// FORCE CUTSCENE MODELS VISIBLE — cModel::UpdateVR4ModelVisibility @0x5F825A0
+// ═══════════════════════════════════════════════════════════════════════
+// Why the "3D cutscene" recipe went BLACK (verified on device 2026-07-21):
+// the theatre box is an ADDITIVE LEVEL — an unlit room containing a screen —
+// and the scene is composited ONTO that screen. Killing the screen
+// (forceScreenOff) leaves you standing in an empty dark room; blocking the box
+// leaves no geometry at all. Both are black, for different reasons. On top of
+// that, SceEventStart calls UpdateSuspendedVisibility (0x6289180), which walks
+// every AVR4Model and runs:
+//
+//   cModel::UpdateVR4ModelVisibility(this):
+//       v2 = (*(this->vtable + 80))(this);        // per-model visibility predicate
+//       AVR4Model::SetModelVisibility(this, v2 & 1);
+//
+// During the suspend that predicate returns HIDDEN for the world, so with the
+// screen off there is literally nothing left to draw.
+//
+// So step one of any true in-world 3D cutscene is making the actors RENDER.
+// We let the original run (normal predicate, normal bookkeeping) and then, only
+// while a Bio4 event is playing, re-assert visibility. We mimic the ORIGINAL's
+// own call site ABI (x0 = cModel*, x1 = bool) rather than IDA's prototype for
+// AVR4Model::SetModelVisibility, which disagrees with the actual call.
+//
+// This alone does NOT produce 3D — you would still be inside the theatre room.
+// It is the prerequisite: prove the suspended actors can be made to render.
+// Default OFF. Toggle from PCBridge: re4.cutscene_force_models_visible.
+static dobby_dummy_func_t     s_updvis_orig = nullptr;
+static std::atomic<bool>      g_force_cutscene_models_visible{true};   // default ON
+static std::atomic<uint32_t>  g_forced_vis_calls{0};
+// Hide our gameplay Leon/Ashley during a scene (the scene has its own copies).
+// ⚠ DEFAULT OFF. This was ON, on the theory that the duplicates are always wrong.
+// They are not: in scenes the game animates OUR Leon directly (door kicks, the
+// prologue), and hiding him makes the character vanish mid-scene — reported live
+// 2026-07-21 ("on some cutscenes like kicking doors the whole char is invisible").
+// The hat-in-camera problem it was meant to solve is a DIFFERENT cause: clearing
+// pG[0x50AF]&0x10 (see unlock_gameloop LAYER 2) removes the engine's own
+// draw-during-suspend filter, so every model draws — ours included.
+static std::atomic<bool>      g_hide_dupes{false};
+
+static uint64_t updvis_force_visible(void* self) {
+    uint64_t r = reinterpret_cast<uint64_t (*)(void*)>(s_updvis_orig)(self);
+    if (self && g_force_cutscene_models_visible.load(std::memory_order_relaxed)) {
+        uintptr_t b = symbols::lib_base();
+        if (b) {
+            // DO NOT force-reveal anything sitting ON the player.
+            //
+            // This patch reveals every model the suspend hid — which also reveals
+            // head-attached props (the HAT) that the game culls on purpose in
+            // first person. The camera lives inside Leon's head, so a revealed hat
+            // renders straight across the view and reads as a black/blocked screen.
+            //
+            // Leon's body itself is NOT the problem and stays visible (the user
+            // wants to see him). We only skip models co-located with him — i.e.
+            // worn/attached items — using a small radius around his position.
+            // Scene actors are metres away and unaffected.
+            // HIDE OUR TWO GAMEPLAY CHARACTERS — the scene spawns its OWN copies.
+            //
+            // During a cutscene you end up looking at duplicates: the scripted
+            // Leon/Ashley that the scene animates, PLUS our gameplay pPL/pSUB
+            // standing in the same shot (and the hat, which rides the gameplay
+            // Leon's head right where the camera is). The scene's actors are the
+            // ones that should play, so our pair get hidden outright.
+            //
+            // Cheap identity compares only — no per-model distance math, which was
+            // costing frame time on every model every frame.
+            uintptr_t ppl   = *reinterpret_cast<volatile uintptr_t*>(b + 0xA54AB40ull);
+            uintptr_t psub  = *reinterpret_cast<volatile uintptr_t*>(b + 0xA54AB48ull);
+            uintptr_t psub2 = *reinterpret_cast<volatile uintptr_t*>(b + 0xA54AB50ull);
+            uintptr_t s = reinterpret_cast<uintptr_t>(self);
+            if ((ppl && s == ppl) || (psub && s == psub) || (psub2 && s == psub2)) {
+                if (g_hide_dupes.load(std::memory_order_relaxed)) {
+                    // force HIDDEN, not just "leave alone"
+                    reinterpret_cast<void (*)(void*, uint64_t)>(b + 0x63790FCull)(self, 0ull);
+                }
+                return r;
+            }
+            // IsBio4EventPlaying == BYTE2(dword_A5A3EFC) != 0 — cutscene only.
+            uint8_t depth = *reinterpret_cast<volatile uint8_t*>(b + 0xA5A3EFCull + 2);
+            if (depth) {
+                reinterpret_cast<void (*)(void*, uint64_t)>(b + 0x63790FCull)(self, 1ull);
+                g_forced_vis_calls.fetch_add(1, std::memory_order_relaxed);
+                if (cut_vlog_due(g_forced_vis_calls, 2000))
+                    logger::log_info("CUTVRB", "force_models_visible: re-asserted visible (call #%u)",
+                                     g_forced_vis_calls.load(std::memory_order_relaxed));
+            }
+        }
+    }
+    return r;
+}
+
+uint32_t cutscene_forced_visible_count() {
+    return g_forced_vis_calls.load(std::memory_order_relaxed);
+}
+
+bool install_cutscene_force_models_visible(uintptr_t updvis) {
+    if (!updvis) return false;
+    static bool installed = false;
+    if (installed) return true;
+    if (DobbyHook(reinterpret_cast<void*>(updvis),
+                  reinterpret_cast<dobby_dummy_func_t>(updvis_force_visible),
+                  &s_updvis_orig) != RT_SUCCESS) {
+        logger::log_error("CUTVIS", "DobbyHook UpdateVR4ModelVisibility failed @0x%lX", (unsigned long)updvis);
+        return false;
+    }
+    installed = true;
+    register_native_patch_toggle(
+        "re4.cutscene_force_models_visible",
+        "Make suspended models RENDER during a cutscene: after UpdateVR4ModelVisibility runs, re-assert SetModelVisibility(model,true) while a Bio4 event is playing. Prerequisite for in-world 3D (the theatre box is an unlit room + screen; killing the screen alone = black). Experimental.",
+        [](bool en) { g_force_cutscene_models_visible.store(en, std::memory_order_relaxed); return true; },
+        g_force_cutscene_models_visible.load(std::memory_order_relaxed));
+    logger::log_info("CUTVIS", "cutscene force-models-visible installed @0x%lX (toggle re4.cutscene_force_models_visible, default OFF)", (unsigned long)updvis);
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// DRIVE LEON DURING A CUTSCENE — AVR4CutscenePlayerPawn::PostBio4Tick @0x628F550
+// ═══════════════════════════════════════════════════════════════════════
+// The cutscene "lock" is NOT input (proven: unmasking the pad and clearing
+// pG+0x198 both did nothing). cPlayer::move (0x5FDF970) simply DOES NOT RUN —
+// active probe: a sentinel written to pPL+2528 (a byte move zeroes every frame)
+// survived 300+ frames. The gate is pG+0x50AC bit 0x10000000; clearing it does
+// resume him, but it un-suspends the WHOLE world and the SCE script — which
+// assumes it is the only thing ticking — loses its scripted beats (a door scene's
+// door never opened). So we must NOT touch that flag.
+//
+// Instead: leave the suspend completely alone and drive Leon ourselves.
+// AVR4CutscenePlayerPawn::PostBio4Tick provably runs every frame of a cutscene
+// (it is what computes screenOn and calls UpdateCamera), so from its post edge we
+// call cPlayer::move(pPL) directly. The world stays suspended, the script keeps
+// its exclusive ownership, and only the player updates.
+//
+// cPlLeon::move (0x5FF3480) is a 0x24-byte wrapper that just calls cPlayer::move,
+// so calling the base directly is equivalent for movement.
+//
+// Pair with re4.cutscene_unfreeze_input — KeyStop masked the pad, so without that
+// Leon will tick but read no stick. Default OFF; toggle from PCBridge.
+static dobby_dummy_func_t     s_postbio4_orig = nullptr;
+static std::atomic<bool>      g_drive_player_in_cutscene{false};
+static std::atomic<uint32_t>  g_driven_frames{0};
+
+// Also drive every OTHER entity so the scene's NPCs animate instead of standing
+// idle. Same root cause as Leon: nothing calls their move(). IDA gives the slot —
+// the cEm/cModel vtable is [0]=? [1]=? [2]=cUnit::beginEvent [3]=cUnit::endEvent
+// [4]=? [5]=move, i.e. move is at vtable+40. The entity list is the same array
+// SceEventStart walks to suspend them:
+//     base   = *(b + 0xA54AB70)
+//     packed = *(b + 0xA54AB78)   low dword = COUNT, high dword = STRIDE
+//     live entry when (*(uint32*)(obj + 8) & 0x201) == 1
+// Leon is skipped (drive_player already moves him, and double-moving him would
+// advance his state machine twice per frame).
+static std::atomic<bool>      g_drive_entities_in_cutscene{false};
+static std::atomic<uint32_t>  g_driven_entities{0};
+
+static void drive_cutscene_entities(uintptr_t b, uintptr_t ppl) {
+    uintptr_t base   = *reinterpret_cast<volatile uintptr_t*>(b + 0xA54AB70ull);
+    uint64_t  packed = *reinterpret_cast<volatile uint64_t*>(b + 0xA54AB78ull);
+    if (!base) return;
+    uint32_t count  = static_cast<uint32_t>(packed);
+    uint32_t stride = static_cast<uint32_t>(packed >> 32);
+    if (!count || !stride || count > 4096 || stride > 0x10000) return;   // sanity
+    for (uint32_t i = 0; i < count; ++i) {
+        uintptr_t obj = base + static_cast<uintptr_t>(stride) * i;
+        if (obj == ppl) continue;                       // Leon: drive_player owns him
+        uint32_t flags = *reinterpret_cast<volatile uint32_t*>(obj + 8);
+        if ((flags & 0x201u) != 1u) continue;           // same liveness test SceEventStart uses
+        uintptr_t vt = *reinterpret_cast<volatile uintptr_t*>(obj);
+        if (!vt) continue;
+        uintptr_t mv = *reinterpret_cast<volatile uintptr_t*>(vt + 40);   // vtable+40 = move()
+        if (!mv) continue;
+        reinterpret_cast<void (*)(void*)>(mv)(reinterpret_cast<void*>(obj));
+        g_driven_entities.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// DRIVE LEON FROM THE PAWN'S OWN MOVEMENT UPDATE
+// ═══════════════════════════════════════════════════════════════════════
+// Hooked on AVR4Bio4PlayerPawn::UpdateMovement(this, dt) @0x6264140.
+//
+// PROVEN LIVE (depth=1, st=5, 2026-07-21): calling UpdateMovement alone moved
+// Leon ZERO. Calling UpdateMovement + cPlayer::move 30x moved him
+// -8176.45 -> -8176.29. Both halves are required:
+//
+//   stick -> UpdateMovement -> UpdateFirstPersonMovement   (sets movement INTENT)
+//                           -> cPlayer::move               (APPLIES it) <- suspended
+//
+// The stick itself comes from UE, not the RE4 pad: GetMovementInput reads
+// UInputComponent::GetAxisKeyValue(pawn+248, EKeys::OculusTouch_*_Thumbstick_X/Y).
+// The legacy pad (WPadMode/kpads/analog) is permanently 0 in this port, which is
+// why KPadRead and every mask patch were dead ends.
+//
+// This is the RIGHT hook site because it is the GAMEPLAY pawn's own update, so it
+// runs exactly when keep_pawn_in_cutscene keeps you in your own pawn — unlike the
+// cutscene pawn's PostBio4Tick, which goes silent the moment possession is blocked.
+static dobby_dummy_func_t s_updmove_orig = nullptr;
+
+static void updatemovement_drive_player(void* self, float dt) {
+    reinterpret_cast<void (*)(void*, float)>(s_updmove_orig)(self, dt);   // sets intent
+    if (!g_drive_player_in_cutscene.load(std::memory_order_relaxed)) return;
+    uintptr_t b = symbols::lib_base();
+    if (!b) return;
+    uint8_t depth = *reinterpret_cast<volatile uint8_t*>(b + 0xA5A3EFCull + 2);
+    if (!depth) return;                       // gameplay: the engine ticks him itself
+    uintptr_t ppl = *reinterpret_cast<volatile uintptr_t*>(b + 0xA54AB40ull);
+    if (!ppl) return;
+    reinterpret_cast<void (*)(void*)>(b + 0x5FDF970ull)(reinterpret_cast<void*>(ppl));  // APPLY
+    g_driven_frames.fetch_add(1, std::memory_order_relaxed);
+    if (cut_vlog_due(g_driven_frames, 300))
+        logger::log_info("CUTVRB", "drive_player(UpdateMovement): frame #%u st=%u/%u pos=%.1f,%.1f,%.1f",
+            g_driven_frames.load(std::memory_order_relaxed),
+            (unsigned)*reinterpret_cast<volatile uint8_t*>(ppl + 276),
+            (unsigned)*reinterpret_cast<volatile uint8_t*>(ppl + 277),
+            *reinterpret_cast<volatile float*>(ppl + 164),
+            *reinterpret_cast<volatile float*>(ppl + 168),
+            *reinterpret_cast<volatile float*>(ppl + 172));
+    if (g_drive_entities_in_cutscene.load(std::memory_order_relaxed))
+        drive_cutscene_entities(b, ppl);
+}
+
+bool install_drive_player_on_movement(uintptr_t updmove) {
+    if (!updmove) return false;
+    static bool installed = false;
+    if (installed) return true;
+    if (DobbyHook(reinterpret_cast<void*>(updmove),
+                  reinterpret_cast<dobby_dummy_func_t>(updatemovement_drive_player),
+                  &s_updmove_orig) != RT_SUCCESS) {
+        logger::log_error("CUTDRV", "DobbyHook Bio4PlayerPawn::UpdateMovement failed @0x%lX", (unsigned long)updmove);
+        return false;
+    }
+    installed = true;
+    logger::log_info("CUTDRV", "drive-player installed on Bio4PlayerPawn::UpdateMovement @0x%lX", (unsigned long)updmove);
+    return true;
+}
+
+static uint64_t postbio4_drive_player(void* self, float dt) {
+    uint64_t r = reinterpret_cast<uint64_t (*)(void*, float)>(s_postbio4_orig)(self, dt);
+    if (g_drive_player_in_cutscene.load(std::memory_order_relaxed)) {
+        uintptr_t b = symbols::lib_base();
+        if (b) {
+            // IsBio4EventPlaying == BYTE2(dword_A5A3EFC) != 0
+            uint8_t depth = *reinterpret_cast<volatile uint8_t*>(b + 0xA5A3EFCull + 2);
+            if (depth) {
+                uintptr_t ppl = *reinterpret_cast<volatile uintptr_t*>(b + 0xA54AB40ull);  // pPL
+                if (ppl) {
+                    // THE control fix: the pad is never SAMPLED during a scene (the
+                    // whole block 0xA562B40..0xA562BB8 reads 0x00000000 all scene —
+                    // measured). KPadRead composes the pad from the raw platform
+                    // globals (0xA5806C0 buttons, 0xA5806CC.. analog), which the UE
+                    // layer keeps writing because it never suspends. So sample it
+                    // ourselves, THEN move Leon — he reads real input and walks with
+                    // full collision + animation instead of ticking on a zero stick.
+                    reinterpret_cast<void (*)()>(b + 0x5FC1C3Cull)();      // KPadRead()
+                    reinterpret_cast<void (*)(void*)>(b + 0x5FDF970ull)(reinterpret_cast<void*>(ppl));
+                    g_driven_frames.fetch_add(1, std::memory_order_relaxed);
+                    if (cut_vlog_due(g_driven_frames, 300)) {
+                        // Report the pad AFTER KPadRead so we can see whether sampling
+                        // actually produced anything, plus Leon's state + position.
+                        uint32_t pad0 = *reinterpret_cast<volatile uint32_t*>(b + 0xA562B48ull);
+                        uint32_t pad1 = *reinterpret_cast<volatile uint32_t*>(b + 0xA562B4Cull);
+                        logger::log_info("CUTVRB",
+                            "drive_player: frame #%u  pad=%08X/%08X  st=%u/%u  pos=%.1f,%.1f,%.1f",
+                            g_driven_frames.load(std::memory_order_relaxed), pad0, pad1,
+                            (unsigned)*reinterpret_cast<volatile uint8_t*>(ppl + 276),
+                            (unsigned)*reinterpret_cast<volatile uint8_t*>(ppl + 277),
+                            *reinterpret_cast<volatile float*>(ppl + 164),
+                            *reinterpret_cast<volatile float*>(ppl + 168),
+                            *reinterpret_cast<volatile float*>(ppl + 172));
+                    }
+                    if (g_drive_entities_in_cutscene.load(std::memory_order_relaxed))
+                        drive_cutscene_entities(b, ppl);
+                }
+            }
+        }
+    }
+    return r;
+}
+
+uint32_t cutscene_driven_entity_count() {
+    return g_driven_entities.load(std::memory_order_relaxed);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// FORCE VR CONTROL — cPlayer::ArmVrHasControl @0x5FDF88C
+// ═══════════════════════════════════════════════════════════════════════
+// THE actual reason you cannot move in a cutscene. Measured live at depth=2:
+//     ArmVrHasControl = 0 · pG[0x50AE] bit0x20 = clear · ALLOW_MOVE = 0 · st = 5
+//
+// cPlayer::ArmVrAllowFirstPersonMovement is:
+//     ArmVrHasControl(this) && (pG[0x50AE] & 0x20) == 0
+// and the pG half PASSES. The whole block is ArmVrHasControl, which reads:
+//     v1 = *(this+276);                      // Leon's STATE
+//     if (*(this+2684) != v1) return 0;
+//     if (!v1 && (pG[0x50A8] & 0x1000)==0) { ... }   // <-- requires state == 0
+//     return 0;
+//
+// So the game REVOKES VR control by design whenever the scene owns the
+// character (scripted scenes put him in state 5; untouched scenes leave him at
+// 0). This is policy, not a bug — which is why nothing we did to input, masks,
+// KPadRead or the suspend ever mattered. Note the legacy pad path is dead in
+// this port anyway (WPadMode/kpads/analog all read 0 permanently), so the VR
+// layer feeds movement directly and this predicate is the only gate.
+//
+// When ON and a Bio4 event is playing, report "yes, you have control" so
+// first-person movement stays enabled through the scene.
+// ⚠ In a scene that ANIMATES Leon (state 5) you are now steering a character the
+// script is also driving — expect them to fight. In scenes that leave him at
+// state 0 (the "useless" overview ones) this is exactly the wanted behaviour.
+static dobby_dummy_func_t     s_hasctl_orig = nullptr;
+static std::atomic<bool>      g_force_vr_control{true};    // default ON — the movement gate
+static std::atomic<uint32_t>  g_forced_ctl{0};
+
+static uint64_t armvr_has_control_forced(void* self) {
+    if (g_force_vr_control.load(std::memory_order_relaxed)) {
+        uintptr_t b = symbols::lib_base();
+        if (b) {
+            uint8_t depth = *reinterpret_cast<volatile uint8_t*>(b + 0xA5A3EFCull + 2);
+            if (depth) {
+                g_forced_ctl.fetch_add(1, std::memory_order_relaxed);
+                if (cut_vlog_due(g_forced_ctl, 300))
+                    logger::log_info("CUTVRB", "force_vr_control: granting control (#%u, st=%u)",
+                                     g_forced_ctl.load(std::memory_order_relaxed),
+                                     self ? (unsigned)*reinterpret_cast<volatile uint8_t*>(
+                                                reinterpret_cast<uintptr_t>(self) + 276) : 0u);
+                return 1ull;
+            }
+        }
+    }
+    return reinterpret_cast<uint64_t (*)(void*)>(s_hasctl_orig)(self);
+}
+
+uint32_t cutscene_forced_control_count() {
+    return g_forced_ctl.load(std::memory_order_relaxed);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// SYNTHESISE THE TRIGGER EDGE — KeyTrg @0xA562B50
+// ═══════════════════════════════════════════════════════════════════════
+// Dry fire during cutscenes. Verified in IDA + live:
+//   TryFire   (0x62DC490): xmmword_A562B48 |= 0x80   -> LOW qword  = KeyOn (held)
+//   joyFireTrg(0x600A978): BYTE8(xmmword_A562B48)&0x80 -> HIGH qword = KeyTrg (edge)
+// Two different halves of the same 16-byte block. Measured in-scene:
+//   KeyOn=00800090 (fire bit SET) · KeyTrg=00000000 (edge NEVER set)
+// PreBio4Tick fills KeyTrg from UPlayerInput::WasJustPressed, which needs frame
+// history that does not advance during a scene — so the edge never happens and
+// the shot never fires. Two-handed guns are worst because they only use the edge.
+//
+// We rebuild the edge exactly as WasJustPressed would: bits that are set in
+// KeyOn this frame but were NOT set last frame become KeyTrg. Runs once per
+// ABio4::Tick, cutscene only, so gameplay input is never touched.
+static std::atomic<bool>      g_fire_edge{false};
+static std::atomic<uint32_t>  g_edges_made{0};
+
+// Find libOVRPlugin.so once by scanning /proc/self/maps (its symbols are not
+// exported by name). ovrp_GetControllerState6 lives at base + 0x176C40; the
+// struct is: +0 ConnectedControllers, +4 Buttons, +8 Touches, +12 NearTouches,
+// +16 IndexTrigger[2], +24 HandTrigger[2], +32 Thumbstick[2].
+static uintptr_t ovrp_base() {
+    static uintptr_t s_base = 0;
+    static bool s_tried = false;
+    if (s_tried) return s_base;
+    s_tried = true;
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "libOVRPlugin.so")) {
+            uintptr_t lo = 0;
+            if (sscanf(line, "%lx", (unsigned long*)&lo) == 1) {
+                if (!s_base || lo < s_base) s_base = lo;
+            }
+        }
+    }
+    fclose(f);
+    logger::log_info("CUTVRB", "libOVRPlugin.so base = 0x%lX", (unsigned long)s_base);
+    return s_base;
+}
+
+// THE FIRE EDGE, from the PHYSICAL trigger.
+//
+// My first attempt watched KeyOn's 0x80 bit — wrong signal. TryFire sets that
+// bit EVERY frame while merely aiming (`if (*(pPL+277)==6) KeyOn |= 0x80`), so it
+// is a level, never an edge, and `on & ~prev` was always 0. Measured: KeyOn
+// pinned at 00800090 with KeyTrg stuck at 0.
+//
+// joyFireTrg wants a real press, so take it from the controller itself and
+// derive the 0->1 there, then publish it as KeyTrg bit 0x80 (0xA562B50).
+static inline void synth_key_edge(uintptr_t b) {
+    uintptr_t ob = ovrp_base();
+    if (!ob) return;
+    alignas(8) unsigned char buf[512];
+    memset(buf, 0, sizeof(buf));
+    reinterpret_cast<int (*)(unsigned int, void*)>(ob + 0x176C40ull)(0x03u, buf);
+    float trigR = *reinterpret_cast<float*>(buf + 20);   // IndexTrigger[1] (right)
+    float trigL = *reinterpret_cast<float*>(buf + 16);   // IndexTrigger[0] (left)
+    float trig  = trigR > trigL ? trigR : trigL;
+
+    static bool s_prev_down = false;
+    bool down = trig > 0.55f;                            // pull threshold
+    bool rising = down && !s_prev_down;
+    s_prev_down = down;
+
+    if (rising) {
+        volatile uint64_t* keyTrg = reinterpret_cast<volatile uint64_t*>(b + 0xA562B50ull);
+        *keyTrg |= 0x80ull;                              // the bit joyFireTrg tests
+        g_edges_made.fetch_add(1, std::memory_order_relaxed);
+        if (cut_vlog_due(g_edges_made, 1))
+            logger::log_info("CUTVRB", "fire_edge: trigger %.2f -> KeyTrg |= 0x80 (#%u)",
+                             trig, g_edges_made.load(std::memory_order_relaxed));
+    }
+}
+
+uint32_t cutscene_fire_edge_count() {
+    return g_edges_made.load(std::memory_order_relaxed);
+}
+
+void set_cutscene_fire_edge(bool en) {
+    g_fire_edge.store(en, std::memory_order_relaxed);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// THE ACTUAL CUTSCENE BLOCKER — ABio4::spInstance[594]
+// ═══════════════════════════════════════════════════════════════════════
+// Everything else in this file that tried to give the player control during a
+// cutscene was aimed at the WRONG LAYER. ABio4::Tick @0x6206A98 runs the whole
+// RE4 engine main loop like this:
+//
+//     while ( !spInstance[594] || spInstance[595] )
+//         off_9D51DD8[ pG[0x24] ](...);      // <- gameMainLoop lives HERE
+//
+// During a cutscene spInstance[594] == 1 and [595] == 0, so `!1 || 0` is false
+// and THE LOOP BODY NEVER EXECUTES. gameMainLoop is never called, so none of its
+// contents run: not cPlayer::move, not cPlayer::ArmSuspendMove, not cEmMgr::move,
+// not the pad refill. That is why the player is frozen, why the pad reads
+// 0x00000000 (ABio4::Tick clears it every tick and only PreBio4Tick/gameMainLoop
+// refill it), and why firing is impossible (TryFire needs pPL+277==6, and no
+// state machine runs to reach it).
+//
+// PROVEN, not inferred (depth=2, 2026-07-21): sentinels were planted in BOTH
+// branches of gameMainLoop's player block — pPL+2528 (zeroed by cPlayer::move)
+// and pPL+2604 (set to 2 by ArmSuspendMove). NEITHER was touched, which is only
+// possible if the caller never ran. Clearing [594] made pPL+2528 go 171 -> 0
+// within 4s and the engine rewrote pPL+2604 — i.e. cPlayer::move resumed.
+//
+// So: while a Bio4 event is playing, clear the byte before ABio4::Tick reads it.
+// The engine sets it again itself, so we re-clear per frame rather than latch it,
+// and we never touch it outside a cutscene.
+static dobby_dummy_func_t     s_bio4tick_orig = nullptr;
+static std::atomic<bool>      g_unlock_gameloop{true};    // default ON — THE blocker
+static std::atomic<uint32_t>  g_unlock_hits{0};
+
+// ── Cutscene fade grace window (see the AVR4FadeManager section below) ───
+// Declared here because ABio4::Tick is the only per-FRAME hook we own, so it is
+// what ticks the window down. The fade hooks only READ it: decrementing on each
+// fade CALL made the window last for minutes (fades are rare) and swallowed
+// room-transition fades, which must keep working.
+static std::atomic<uint32_t>  g_fade_window{0};        // frames of grace remaining
+static constexpr uint32_t     kFadeWindowFrames = 180; // ~3s at 60fps
+// LAYER 4: rewrite the scripted player state 5 -> 0 during a scene.
+// ⚠ DEFAULT OFF — THIS PINS THE PLAYER. Tried 2026-07-21 as a collision fix on the
+// theory that state 0 is a "superset" of the scene handler. It is NOT: state 0 with
+// pPL+277 == 0 lands on Pl_func_move_tbl[0] = sub_5FDB9B4, the STAND-IDLE handler,
+// which moves nothing (cPlayer::checkCtrl is only a button-trigger check, not
+// locomotion). Result: "stuck in a pos whenever cutscenes happen". Reported live.
+// Leave OFF unless you have a better dispatch target than plMove 0.
+static std::atomic<bool>      g_normal_move_state{false};
+static std::atomic<uint32_t>  g_state_rewrites{0};
+
+static uint64_t bio4tick_unlock_gameloop(void* self, float dt) {
+    {
+        // ── Per-FRAME tick of the cutscene fade grace window ──────────────
+        // Runs regardless of g_unlock_gameloop: the fade suppression is its own
+        // feature and must not depend on the movement patch being enabled.
+        // While a scene plays, hold the window open; once it ends, count down so
+        // the trailing fade-out is eaten and NOTHING later is (room transitions
+        // keep their fade).
+        uintptr_t fb = symbols::lib_base();
+        if (fb) {
+            uint8_t d = *reinterpret_cast<volatile uint8_t*>(fb + 0xA5A3EFCull + 2);
+            if (d) {
+                g_fade_window.store(kFadeWindowFrames, std::memory_order_relaxed);
+            } else {
+                uint32_t w = g_fade_window.load(std::memory_order_relaxed);
+                if (w) g_fade_window.store(w - 1, std::memory_order_relaxed);
+            }
+        }
+    }
+    if (g_unlock_gameloop.load(std::memory_order_relaxed)) {
+        uintptr_t b = symbols::lib_base();
+        if (b) {
+            uint8_t depth = *reinterpret_cast<volatile uint8_t*>(b + 0xA5A3EFCull + 2);
+            if (depth) {
+                // ── LAYER 1: let the engine main loop run at all ──────────
+                uintptr_t sp = *reinterpret_cast<volatile uintptr_t*>(b + 0xA5B1860ull);  // ABio4::spInstance
+                if (sp) {
+                    volatile uint8_t* gate = reinterpret_cast<volatile uint8_t*>(sp + 594ull);
+                    if (*gate) *gate = 0;   // else the while-loop body never executes
+                }
+                // ── LAYER 2: inside gameMainLoop, take cPlayer::move, not ──
+                //             ArmSuspendMove:
+                //   if (pG[0x50AF]&0x10 && !(pPL[8]&0x800)) ArmSuspendMove();
+                //
+                // EITHER half skips ArmSuspendMove, but they are NOT equivalent.
+                // pPL[8] bit 0x800 means "Leon is RIDING something" — the same bit
+                // gates ArmUpdateRideTransform further down gameMainLoop:
+                //   if ((pPL[8]&0x20) && ((pG[0x50AF]&0x10)==0 || (pPL[8]&0x800)))
+                //       cPlayer::ArmUpdateRideTransform(pPL);
+                // Setting it told the engine his position comes from a ride, which
+                // DISABLED GROUND COLLISION — no stairs, no walls. (Reported live.)
+                //
+                // So clear the pG side instead: same branch, no ride semantics,
+                // collision intact.
+                uintptr_t pgv = *reinterpret_cast<volatile uintptr_t*>(b + 0xA456E48ull);
+                if (pgv) {
+                    volatile uint8_t* gate = reinterpret_cast<volatile uint8_t*>(pgv + 0x50AFull);
+                    if (*gate & 0x10u) *gate &= static_cast<uint8_t>(~0x10u);
+                }
+                // ── LAYER 3: rebuild the trigger EDGE so weapons actually fire ──
+                if (g_fire_edge.load(std::memory_order_relaxed)) synth_key_edge(b);
+
+                // ── LAYER 4: THE COLLISION FIX ────────────────────────────
+                // cPlayer::move dispatches Pl_func_tbl[pPL+276]. A scene sets
+                // state 5 (Pl_R0_Event), which sub-dispatches on pPL+277 into
+                // off_9D483A8. For the common case that lands on sub_5FED624:
+                //
+                //     if (!this[278]) this[278] = 1;
+                //     cModel::motionMove(this);        // animation ONLY
+                //
+                // It never reads the movement intent the pawn wrote to
+                // pPL+2592 (UpdateFirstPersonMovement's last act), and never
+                // runs a collision test. So during a scene your stick input is
+                // produced and then dropped — the VR rig keeps moving with
+                // NOTHING clamping it. That is the walk-through-walls bug.
+                //
+                // The normal state-0 handler (sub_5FDB9B4) for the same
+                // pPL+277 is a SUPERSET: same cModel::motionMove, PLUS
+                // cPlayer::actionSelect + cPlayer::checkCtrl — the control
+                // path that consumes the intent and collides it. So forcing
+                // state 0 during a scene keeps the animation and restores
+                // collision, rather than trading one for the other.
+                //
+                // Only rewrite 5 -> 0. Every other state (damage, death,
+                // ladders, QTE grabs) is left exactly as the scene set it.
+                if (g_normal_move_state.load(std::memory_order_relaxed)) {
+                    uintptr_t ppl = *reinterpret_cast<volatile uintptr_t*>(b + 0xA54AB40ull);
+                    if (ppl) {
+                        volatile uint8_t* st = reinterpret_cast<volatile uint8_t*>(ppl + 276ull);
+                        if (*st == 5u) {
+                            *st = 0u;
+                            g_state_rewrites.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+
+                g_unlock_hits.fetch_add(1, std::memory_order_relaxed);
+                if (cut_vlog_due(g_unlock_hits, 300))
+                    logger::log_info("CUTVRB", "unlock_gameloop: [594]=0 + pPL[8]|=0x800 (#%u, evtDepth=%u)",
+                                     g_unlock_hits.load(std::memory_order_relaxed), (unsigned)depth);
+            }
+        }
+    }
+    return reinterpret_cast<uint64_t (*)(void*, float)>(s_bio4tick_orig)(self, dt);
+}
+
+uint32_t cutscene_unlock_gameloop_count() {
+    return g_unlock_hits.load(std::memory_order_relaxed);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// cObjMgr::move NULL-VTABLE GUARD @0x5F89C8C — the price of unlock_gameloop
+// ═══════════════════════════════════════════════════════════════════════
+// unlock_gameloop makes gameMainLoop run during a scene. gameMainLoop calls
+// cObjMgr::move, which the engine NEVER runs mid-scene — so it happily calls
+// vtable[0] on objects the scene already tore down:
+//
+//   if ((flags & 0x400) != 0) {            // pending-destroy
+//       v3 = *(void***)obj;                // vtable  -> NULL
+//       *(DWORD*)(obj + 8) = 0;
+//       (*v3)();                           // BLR x8 -> PC = 0        ← SIGSEGV
+//   }
+//
+// Confirmed from tombstone_09 (2026-07-21): fault addr 0x0, PC 0x0, x8 = 0,
+//   #01 cObjMgr::move+52  #02 gameMainLoop+576  #03 ABio4::Tick+1032
+//   #04 native_hooks::bio4tick_unlock_gameloop+784      <- our patch, 4 frames down
+//
+// Fix: before the original runs, walk the pool and zero the flags of any
+// pending-destroy entry whose vtable is not a sane pointer. flags==0 fails the
+// original's `(v4 & 0x601) == 0` test, so it skips that slot entirely — the same
+// outcome the engine gets by never running this loop at all.
+//
+// ⚠ This hooks the FUNCTION ENTRY (0x5F89C8C), NOT the faulting BLR at +52.
+// Hooking the instruction itself smashes the frame: Dobby relocates a prologue,
+// and mid-function there is none -> SIGABRT 'stack corruption detected
+// (-fstack-protector)' (tombstone_10, same day).
+static dobby_dummy_func_t     s_objmgr_move_orig = nullptr;
+static std::atomic<bool>      g_objmgr_guard{true};
+static std::atomic<uint32_t>  g_objmgr_skips{0};
+
+static uint64_t objmgr_move_guard(void* self) {
+    if (self && g_objmgr_guard.load(std::memory_order_relaxed)) {
+        uintptr_t t = reinterpret_cast<uintptr_t>(self);
+        uintptr_t base   = *reinterpret_cast<volatile uintptr_t*>(t + 8);
+        uint32_t  count  = *reinterpret_cast<volatile uint32_t*>(t + 16);
+        uint32_t  stride = *reinterpret_cast<volatile uint32_t*>(t + 20);
+        // Sanity-bound the walk; a wild header must never turn into a wild loop.
+        if (base && count && stride && count <= 8192u && stride <= 0x8000u) {
+            for (uint32_t i = 0; i < count; ++i) {
+                uintptr_t e = base + static_cast<uintptr_t>(stride) * i;
+                uint32_t fl = *reinterpret_cast<volatile uint32_t*>(e + 8);
+                if ((fl & 0x400u) == 0) continue;              // not pending-destroy
+                uintptr_t vt = *reinterpret_cast<volatile uintptr_t*>(e);
+                if (vt >= 0x1000ull) continue;                 // plausible vtable: leave it
+                *reinterpret_cast<volatile uint32_t*>(e + 8) = 0;   // make the original skip it
+                uint32_t n = g_objmgr_skips.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n <= 4 || (n % 256) == 0)
+                    logger::log_info("OBJMGR", "skipped pending-destroy slot %u with null vtable (#%u)",
+                                     i, n);
+            }
+        }
+    }
+    return reinterpret_cast<uint64_t (*)(void*)>(s_objmgr_move_orig)(self);
+}
+
+uint32_t objmgr_guard_skip_count() {
+    return g_objmgr_skips.load(std::memory_order_relaxed);
+}
+
+bool install_objmgr_move_guard(uintptr_t move_fn) {
+    if (!move_fn || s_objmgr_move_orig) return false;
+    if (DobbyHook(reinterpret_cast<void*>(move_fn),
+                  reinterpret_cast<dobby_dummy_func_t>(objmgr_move_guard),
+                  &s_objmgr_move_orig) != 0) {
+        logger::log_error("OBJMGR", "failed to hook cObjMgr::move @0x%lX", (unsigned long)move_fn);
+        return false;
+    }
+    register_native_patch_toggle(
+        "re4.objmgr_move_guard",
+        "cObjMgr::move null-vtable guard. unlock_gameloop makes gameMainLoop run during "
+        "a scene, and cObjMgr::move then calls vtable[0] on objects the scene tore down "
+        "(PC=0 crash, tombstone_09). Zeroes the flags of pending-destroy slots with a null "
+        "vtable so the original skips them. Keep ON whenever unlock_gameloop is on.",
+        [](bool en) { g_objmgr_guard.store(en, std::memory_order_relaxed); return true; },
+        g_objmgr_guard.load(std::memory_order_relaxed));
+    logger::log_info("OBJMGR", "cObjMgr::move null-vtable guard installed @0x%lX (default ON)",
+                     (unsigned long)move_fn);
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// SUPPRESS THE BLACK FADE INTO/OUT OF A CUTSCENE — FadeSet @0x5F39930
+// ═══════════════════════════════════════════════════════════════════════
+// Entering a scene the game fades the screen to opaque black and back, e.g.
+//     FadeSet(0, 0, 0xFF000000, 0, 0, 0)      // 0xFF000000 = black, full alpha
+// which in VR is a jarring blink now that the scene plays in-world instead of
+// on a theatre screen (the fade existed to cover the hand-off TO that screen).
+//
+// We only swallow the fade while a Bio4 event is in play, so room transitions,
+// deaths and menu fades outside cutscenes behave exactly as stock. The call is
+// dropped entirely rather than forced transparent — FadeControl keeps driving
+// the fade state machine, it just never gets handed a black target from here.
+static dobby_dummy_func_t     s_fadeset_orig = nullptr;
+static std::atomic<bool>      g_no_cutscene_fade{true};   // default ON
+static std::atomic<uint32_t>  g_fades_killed{0};
+
+// ⚠ THE BOUNDARY PROBLEM. Gating purely on "a Bio4 event is playing" does NOT
+// work, and this is why the fade survived the first attempt (reported live
+// 2026-07-21: "Black fade in/out when a cutscene starts or ends").
+//
+// The fades BRACKET the scene — they exist precisely to cover the transition:
+//
+//      FadeSet(black)   <- fade IN,  evtDepth is still 0 here
+//      SceEventStart    -> evtDepth becomes non-zero
+//      ...scene plays...   (nothing fades during this part)
+//      SceEventEnd      -> evtDepth back to 0
+//      FadeSet(black)   <- fade OUT, evtDepth is 0 again
+//
+// So at the only two moments a fade actually fires, the old `if (depth)` test is
+// false and the fade passed straight through. The window below keeps suppression
+// alive for a while AFTER the scene (kills the fade-out) and SceEventStart opens
+// it early (kills the fade-in). Outside that window room transitions, deaths and
+// menu fades are untouched, which is the whole point of not just nuking FadeSet.
+void cutscene_open_fade_window() {
+    g_fade_window.store(kFadeWindowFrames, std::memory_order_relaxed);
+}
+
+static uint64_t fadeset_no_cutscene_fade(uint64_t a, uint64_t b1, uint64_t c,
+                                         uint64_t d, uint64_t e, uint64_t f) {
+    if (g_no_cutscene_fade.load(std::memory_order_relaxed)) {
+        uintptr_t b = symbols::lib_base();
+        if (b) {
+            uint8_t depth = *reinterpret_cast<volatile uint8_t*>(b + 0xA5A3EFCull + 2);
+            uint32_t win = g_fade_window.load(std::memory_order_relaxed);
+            // READ-ONLY: the window is ticked per FRAME in bio4tick, not here.
+            if (depth || win) {
+                g_fades_killed.fetch_add(1, std::memory_order_relaxed);
+                if (cut_vlog_due(g_fades_killed, 1))
+                    logger::log_info("CUTVRB", "no_fade: swallowed FadeSet (#%u, evtDepth=%u, window=%u)",
+                                     g_fades_killed.load(std::memory_order_relaxed),
+                                     (unsigned)depth, win);
+                return 0;   // drop the fade
+            }
+        }
+    }
+    return reinterpret_cast<uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t)>(
+               s_fadeset_orig)(a, b1, c, d, e, f);
+}
+
+uint32_t cutscene_fades_killed_count() {
+    return g_fades_killed.load(std::memory_order_relaxed);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// THE *VR* FADE — AVR4FadeManager @0x62B3A10 / 0x62B4998
+// ═══════════════════════════════════════════════════════════════════════
+// Hooking the legacy FadeSet @0x5F39930 did NOT remove the black fade (reported
+// live twice, 2026-07-21). FadeSet is the flat-screen/GameCube-era fade path.
+// The VR build has its OWN fade actor, AVR4FadeManager, whose Tick ->
+// UpdateFades -> UpdateInstanceFades blends a full-screen colour every frame.
+// A fade is CREATED by SetFade / SetTimedFade, so dropping those calls stops the
+// fade from ever existing, rather than fighting the per-frame blend.
+//
+// Gated by the same window as the legacy hook so only CUTSCENE fades die: room
+// transitions, deaths and menu fades outside the window are untouched.
+static dobby_dummy_func_t     s_vrsetfade_orig  = nullptr;
+static dobby_dummy_func_t     s_vrtimedfade_orig = nullptr;
+static std::atomic<uint32_t>  g_vr_fades_killed{0};
+
+// True while we should be eating cutscene fades: either an event is playing, or
+// we are inside the grace window that brackets it.
+//
+// ⚠ READ-ONLY. The window is ticked down once per FRAME in
+// bio4tick_unlock_gameloop, never here. Decrementing per fade-CALL was wrong:
+// fades are rare, so a 180-"frame" window would survive for minutes of gameplay
+// and start eating ROOM-TRANSITION fades, which must keep working ("i dont mind
+// the fade if is a level change" — 2026-07-21).
+static bool vr_fade_suppress_now() {
+    if (!g_no_cutscene_fade.load(std::memory_order_relaxed)) return false;
+    uintptr_t b = symbols::lib_base();
+    if (!b) return false;
+    uint8_t depth = *reinterpret_cast<volatile uint8_t*>(b + 0xA5A3EFCull + 2);
+    return depth != 0 || g_fade_window.load(std::memory_order_relaxed) != 0;
+}
+
+static uint64_t vr_setfade_suppress(void* self, void* ffade) {
+    if (vr_fade_suppress_now()) {
+        uint32_t n = g_vr_fades_killed.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 4 || (n % 64) == 0)
+            logger::log_info("CUTFADE", "swallowed AVR4FadeManager::SetFade (#%u)", n);
+        return 0;
+    }
+    return reinterpret_cast<uint64_t (*)(void*, void*)>(s_vrsetfade_orig)(self, ffade);
+}
+
+static uint64_t vr_timedfade_suppress(void* self, uint64_t a, uint64_t b1, uint64_t c,
+                                      uint64_t d, uint64_t e, uint64_t f, uint64_t g) {
+    if (vr_fade_suppress_now()) {
+        uint32_t n = g_vr_fades_killed.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 4 || (n % 64) == 0)
+            logger::log_info("CUTFADE", "swallowed AVR4FadeManager::SetTimedFade (#%u)", n);
+        return 0;
+    }
+    return reinterpret_cast<uint64_t (*)(void*, uint64_t, uint64_t, uint64_t,
+                                         uint64_t, uint64_t, uint64_t, uint64_t)>(
+               s_vrtimedfade_orig)(self, a, b1, c, d, e, f, g);
+}
+
+uint32_t cutscene_vr_fades_killed_count() {
+    return g_vr_fades_killed.load(std::memory_order_relaxed);
+}
+
+bool install_vr_fade_suppress(uintptr_t setfade, uintptr_t timedfade) {
+    static bool installed = false;
+    if (installed) return true;
+    bool any = false;
+    if (setfade && DobbyHook(reinterpret_cast<void*>(setfade),
+                             reinterpret_cast<dobby_dummy_func_t>(vr_setfade_suppress),
+                             &s_vrsetfade_orig) == RT_SUCCESS) {
+        any = true;
+        logger::log_info("CUTFADE", "AVR4FadeManager::SetFade hooked @0x%lX", (unsigned long)setfade);
+    }
+    if (timedfade && DobbyHook(reinterpret_cast<void*>(timedfade),
+                               reinterpret_cast<dobby_dummy_func_t>(vr_timedfade_suppress),
+                               &s_vrtimedfade_orig) == RT_SUCCESS) {
+        any = true;
+        logger::log_info("CUTFADE", "AVR4FadeManager::SetTimedFade hooked @0x%lX", (unsigned long)timedfade);
+    }
+    if (!any) {
+        logger::log_error("CUTFADE", "failed to hook any AVR4FadeManager fade entry");
+        return false;
+    }
+    installed = true;
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// PROMPTS/SUBTITLES: revive a garbage-collected floater @0x632CAC8
+// ═══════════════════════════════════════════════════════════════════════
+// AVR4InteractionManager::GetTextPromptUi lazily spawns the AVR4FloaterUI and
+// caches it in this[78] (+624):
+//
+//     result = this[78];
+//     if (result) goto LABEL_7;              // use the cache
+//     ... UWorld::SpawnActor(...); this[78] = result;
+//   LABEL_7:
+//     if (objflags & 0x20) return 0;         // pending-kill -> NULL
+//
+// The bug: when the cached floater is destroyed (cutscene pawn hand-off, level
+// streaming, GC), this[78] stays NON-NULL but points at a pending-kill object.
+// The cache test passes, LABEL_7 sees the kill flag and returns 0 — and the
+// stale pointer is NEVER cleared, so the lazy spawn can never run again.
+// GetTextPromptUi then returns NULL for the rest of the level, and both callers
+// silently do nothing:
+//     OnShowSceneMessage:   else if (v7) SetThoughtPrompt(...)      <- subtitles
+//     DisplayCommandPrompt: else if (v9) SetInteractionCommand(...) <- button prompts
+// That is "no subtitles / prompts not usable", and it is sticky.
+//
+// Fix: if the original returns NULL while the cache is non-null, the cache is
+// dead — clear it and call through again so the spawn path runs.
+static dobby_dummy_func_t     s_gettextprompt_orig = nullptr;
+static std::atomic<bool>      g_prompt_respawn{true};   // default ON
+static std::atomic<uint32_t>  g_prompt_respawns{0};
+
+static uint64_t gettextpromptui_respawn(void* self) {
+    uint64_t r = reinterpret_cast<uint64_t (*)(void*)>(s_gettextprompt_orig)(self);
+    if (!r && self && g_prompt_respawn.load(std::memory_order_relaxed)) {
+        uintptr_t t = reinterpret_cast<uintptr_t>(self);
+        volatile uintptr_t* cached = reinterpret_cast<volatile uintptr_t*>(t + 78ull * 8ull);
+        if (*cached) {
+            *cached = 0;   // drop the dead floater; the lazy spawn can run again
+            r = reinterpret_cast<uint64_t (*)(void*)>(s_gettextprompt_orig)(self);
+            uint32_t n = g_prompt_respawns.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 4 || (n % 64) == 0)
+                logger::log_info("CUTUI", "respawned dead floater UI (#%u) -> %s",
+                                 n, r ? "OK" : "still null");
+        }
+    }
+    return r;
+}
+
+uint32_t cutscene_prompt_respawn_count() {
+    return g_prompt_respawns.load(std::memory_order_relaxed);
+}
+
+bool install_prompt_ui_respawn(uintptr_t gettextpromptui) {
+    if (!gettextpromptui) return false;
+    static bool installed = false;
+    if (installed) return true;
+    if (DobbyHook(reinterpret_cast<void*>(gettextpromptui),
+                  reinterpret_cast<dobby_dummy_func_t>(gettextpromptui_respawn),
+                  &s_gettextprompt_orig) != RT_SUCCESS) {
+        logger::log_error("CUTUI", "DobbyHook GetTextPromptUi failed @0x%lX", (unsigned long)gettextpromptui);
+        return false;
+    }
+    installed = true;
+    register_native_patch_toggle(
+        "re4.cutscene_prompt_respawn",
+        "Fix missing SUBTITLES and BUTTON PROMPTS. GetTextPromptUi caches the AVR4FloaterUI "
+        "in this[78] and returns NULL forever once that actor is garbage-collected, because "
+        "the stale pointer is never cleared so the lazy spawn cannot re-run. Both "
+        "OnShowSceneMessage (subtitles) and DisplayCommandPrompt (button prompts) are "
+        "`else if (ui)` — a NULL ui silently draws nothing. This clears the dead cache and "
+        "respawns. OFF = stock behaviour (prompts stay dead after a GC).",
+        [](bool en) { g_prompt_respawn.store(en, std::memory_order_relaxed); return true; },
+        g_prompt_respawn.load(std::memory_order_relaxed));
+    logger::log_info("CUTUI", "prompt-UI respawn installed on GetTextPromptUi @0x%lX (default ON)",
+                     (unsigned long)gettextpromptui);
+    return true;
+}
+
+// ── SceEventStart: open the fade window at the scene boundary ────────────
+// evtDepth only goes non-zero INSIDE SceEventStart, so hooking its entry lets us
+// arm the window a beat earlier than the fade-suppression could otherwise see.
+static dobby_dummy_func_t s_sceevtstart_orig = nullptr;
+
+static uint64_t sceeventstart_open_fade_window(uint64_t a, uint64_t b1, uint64_t c, uint64_t d) {
+    cutscene_open_fade_window();
+    uint64_t r = reinterpret_cast<uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t)>(
+                     s_sceevtstart_orig)(a, b1, c, d);
+    cutscene_open_fade_window();   // and again on the way out
+    return r;
+}
+
+bool install_scene_start_fade_window(uintptr_t sceeventstart) {
+    if (!sceeventstart) return false;
+    static bool installed = false;
+    if (installed) return true;
+    if (DobbyHook(reinterpret_cast<void*>(sceeventstart),
+                  reinterpret_cast<dobby_dummy_func_t>(sceeventstart_open_fade_window),
+                  &s_sceevtstart_orig) != RT_SUCCESS) {
+        logger::log_error("CUTFADE", "DobbyHook SceEventStart failed @0x%lX", (unsigned long)sceeventstart);
+        return false;
+    }
+    installed = true;
+    logger::log_info("CUTFADE", "SceEventStart fade-window hook installed @0x%lX", (unsigned long)sceeventstart);
+    return true;
+}
+
+
+bool install_cutscene_no_fade(uintptr_t fadeset) {
+    if (!fadeset) return false;
+    static bool installed = false;
+    if (installed) return true;
+    if (DobbyHook(reinterpret_cast<void*>(fadeset),
+                  reinterpret_cast<dobby_dummy_func_t>(fadeset_no_cutscene_fade),
+                  &s_fadeset_orig) != RT_SUCCESS) {
+        logger::log_error("CUTFADE", "DobbyHook FadeSet failed @0x%lX", (unsigned long)fadeset);
+        return false;
+    }
+    installed = true;
+    register_native_patch_toggle(
+        "re4.cutscene_no_fade",
+        "Kill the black fade into/out of cutscenes. The fade existed to cover the hand-off to the 2D theatre screen; with scenes playing in-world it is just a blink. Only suppressed while a Bio4 event is playing — room transitions, deaths and menu fades are untouched.",
+        [](bool en) { g_no_cutscene_fade.store(en, std::memory_order_relaxed); return true; },
+        g_no_cutscene_fade.load(std::memory_order_relaxed));
+    logger::log_info("CUTFADE", "cutscene no-fade installed on FadeSet @0x%lX (toggle re4.cutscene_no_fade, default OFF)", (unsigned long)fadeset);
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// DETACH THE CAMERA FROM LEON — cPlayer::ArmUpdateRideTransform @0x5FE0134
+// ═══════════════════════════════════════════════════════════════════════
+// With the cutscene unlocked, Leon moves — but the VR camera is glued to his
+// head, so his own model renders through the view ("char overlapping over the
+// camera"). The user does NOT want him hidden; they want the camera pulled off
+// him so he is visible as a character while they move.
+//
+// cPlayer::ArmUpdateRideTransform is the FIRST thing cPlayer::move calls, and it
+// is where the VR rig is reconciled with Leon's transform each frame. Running it
+// and THEN offsetting the pawn gives us the last word without fighting the
+// Blueprint mid-frame (the mistake that caused the flashing with the free-cam).
+//
+// The offset is applied to the pawn via AVR4PlayerPawn::SetAnchorInternal using
+// the pawn's OWN current transform — we only translate it, never rebuild it, so
+// head-look stays free (the HMD is relative to the pawn).
+static dobby_dummy_func_t     s_ride_orig = nullptr;
+static std::atomic<bool>      g_cam_offset{false};
+static std::atomic<uint32_t>  g_cam_hits{0};
+// Metres behind / above Leon. Tunable live via set_cutscene_camera_offset().
+static std::atomic<int>       g_cam_back{200};   // world units behind
+static std::atomic<int>       g_cam_up{60};      // world units up
+
+void set_cutscene_camera_offset(int back, int up) {
+    g_cam_back.store(back, std::memory_order_relaxed);
+    g_cam_up.store(up, std::memory_order_relaxed);
+    logger::log_info("CUTCAM", "camera offset set: back=%d up=%d", back, up);
+}
+
+// Frozen anchor, captured on the scene-start edge and released when it ends.
+static float s_anchor[3] = {0, 0, 0};
+static bool  s_have_anchor = false;
+
+static uint64_t ride_transform_cam_offset(void* self) {
+    uint64_t r = reinterpret_cast<uint64_t (*)(void*)>(s_ride_orig)(self);
+    if (!g_cam_offset.load(std::memory_order_relaxed)) return r;
+    uintptr_t b = symbols::lib_base();
+    if (!b) return r;
+    uint8_t depth = *reinterpret_cast<volatile uint8_t*>(b + 0xA5A3EFCull + 2);
+    if (!depth) { s_have_anchor = false; return r; }   // scene over: release the freeze
+    uintptr_t spc = *reinterpret_cast<volatile uintptr_t*>(b + 0xA5DF9B8ull);
+    if (!spc) return r;
+    uint8_t pt = *reinterpret_cast<volatile uint8_t*>(spc + 0x5E0ull);
+    uintptr_t pawn = *reinterpret_cast<volatile uintptr_t*>(spc + 1416ull + 8ull * pt);
+    if (!pawn) return r;
+    uintptr_t ppl = *reinterpret_cast<volatile uintptr_t*>(b + 0xA54AB40ull);
+    if (!ppl) return r;
+
+    // RIDE ALONG, JUST NOT FROM INSIDE HIS HEAD.
+    //
+    // Scripted scenes MOVE Leon — walking, and sometimes warping him to another
+    // part of the level. The user wants to keep all of that (a minecart ride):
+    // wherever the scene takes him, the view goes too. The ONLY problem is that
+    // the VR rig sits exactly on him, so his own model renders through the
+    // camera. So we do not reject teleports, freeze anything, or hide anything —
+    // we simply anchor the rig a short distance BEHIND and ABOVE his current
+    // position every frame. He stays fully visible as a character in front of
+    // you, and any teleport carries you with him automatically because we track
+    // his live position.
+    //
+    // Rotation is left identity so the pawn keeps its yaw-flattened anchor
+    // behaviour and the HMD still supplies look direction — you can turn and
+    // watch him freely from the trailing camera.
+    float px = *reinterpret_cast<volatile float*>(ppl + 164);
+    float py = *reinterpret_cast<volatile float*>(ppl + 168);
+    float pz = *reinterpret_cast<volatile float*>(ppl + 172);
+
+    float back = static_cast<float>(g_cam_back.load(std::memory_order_relaxed));
+    float up   = static_cast<float>(g_cam_up.load(std::memory_order_relaxed));
+
+    alignas(16) float xf[12] = {0};
+    xf[0] = 0.0f; xf[1] = 0.0f; xf[2] = 0.0f; xf[3] = 1.0f;   // quat identity
+    xf[4] = px - back;                                        // trail behind
+    xf[5] = py;
+    xf[6] = pz + up;                                          // and a little above
+
+    reinterpret_cast<void (*)(void*, void*)>(b + 0x639A598ull)(   // SetAnchorInternal
+        reinterpret_cast<void*>(pawn), xf);
+
+    g_cam_hits.fetch_add(1, std::memory_order_relaxed);
+    if (cut_vlog_due(g_cam_hits, 300))
+        logger::log_info("CUTVRB", "ride_along: cam at %.0f,%.0f,%.0f (Leon %.0f,%.0f,%.0f, back=%d up=%d) #%u",
+                         xf[4], xf[5], xf[6], px, py, pz, (int)back, (int)up,
+                         g_cam_hits.load(std::memory_order_relaxed));
+    return r;
+}
+
+uint32_t cutscene_camera_offset_count() {
+    return g_cam_hits.load(std::memory_order_relaxed);
+}
+
+bool install_cutscene_camera_offset(uintptr_t ride) {
+    if (!ride) return false;
+    static bool installed = false;
+    if (installed) return true;
+    if (DobbyHook(reinterpret_cast<void*>(ride),
+                  reinterpret_cast<dobby_dummy_func_t>(ride_transform_cam_offset),
+                  &s_ride_orig) != RT_SUCCESS) {
+        logger::log_error("CUTCAM", "DobbyHook ArmUpdateRideTransform failed @0x%lX", (unsigned long)ride);
+        return false;
+    }
+    installed = true;
+    register_native_patch_toggle(
+        "re4.cutscene_fire_edge",
+        "Fix DRY FIRE in cutscenes. TryFire only sets KeyOn (held, low qword) but joyFireTrg tests KeyTrg (edge, BYTE8/0xA562B50) — and KeyTrg stays 0 all scene because WasJustPressed has no frame history. Rebuilds the 0->1 edge each tick exactly as WasJustPressed would. Two-handed guns need this most.",
+        [](bool en) { set_cutscene_fire_edge(en); return true; },
+        false);
+    register_native_patch_toggle(
+        "re4.cutscene_hide_dupes",
+        "Hide OUR gameplay Leon + Ashley during a cutscene. The scene spawns its own scripted copies, so without this you see two of each — and the hat rides our Leon's head right where the camera is. Only affects pPL/pSUB/pSUB2; the scene's actors are untouched.",
+        [](bool en) { g_hide_dupes.store(en, std::memory_order_relaxed); return true; },
+        g_hide_dupes.load(std::memory_order_relaxed));
+    register_native_patch_toggle(
+        "re4.cutscene_ride_along",
+        "Ride the cutscene instead of being welded inside Leon: anchors the VR rig a short distance behind/above his LIVE position every frame, so scripted walking AND teleports carry you along (minecart-style) while he stays fully visible in front of you. Hides nothing, blocks no movement. Tune with cutscene_cam back/up.",
+        [](bool en) { g_cam_offset.store(en, std::memory_order_relaxed); return true; },
+        false);
+    logger::log_info("CUTCAM", "cutscene ride-along camera installed on ArmUpdateRideTransform @0x%lX (toggle re4.cutscene_ride_along, default OFF)", (unsigned long)ride);
+    return true;
+}
+
+bool install_cutscene_unlock_gameloop(uintptr_t bio4tick) {
+    if (!bio4tick) return false;
+    static bool installed = false;
+    if (installed) return true;
+    if (DobbyHook(reinterpret_cast<void*>(bio4tick),
+                  reinterpret_cast<dobby_dummy_func_t>(bio4tick_unlock_gameloop),
+                  &s_bio4tick_orig) != RT_SUCCESS) {
+        logger::log_error("CUTLOOP", "DobbyHook ABio4::Tick failed @0x%lX", (unsigned long)bio4tick);
+        return false;
+    }
+    installed = true;
+    register_native_patch_toggle(
+        "re4.cutscene_unlock_gameloop",
+        "THE cutscene blocker. ABio4::Tick runs the engine main loop as `while(!spInstance[594] || spInstance[595])`, and a cutscene sets [594]=1 so the loop body — gameMainLoop, and therefore cPlayer::move, the pad refill and the whole state machine — NEVER RUNS. Clears that byte each frame while a Bio4 event plays, restoring movement and firing. Proven with sentinels in both gameMainLoop branches.",
+        [](bool en) { g_unlock_gameloop.store(en, std::memory_order_relaxed); return true; },
+        g_unlock_gameloop.load(std::memory_order_relaxed));
+    // THE COLLISION FIX — see LAYER 4 in bio4tick_unlock_gameloop.
+    register_native_patch_toggle(
+        "re4.cutscene_normal_move_state",
+        "THE CUTSCENE COLLISION FIX. A scene sets the player state (pPL+276) to 5, so "
+        "cPlayer::move dispatches Pl_R0_Event -> sub_5FED624, which only calls "
+        "cModel::motionMove (animation). That handler NEVER reads the movement intent the "
+        "pawn writes to pPL+2592 and NEVER runs a collision test, so the VR rig walks "
+        "through walls. The normal state-0 handler for the same pPL+277 is a superset: "
+        "same motionMove PLUS actionSelect + checkCtrl, which consume the intent and "
+        "collide it. This rewrites 5 -> 0 during a scene (only 5; damage/death/ladder "
+        "states are untouched). OFF = walk through walls again.",
+        [](bool en) { g_normal_move_state.store(en, std::memory_order_relaxed); return true; },
+        g_normal_move_state.load(std::memory_order_relaxed));
+    logger::log_info("CUTLOOP", "cutscene unlock-gameloop installed on ABio4::Tick @0x%lX (+ normal_move_state collision fix, both default ON)", (unsigned long)bio4tick);
+    return true;
+}
+
+bool install_force_vr_control(uintptr_t hasctl) {
+    if (!hasctl) return false;
+    static bool installed = false;
+    if (installed) return true;
+    if (DobbyHook(reinterpret_cast<void*>(hasctl),
+                  reinterpret_cast<dobby_dummy_func_t>(armvr_has_control_forced),
+                  &s_hasctl_orig) != RT_SUCCESS) {
+        logger::log_error("CUTCTL", "DobbyHook ArmVrHasControl failed @0x%lX", (unsigned long)hasctl);
+        return false;
+    }
+    installed = true;
+    register_native_patch_toggle(
+        "re4.force_vr_control",
+        "THE cutscene movement gate. cPlayer::ArmVrHasControl returns 0 whenever the scene owns Leon (it requires state==0; scripted scenes use state 5), and ArmVrAllowFirstPersonMovement is gated entirely on it. Force it true during a Bio4 event so first-person movement stays enabled. In scripted scenes you and the script will both drive him.",
+        [](bool en) { g_force_vr_control.store(en, std::memory_order_relaxed); return true; },
+        g_force_vr_control.load(std::memory_order_relaxed));
+    logger::log_info("CUTCTL", "force_vr_control installed on ArmVrHasControl @0x%lX (toggle re4.force_vr_control, default OFF)", (unsigned long)hasctl);
+    return true;
+}
+
+uint32_t cutscene_driven_frame_count() {
+    return g_driven_frames.load(std::memory_order_relaxed);
+}
+
+bool install_drive_player_in_cutscene(uintptr_t postbio4tick) {
+    if (!postbio4tick) return false;
+    static bool installed = false;
+    if (installed) return true;
+    if (DobbyHook(reinterpret_cast<void*>(postbio4tick),
+                  reinterpret_cast<dobby_dummy_func_t>(postbio4_drive_player),
+                  &s_postbio4_orig) != RT_SUCCESS) {
+        logger::log_error("CUTDRV", "DobbyHook PostBio4Tick failed @0x%lX", (unsigned long)postbio4tick);
+        return false;
+    }
+    installed = true;
+    register_native_patch_toggle(
+        "re4.drive_player_in_cutscene",
+        "Walk during cutscenes WITHOUT un-suspending the world: each frame of a Bio4 event call KPadRead() (the pad is never sampled during a scene - the whole block reads 0) then cPlayer::move(pPL). Leon gets REAL input and walks with collision+animation; the scene keeps exclusive world ownership so scripted beats survive.",
+        [](bool en) { g_drive_player_in_cutscene.store(en, std::memory_order_relaxed); return true; },
+        false);
+    register_native_patch_toggle(
+        "re4.cutscene_verbose",
+        "TEMPORARY instrumentation: log whether each cutscene patch actually fires (keep_pawn blocks, KeyStop neutralizations, forced-visible calls, and per-300-frames drive_player with live pad/state/pos). Rate-limited. Turn OFF when done — it writes to the log every scene.",
+        [](bool en) { g_cutscene_verbose.store(en, std::memory_order_relaxed); return true; },
+        false);
+    register_native_patch_toggle(
+        "re4.drive_entities_in_cutscene",
+        "Make the cutscene NPCs ANIMATE instead of standing idle: drive every live entity's move() (vtable+40) each cutscene frame, over the same list SceEventStart suspends (base *0xA54AB70, count/stride packed in *0xA54AB78, live when flags&0x201==1). Leon is skipped. Experimental - may fight scripted beats.",
+        [](bool en) { g_drive_entities_in_cutscene.store(en, std::memory_order_relaxed); return true; },
+        false);
+    logger::log_info("CUTDRV", "cutscene drive-player installed on PostBio4Tick @0x%lX (toggle re4.drive_player_in_cutscene, default OFF)", (unsigned long)postbio4tick);
     return true;
 }
 

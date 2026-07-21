@@ -258,6 +258,12 @@ local function applyBailPatch()
         LogWarn(TAG .. ": WriteU32 failed @ " .. ToHex(addr)); return false
     end
     bailApplied = true
+    -- Expose to PCBridge's native-patch registry for live per-patch toggling.
+    if RegisterNativePatch then
+        pcall(RegisterNativePatch, "re4.objectpool.loadrocket_bail",
+            TAG .. ": loadRocket null-bail (rocket pool-exhaustion crash fix)",
+            addr, BAIL_ORIG, BAIL_PATCH, true)
+    end
     Log(TAG .. ": PATCHED loadRocket+0xC8 @ " .. ToHex(addr)
         .. " — pool exhaustion now dry-fires instead of NULL-tail-calling")
     return true
@@ -267,6 +273,11 @@ local function restoreBailPatch()
     if not bailAddr or not bailApplied then return end
     if pcall(WriteU32, bailAddr, BAIL_ORIG) then
         bailApplied = false
+        if RegisterNativePatch then
+            pcall(RegisterNativePatch, "re4.objectpool.loadrocket_bail",
+                TAG .. ": loadRocket null-bail (rocket pool-exhaustion crash fix)",
+                bailAddr, BAIL_ORIG, BAIL_PATCH, false)
+        end
         Log(TAG .. ": RESTORED loadRocket+0xC8 (rocket launcher can crash again)")
     end
 end

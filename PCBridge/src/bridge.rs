@@ -28,6 +28,21 @@ fn default_true() -> bool {
     true
 }
 
+/// One entry in the modloader's native-patch registry (embedded C++ patches like
+/// the getPartsPtr guard, plus Lua-registered byte patches). Toggled live via
+/// `native_patch_set`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NativePatch {
+    pub id: String,
+    #[serde(default)]
+    pub desc: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub kind: String, // "bytes" | "toggle"
+    #[serde(default)]
+    pub addr: Option<String>,
+}
+
 /// A parsed bridge reply. `ok=false` carries the modloader's error string.
 pub struct Reply {
     pub ok: bool,

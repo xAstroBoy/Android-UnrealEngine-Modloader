@@ -3,7 +3,7 @@
 // and a Logs tab (live logcat + modloader stream with filters and auto-save).
 
 use crate::adb::{self, LogcatStream};
-use crate::bridge::ModEntry;
+use crate::bridge::{ModEntry, NativePatch};
 use crate::worker::{Job, JobResult, Worker, WorkerConfig};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Mods,
+    Patches,
     Objects,
     Lua,
     Bridge,
@@ -45,6 +46,12 @@ pub struct PcBridgeApp {
     mods: Vec<ModEntry>,
     busy_mods: HashSet<String>,
     busy_all: bool,
+    mod_search: String,
+
+    // ── native-patch registry (embedded + Lua patches, live toggle) ─────
+    patches: Vec<NativePatch>,
+    busy_patches: HashSet<String>,
+    patch_search: String,
     connected: Option<bool>,
     stats: Option<Value>,
     messages: Vec<(Instant, String)>, // newest last
@@ -115,6 +122,12 @@ impl PcBridgeApp {
         worker.post(Job::RefreshMods);
         worker.post(Job::RefreshStats);
         worker.post(Job::Bridge {
+            tag: "npatch".into(),
+            cmd: "native_patch_list".into(),
+            params: json!({}),
+            timeout_s: 6,
+        });
+        worker.post(Job::Bridge {
             tag: "help".into(),
             cmd: "help".into(),
             params: json!({}),
@@ -140,6 +153,10 @@ impl PcBridgeApp {
             mods: Vec::new(),
             busy_mods: HashSet::new(),
             busy_all: false,
+            mod_search: String::new(),
+            patches: Vec::new(),
+            busy_patches: HashSet::new(),
+            patch_search: String::new(),
             connected: None,
             stats: None,
             messages: Vec::new(),
@@ -298,6 +315,44 @@ impl PcBridgeApp {
                     Err(e) => format!("ERROR: {e}"),
                 };
             }
+            "npatch" => match result {
+                Ok(v) => {
+                    self.patches = serde_json::from_value(v).unwrap_or_default();
+                }
+                Err(e) => {
+                    // Old .so without the registry → command unknown. Keep quiet
+                    // unless the user is actually on the Patches tab.
+                    if self.tab == Tab::Patches {
+                        self.push_msg(format!("native_patch_list failed: {e}"));
+                    }
+                }
+            },
+            "npatch_set" => {
+                if let Some(id) = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|v| v.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                {
+                    self.busy_patches.remove(&id);
+                }
+                match result {
+                    Ok(v) => {
+                        let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+                        let en = v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false);
+                        self.push_msg(format!(
+                            "patch {id}: {}",
+                            if en { "ENABLED" } else { "DISABLED (original)" }
+                        ));
+                    }
+                    Err(e) => self.push_msg(format!("patch toggle FAILED: {e}")),
+                }
+                // On any toggle result, busy set may still hold stale ids if the
+                // reply lacked an id; clear conservatively and refresh the list.
+                self.busy_patches.clear();
+                self.post_bridge("npatch", "native_patch_list", json!({}), 6);
+            }
             "help" => {
                 if let Ok(Value::Array(arr)) = result {
                     self.bridge_cmd_list = arr
@@ -415,6 +470,19 @@ impl PcBridgeApp {
         }
     }
 
+    fn toggle_patch(&mut self, id: &str, currently_on: bool) {
+        if self.busy_patches.contains(id) {
+            return;
+        }
+        self.busy_patches.insert(id.to_string());
+        self.post_bridge(
+            "npatch_set",
+            "native_patch_set",
+            json!({ "id": id, "enabled": !currently_on }),
+            6,
+        );
+    }
+
     // ── logcat control ─────────────────────────────────────────────────
     fn logcat_args(&self) -> Vec<String> {
         match self.log_filter_mode {
@@ -498,6 +566,9 @@ impl eframe::App for PcBridgeApp {
             self.worker.post(Job::Ping);
             self.worker.post(Job::RefreshMods);
             self.worker.post(Job::RefreshStats);
+            if self.tab == Tab::Patches && self.busy_patches.is_empty() {
+                self.post_bridge("npatch", "native_patch_list", json!({}), 6);
+            }
         }
         // Keep the UI live while logcat streams in.
         if self.logcat.is_some() {
@@ -511,6 +582,7 @@ impl eframe::App for PcBridgeApp {
 
         match self.tab {
             Tab::Mods => self.mods_tab(ctx),
+            Tab::Patches => self.patches_tab(ctx),
             Tab::Objects => self.objects_tab(ctx),
             Tab::Lua => self.lua_tab(ctx),
             Tab::Bridge => self.bridge_tab(ctx),
@@ -538,6 +610,7 @@ impl PcBridgeApp {
 
                 ui.separator();
                 ui.selectable_value(&mut self.tab, Tab::Mods, "Mods");
+                ui.selectable_value(&mut self.tab, Tab::Patches, "Patches");
                 ui.selectable_value(&mut self.tab, Tab::Objects, "Objects");
                 ui.selectable_value(&mut self.tab, Tab::Lua, "Lua");
                 ui.selectable_value(&mut self.tab, Tab::Bridge, "Bridge");
@@ -550,6 +623,7 @@ impl PcBridgeApp {
                         self.worker.post(Job::Ping);
                         self.worker.post(Job::RefreshMods);
                         self.worker.post(Job::RefreshStats);
+                        self.post_bridge("npatch", "native_patch_list", json!({}), 6);
                     }
                     ui.checkbox(&mut self.auto_refresh, "auto");
                 });
@@ -659,6 +733,16 @@ impl PcBridgeApp {
                     ui.spinner();
                     ui.label("applying to all mods…");
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("✖").on_hover_text("clear search").clicked() {
+                        self.mod_search.clear();
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.mod_search)
+                            .hint_text("🔍 search mods")
+                            .desired_width(200.0),
+                    );
+                });
             });
             ui.separator();
 
@@ -684,7 +768,13 @@ impl PcBridgeApp {
             }
 
             // Snapshot rows so we don't borrow self.mods while mutating busy set.
-            let rows: Vec<ModEntry> = self.mods.clone();
+            let needle = self.mod_search.trim().to_lowercase();
+            let rows: Vec<ModEntry> = self
+                .mods
+                .iter()
+                .filter(|m| needle.is_empty() || m.name.to_lowercase().contains(&needle))
+                .cloned()
+                .collect();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 egui::Grid::new("mods_grid")
                     .num_columns(4)
@@ -756,6 +846,130 @@ impl PcBridgeApp {
                                     self.busy_mods.insert(m.name.clone());
                                     self.worker.post(Job::Unload(m.name.clone()));
                                 }
+                            });
+                            ui.end_row();
+                        }
+                    });
+            });
+        });
+    }
+
+    fn patches_tab(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong("Native patches");
+                ui.label(
+                    egui::RichText::new(
+                        "— embedded modloader hooks + Lua byte patches. Toggle OFF = restore the original game code.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("✖").on_hover_text("clear search").clicked() {
+                        self.patch_search.clear();
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.patch_search)
+                            .hint_text("🔍 search patches")
+                            .desired_width(200.0),
+                    );
+                });
+            });
+            ui.separator();
+
+            if self.patches.is_empty() {
+                ui.add_space(20.0);
+                ui.vertical_centered(|ui| match self.connected {
+                    Some(false) | None => {
+                        ui.label("No bridge connection.");
+                        ui.label(
+                            egui::RichText::new(
+                                "Launch the game with the modloader injected, then Refresh.",
+                            )
+                            .weak(),
+                        );
+                    }
+                    Some(true) => {
+                        ui.label("No native patches registered.");
+                        ui.label(
+                            egui::RichText::new(
+                                "If the game just launched, patches register as the level loads. \
+                                 An older modloader .so without the registry also shows empty here.",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                    }
+                });
+                return;
+            }
+
+            let needle = self.patch_search.trim().to_lowercase();
+            let rows: Vec<NativePatch> = self
+                .patches
+                .iter()
+                .filter(|p| {
+                    needle.is_empty()
+                        || p.id.to_lowercase().contains(&needle)
+                        || p.desc.to_lowercase().contains(&needle)
+                })
+                .cloned()
+                .collect();
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("patches_grid")
+                    .num_columns(4)
+                    .striped(true)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.strong("On");
+                        ui.strong("Patch");
+                        ui.strong("Kind / addr");
+                        ui.strong("Description");
+                        ui.end_row();
+
+                        for p in &rows {
+                            let busy = self.busy_patches.contains(&p.id);
+
+                            // Live toggle.
+                            let mut on = p.enabled;
+                            let cb = ui
+                                .add_enabled(!busy, egui::Checkbox::without_text(&mut on));
+                            if cb.clicked() {
+                                self.toggle_patch(&p.id, p.enabled);
+                            }
+
+                            // Id (+ spinner while a toggle is in flight).
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(&p.id).strong().monospace());
+                                if busy {
+                                    ui.spinner();
+                                }
+                            });
+
+                            // Kind + address.
+                            ui.horizontal(|ui| {
+                                let (col, txt) = if p.kind == "toggle" {
+                                    (egui::Color32::from_rgb(0x8a, 0x7a, 0xd0), "hook")
+                                } else {
+                                    (egui::Color32::from_rgb(0x50, 0x90, 0xc0), "bytes")
+                                };
+                                ui.colored_label(col, txt);
+                                if let Some(a) = &p.addr {
+                                    ui.label(egui::RichText::new(a).monospace().weak().small());
+                                }
+                            });
+
+                            // Description, plus a red flag when it's OFF (original).
+                            ui.horizontal(|ui| {
+                                if !p.enabled {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(0xd0, 0x70, 0x40),
+                                        "OFF (original)",
+                                    );
+                                }
+                                ui.label(egui::RichText::new(&p.desc).small());
                             });
                             ui.end_row();
                         }

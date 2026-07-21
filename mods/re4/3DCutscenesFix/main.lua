@@ -30,20 +30,30 @@ local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) 
 
 local state = {
     enabled         = true,
-    -- CORRECT 3D APPROACH (verified from libUE4.so decompilation, v14):
-    --   anchorToCamera = SetAnchorInternal(pawn, cutsceneCameraXform) each frame.
-    --   SetAnchorInternal → AActor::SetActorLocationAndRotation, so it MOVES your
-    --   VR view onto the cinematic camera. And StreamLoadTheatreBox loads the
-    --   theatre box with ULevelStreamingDynamic::LoadLevelInstance — an ADDITIVE
-    --   streaming level — so the real world stays loaded/rendered underneath.
-    --   ⇒ moving the view onto the camera shows the real 3D scene, NOT black.
-    -- This is why anchorToCamera is ON by default. The other two are the OLD,
-    -- WRONG approach: they remove the render surface WITHOUT moving you into the
-    -- scene → pure black. Left as opt-in for experimentation only; keep them OFF.
-    forceScreenOff  = false,  -- cutscene_screen  : (BLACK — do not use) force screenOn=false
-    blockTheatreBox = false,  -- cutscene_theatre : (BLACK — do not use) skip StreamLoadTheatreBox
-    anchorToCamera  = true,   -- cutscene_anchor  : SetAnchorInternal → cutscene camera (THE 3D fix)
-    autoQTE         = true,   -- auto-pass quick-time events
+    -- THE WORKING 3D APPROACH (v17 — user-verified on device):
+    --   Forcing the VR view to a POSITION inside the scene DOES render 3D — the
+    --   theatre box is viewable, not an unlit void. The old anchor put you at the
+    --   WIDE CINEMATIC CAMERA (feels wrong / far). The fix is anchorToCharacter:
+    --   place the view at LEON's world position each frame (keeping the cine yaw so
+    --   you face the action), so you ride along with him. Position comes from the
+    --   player pawn (VR4Bio4PlayerPawn:K2_GetActorLocation). We reuse the proven
+    --   SetAnchorInternal path by overwriting the cutscene camera's translation
+    --   (cam+0x10) with Leon's pos + offset just before the anchor call.
+    -- Tunables (live commands): cutscene_up/down (eye height), cutscene_back/fwd
+    --   (pull toward/away from the wide cam along the Leon→cam axis).
+    forceScreenOff    = true,   -- cutscene_screen : screenOn=0, kill the flat screen (needed)
+    blockTheatreBox   = false,  -- cutscene_theatre: keep OFF (additive box = world stays)
+    anchorToCamera    = false,  -- cutscene_anchor : wide cine-cam anchor (charFwd=0 == this)
+    anchorToCharacter = true,   -- cutscene_follow : ride the cine cam + push toward the subject
+    -- IMPORTANT: the cutscene actors live in the THEATRE-BOX space (where the cine
+    -- camera is), NOT where Leon's gameplay pawn stands — the main world is
+    -- suspended (dark) during a cutscene, so anchoring to the gameplay pawn = BLACK.
+    -- So we start at the cine-camera position (proven to render 3D) and move along
+    -- the camera's OWN forward vector toward whatever it is framing (Leon). charFwd=0
+    -- is exactly the wide cam; increase it to approach the character.
+    charFwd           = 0.0,    -- move toward the subject along the cine forward axis
+    charUp            = 0.0,    -- world Z nudge (raise/lower the eye)
+    autoQTE           = true,   -- auto-pass quick-time events
 }
 
 local saved = ModConfig.Load("3DCutscenesFix")
@@ -90,6 +100,26 @@ end
 
 if state.enabled and state.blockTheatreBox then applyTheatreBlock() end
 
+-- ── Leon's world position (for anchorToCharacter) ───────────────────────
+-- Cache the player pawn; re-find lazily if it goes invalid. One reflection
+-- read per cutscene frame (cutscene-only, not gameplay-hot). pcall-guarded so a
+-- bad read never faults the game thread.
+local cachedLeon = nil
+local function getLeonPos()
+    if not cachedLeon or not cachedLeon:IsValid() then
+        cachedLeon = nil
+        pcall(function()
+            local p = FindFirstOf("VR4Bio4PlayerPawn")
+            if p and p:IsValid() then cachedLeon = p end
+        end)
+    end
+    if not cachedLeon then return nil end
+    local loc
+    local ok = pcall(function() loc = cachedLeon:K2_GetActorLocation() end)
+    if ok and loc then return loc.X, loc.Y, loc.Z end
+    return nil
+end
+
 -- ═══════════════════════════════════════════════════════════════════════
 -- 2. THE 3D FIX — UpdateCamera(this=x0, const FTransform* cam=x1, float fov=d0,
 --    char screenOn=x2). UpdateCamera forwards to a Blueprint event that does the
@@ -115,10 +145,36 @@ if sym_UpdateCamera and not IsNull(sym_UpdateCamera) then
                 end
                 return self_ptr, cam_ptr, fov, screenOn
             end,
-            -- POST: anchor the VR view onto the cutscene camera AFTER the BP ran,
-            -- so it sticks (no per-frame fight → no flashing).
+            -- POST: place the VR view AFTER the BP ran so ours is the last write.
+            --   anchorToCharacter → overwrite the cutscene-camera translation
+            --     (cam+0x10) with LEON's world pos (+ up / back offsets along the
+            --     Leon→cam axis), then SetAnchorInternal → you ride Leon, facing the
+            --     cine yaw. This is the fix (was: sitting at the wide movie camera).
+            --   anchorToCamera → legacy: anchor straight to the cine camera.
             function(retval, self_ptr, cam_ptr, fov, screenOn)
-                if state.enabled and state.anchorToCamera and sym_SetAnchor and cam_ptr and cam_ptr ~= 0 then
+                if not (state.enabled and sym_SetAnchor and cam_ptr and cam_ptr ~= 0) then
+                    return retval
+                end
+                if state.anchorToCharacter then
+                    pcall(function()
+                        -- cine-cam FTransform: FQuat @ +0x00 (x,y,z,w), Translation @ +0x10
+                        local qx = ReadF32(Offset(cam_ptr, 0x00))
+                        local qy = ReadF32(Offset(cam_ptr, 0x04))
+                        local qz = ReadF32(Offset(cam_ptr, 0x08))
+                        local qw = ReadF32(Offset(cam_ptr, 0x0C))
+                        local cx = ReadF32(Offset(cam_ptr, 0x10))
+                        local cy = ReadF32(Offset(cam_ptr, 0x14))
+                        local cz = ReadF32(Offset(cam_ptr, 0x18))
+                        -- forward = quat * (1,0,0)  (UE X-forward). Move toward the framed subject.
+                        local fx = 1.0 - 2.0*(qy*qy + qz*qz)
+                        local fy = 2.0*(qx*qy + qw*qz)
+                        local fz = 2.0*(qx*qz - qw*qy)
+                        WriteF32(Offset(cam_ptr, 0x10), cx + fx * state.charFwd)
+                        WriteF32(Offset(cam_ptr, 0x14), cy + fy * state.charFwd)
+                        WriteF32(Offset(cam_ptr, 0x18), cz + fz * state.charFwd + state.charUp)
+                        CallNative(sym_SetAnchor, "vpp", self_ptr, cam_ptr)
+                    end)
+                elseif state.anchorToCamera then
                     pcall(function() CallNative(sym_SetAnchor, "vpp", self_ptr, cam_ptr) end)
                 end
                 return retval
@@ -210,6 +266,21 @@ RegisterCommand("cutscene_anchor", function()
     Notify(TAG, "Camera anchor " .. (state.anchorToCamera and "ON" or "OFF"))
 end)
 
+RegisterCommand("cutscene_follow", function()
+    state.anchorToCharacter = not state.anchorToCharacter
+    if state.anchorToCharacter then state.anchorToCamera = false end
+    save()
+    Log(TAG .. ": anchorToCharacter=" .. tostring(state.anchorToCharacter))
+    Notify(TAG, "Follow Leon " .. (state.anchorToCharacter and "ON" or "OFF"))
+end)
+
+-- Live position tuning (step size chosen for RE4 world units; adjust as needed).
+local STEP = 25.0
+RegisterCommand("cutscene_up",   function() state.charUp = state.charUp + STEP; save(); Notify(TAG, "eye height "..math.floor(state.charUp)) end)
+RegisterCommand("cutscene_down", function() state.charUp = state.charUp - STEP; save(); Notify(TAG, "eye height "..math.floor(state.charUp)) end)
+RegisterCommand("cutscene_fwd",  function() state.charFwd = state.charFwd + STEP; save(); Notify(TAG, "toward subject "..math.floor(state.charFwd)) end)
+RegisterCommand("cutscene_back", function() state.charFwd = state.charFwd - STEP; save(); Notify(TAG, "toward subject "..math.floor(state.charFwd)) end)
+
 RegisterCommand("cutscene_qte", function()
     state.autoQTE = not state.autoQTE
     save()
@@ -241,15 +312,32 @@ if SharedAPI and SharedAPI.DebugMenu then
     api.RegisterToggle("3DCutscenesFix_Theatre", "  ↳ Block Theatre Box",
         function() return state.blockTheatreBox end,
         function(v) state.blockTheatreBox = v; if state.enabled and v then applyTheatreBlock() else restoreTheatreBlock() end; save() end)
-    api.RegisterToggle("3DCutscenesFix_Anchor", "  ↳ Anchor To Camera",
+    api.RegisterToggle("3DCutscenesFix_Anchor", "  ↳ Anchor To Camera (wide/legacy)",
         function() return state.anchorToCamera end,
-        function(v) state.anchorToCamera = v; save() end)
+        function(v) state.anchorToCamera = v; if v then state.anchorToCharacter = false end; save() end)
+    api.RegisterToggle("3DCutscenesFix_Follow", "  ↳ Follow Leon (3D)",
+        function() return state.anchorToCharacter end,
+        function(v) state.anchorToCharacter = v; if v then state.anchorToCamera = false end; save() end)
+    -- Optional stepper buttons for live tuning if the menu API supports them.
+    if api.RegisterButton then
+        api.RegisterButton("3DCutscenesFix_Up",   "    · eye height +",      function() state.charUp = state.charUp + 25; save() end)
+        api.RegisterButton("3DCutscenesFix_Down", "    · eye height -",      function() state.charUp = state.charUp - 25; save() end)
+        api.RegisterButton("3DCutscenesFix_Fwd",  "    · toward subject +",  function() state.charFwd = state.charFwd + 25; save() end)
+        api.RegisterButton("3DCutscenesFix_Back", "    · toward subject -",  function() state.charFwd = state.charFwd - 25; save() end)
+    end
 end
 
-Log(TAG .. ": v14.0 loaded — TRUE 3D via anchorToCamera (SetAnchorInternal→SetActorLocationAndRotation"
-    .. " moves view onto cutscene camera; theatre box is ADDITIVE so world stays rendered → 3D not black)"
-    .. " + auto-QTE | anchor=" .. tostring(state.anchorToCamera)
-    .. " screenOff=" .. tostring(state.forceScreenOff) .. "(black,off)"
-    .. " theatreBlock=" .. tostring(state.blockTheatreBox) .. "(black,off)"
+-- NOTE: anchorToCharacter here moves along the cine-cam FORWARD axis only (stays
+-- in the valid theatre-box render space near the working camera — small, safe).
+-- Do NOT anchor to the gameplay pawn's world position: that is far outside the
+-- box in the suspended main world, and effects there crash MTXConcat/EspCommonTrans
+-- (tombstone_02). The accurate target is cutscene-Leon's ACTOR position IN the box
+-- (TODO: enumerate cutscene AVR4Models live and pick Leon).
+Log(TAG .. ": v18.0 loaded — 3D via cine-cam + forward push toward subject (safe, in-box);"
+    .. " gameplay-pawn teleport REMOVED (it crashed effects) | follow=" .. tostring(state.anchorToCharacter)
+    .. " fwd=" .. tostring(state.charFwd) .. " up=" .. tostring(state.charUp)
+    .. " screenOff=" .. tostring(state.forceScreenOff)
+    .. " anchorCam=" .. tostring(state.anchorToCamera)
     .. " camHook=" .. tostring(camHookInstalled)
-    .. " qte=" .. tostring(qteHookInstalled))
+    .. " qte=" .. tostring(qteHookInstalled)
+    .. " | tune: cutscene_fwd/back, cutscene_up/down, cutscene_follow")

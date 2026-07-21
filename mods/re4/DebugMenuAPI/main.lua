@@ -89,6 +89,24 @@ local _submenu_name  = nil
 local _building      = false   -- true while an explicit build runs → NewMenu PostHook stands down
 local RegisterBridgeCommand = rawget(_G, "RegisterBridgeCommand")
 
+-- ── AUTHORITATIVE MENU-OPEN STATE ───────────────────────────────────────
+-- DebugMenu_C is an ACTOR, not a UUserWidget (confirmed from the SDK: parent
+-- VR4DebugScreenActor -> Actor). So IsInViewport()/IsVisible() — the widget
+-- calls the old is_menu_open() used — DO NOT EXIST on it: dm:Call returns nil,
+-- is_menu_open fell through to "assume OPEN", and every gameplay trigger pull
+-- dispatched a confirm. That is the "fires when the menu is closed" bug.
+--
+-- The engine's own open/close pair are real UFunctions: OpenDebugMenu and
+-- HideDebugMenu. Track them explicitly — no flaky visibility query, no guessing.
+--
+-- ★ DEFAULT TRUE, on purpose. Default false BLOCKED the Mods page: if the mod
+-- (re)loads while the menu is already open, OpenDebugMenu already fired, the flag
+-- stayed false, and GATE 1 rejected the very confirm that opens Mods. Permissive
+-- is the safe default — the whole POINT of the pair is that HideDebugMenu now
+-- sets it false on close (the OLD code never detected close at all), so we still
+-- fix the "confirm fires during gameplay" bug without ever blocking legit use.
+local menu_open = true
+
 -- Root page — always exists, items are persistent (static)
 pages[MODS_ROOT_BYTE] = {
     name        = "Mods",
@@ -178,16 +196,24 @@ end
 --- UMG is authoritative here, so ask the widget: a closed menu is either not in
 --- the viewport or not visible.
 local function is_menu_open(dm)
-    if not dm then return false end
-    local ok1, inv = pcall(function() return dm:Call("IsInViewport") end)
-    if ok1 and type(inv) == "boolean" and not inv then return false end
-    local ok2, vis = pcall(function() return dm:Call("IsVisible") end)
-    if ok2 and type(vis) == "boolean" then return vis end
-    -- Neither query answered. Prefer the old permissive behaviour over a menu
-    -- that can never be used, but say so loudly — this is the gate that stops
-    -- gameplay trigger pulls from firing menu actions.
-    V("is_menu_open: no usable visibility query — assuming OPEN")
-    return true
+    -- DebugMenu_C is an ACTOR — IsInViewport/IsVisible do not exist on it and
+    -- dm:Call returned nil, so the old body always fell through to "assume OPEN"
+    -- and confirms fired during gameplay. The truth is the OpenDebugMenu /
+    -- HideDebugMenu hooks, tracked in `menu_open`.
+    --
+    -- Cross-check against the actor's real visibility when the engine will give
+    -- it to us: Actor::IsHidden returns true when the menu is torn down. If the
+    -- flag says open but the actor is hidden, believe the actor and correct the
+    -- flag (covers a close path that somehow skipped HideDebugMenu).
+    if dm then
+        local ok, hidden = pcall(function() return dm:Call("IsHidden") end)
+        if ok and type(hidden) == "boolean" then
+            if hidden and menu_open then menu_open = false end
+            if not hidden and not menu_open then menu_open = true end
+            return not hidden
+        end
+    end
+    return menu_open
 end
 
 --- Read CurrentIndex from DebugMenu_C.
@@ -662,11 +688,25 @@ local function setup_hooks()
     -- └─────────────────────────────────────────────────────────────────┘
     pcall(function()
         RegisterPostHook(DM_PATH .. ":OpenDebugMenu", function(self, func, parms)
+            menu_open = true            -- authoritative: the menu is now on screen
             Log("PostHook OpenDebugMenu FIRED — scheduling deferred injection")
             V("PostHook OpenDebugMenu fired — scheduling deferred injection")
             schedule_mods_injection()
         end)
         Log("PostHook: OpenDebugMenu → deferred 'Mods' injection (200/500/1000/2000ms)")
+    end)
+
+    -- ┌─────────────────────────────────────────────────────────────────┐
+    -- │ PostHook : HideDebugMenu — the CLOSE half of the open/close pair. │
+    -- │ Without this, menu_open stayed true after closing and every       │
+    -- │ gameplay trigger pull dispatched a confirm on the last item.      │
+    -- └─────────────────────────────────────────────────────────────────┘
+    pcall(function()
+        RegisterPostHook(DM_PATH .. ":HideDebugMenu", function(self, func, parms)
+            menu_open = false
+            V("PostHook HideDebugMenu — menu closed, confirms disarmed")
+        end)
+        Log("PostHook: HideDebugMenu → menu_open=false (confirms only fire while open)")
     end)
 
     -- ┌─────────────────────────────────────────────────────────────────┐

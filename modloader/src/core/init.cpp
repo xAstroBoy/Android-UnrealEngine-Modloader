@@ -22,6 +22,7 @@
 #include "modloader/class_rebuilder.h"
 #include "modloader/process_event_hook.h"
 #include "modloader/native_hooks.h"
+#include "modloader/re4_cutscene.h"
 #include "modloader/lua_engine.h"
 #include "modloader/mod_loader.h"
 #include "modloader/dotnet_host.h"
@@ -326,6 +327,42 @@ namespace init
         // Prevents early boot execution against Default__ objects and intro-time
         // freezes when mods mutate UI/game state before world readiness.
         wait_for_runtime_world(90000);
+
+        // ── RE4: getPartsPtr guard — the ENHANCED replacement ──────────────
+        // install_getpartsptr_guard now installs ONLY the getPartsPtr DobbyHook,
+        // whose getparts_safe is a FAITHFUL reproduction of the stock function
+        // (verified against the decompile: same a2<0→this, same *(v2+9)&0x20
+        // ARRAY (+496*a2), same LIST walk count, same head-null path). For every
+        // real model — Ashley, doors, carts — it returns EXACTLY what the game's
+        // own getPartsPtr would; the only added behaviour is a guarded fallback
+        // where the original would deref off the end and crash.
+        //
+        // The cSubChar::moveFace INSTRUMENT is NO LONGER installed (it was an
+        // inline probe on the per-frame sub-character update and was breaking
+        // Ashley's follow). See install_getpartsptr_guard.
+        if (game_profile::detected_game() == game_profile::GameID::RE4_VR)
+        {
+            uintptr_t b = symbols::lib_base();
+            if (b)
+            {
+                native_hooks::install_getpartsptr_guard(b + 0x5F81AFC);
+                logger::log_info("DEFER", "RE4 getPartsPtr enhanced replacement installed "
+                                          "(faithful; moveFace instrument NOT installed)");
+                // EspCommonTrans use-after-free guard — stops the MTXConcat
+                // SIGSEGV when an effect outlives its freed parent (tombstone_02/03).
+                native_hooks::install_esp_parent_guard(b + 0x5F14E7C);
+                // The cutscene subsystem (keep-pawn / input unfreeze / force models
+                // visible / drive player + entities). It owns its own RVA table and
+                // registers its own PCBridge toggles — see modloader/re4_cutscene.h
+                // for what a cutscene does to the game and why each patch exists.
+                re4_cutscene::install_all(b);
+            }
+            else
+            {
+                logger::log_error("DEFER", "RE4 getPartsPtr install skipped — lib_base unavailable");
+            }
+        }
+
         logger::log_info("DEFER", "Loading Lua mods (world gate passed or timed out)...");
         int mods_loaded = mod_loader::load_all();
         int mods_failed = mod_loader::failed_count();
@@ -568,6 +605,12 @@ namespace init
         logger::log_info("BOOT", "=== SESSION START ===");
         logger::log_info("BOOT", "UE ModLoader initializing");
         logger::log_info("BOOT", "Data dir: %s", paths::data_dir().c_str());
+
+        // NOTE: do NOT map page 0 here. Tried it — the process died immediately
+        // after "Data dir:", i.e. inside install_null_page_guard. ART uses
+        // implicit null checks (it relies on page 0 faulting and catches the
+        // SIGSEGV), so mapping it breaks the runtime itself. Kept the function
+        // for reference but it must never be called in an ART process.
 
         // ── Step 2.5: Detect game and load profile ──────────────────────────
         game_profile::init();

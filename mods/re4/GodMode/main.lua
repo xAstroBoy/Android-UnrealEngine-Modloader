@@ -72,7 +72,27 @@ local INSTAKILL_PATCHES = {
     { name = "PlSetDamage (const/event)",  mangled = "_Z11PlSetDamageiij17EActionCameraType",               fb = 0x05EEEE70 },
 }
 
+-- ⚠️ DISABLED — the `ret` patch on SetPlDamage/PlSetDamage is a WORLD-BREAKER.
+-- Verified in IDA (v9 diagnosis): these are NOT pure damage functions, they are
+-- the player-action STATE MACHINE:
+--   SetPlDamage: *(pPL+2605)=EActionCameraType; cPlayer::beginDamage(); *(pPL+276)=4
+--   PlSetDamage: *(pPL+2605)=camera; *(pPL+276)=2; *(pPL+1021)=0x80; (HP loss only if a2!=0)
+-- RE4 routes CONTEXT ACTIONS through here (ladder-climb, cart-shoot, door-kick,
+-- grabs). Overwriting the whole function with `ret` skips the state transition, so
+-- the player can't climb a ladder / kick a door / shoot a cart. Bisected live:
+-- restoring these two functions to stock instantly restored ladder use.
+-- The other layers (bCanBeDamaged=false + HurtPlayer/HurtAshley PreHook) still
+-- block normal damage. A proper insta-kill block needs to filter by action-type
+-- (block only lethal grab/chainsaw EActionCameraType, allow ladder/context types)
+-- or hook the HP-loss (cPlayer::setDamage @0x5FE83E0 / LifeDownSet2 player-target)
+-- WITHOUT touching the state setters — TODO, not the blunt whole-function ret.
+local ENABLE_INSTAKILL_BLOCK = false
+
 local function applyInstaKillPatch()
+    if not ENABLE_INSTAKILL_BLOCK then
+        Log(TAG .. ": insta-kill native block DISABLED (it broke ladder/cart/door — see note)")
+        return
+    end
     for _, p in ipairs(INSTAKILL_PATCHES) do
         pcall(function()
             local sym = Resolve(p.mangled, p.fb)

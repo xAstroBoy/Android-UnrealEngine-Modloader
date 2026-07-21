@@ -60,10 +60,24 @@ namespace mod_tracker
         {
             uintptr_t start = 0, end = 0;
             char perms[8] = {0};
-            if (sscanf(line, "%zx-%zx %7s", &start, &end, perms) < 3)
+            int consumed = 0;
+            if (sscanf(line, "%zx-%zx %7s %*x %*x:%*x %*u %n", &start, &end, perms, &consumed) < 3)
                 continue;
-            if (perms[2] == 'x')
-                s_exec_ranges.push_back({start, end});
+            if (perms[2] != 'x')
+                continue;
+            // ONLY file-backed executable mappings are code (real .so images).
+            // This engine also maps ANONYMOUS rwx regions and allocates game
+            // objects from them, so a heap object write would otherwise be
+            // mis-recorded as a "code patch" — and reload's restore/__clear_cache
+            // on that (by-then freed) heap faulted the game (tombstone_12,
+            // FireGrenadeLauncher reload). A pathname after the fields ('/...'
+            // or a '[name]') marks file/named mappings; bare anon has none.
+            const char *rest = (consumed > 0) ? line + consumed : "";
+            while (*rest == ' ' || *rest == '\t')
+                ++rest;
+            if (*rest != '/')
+                continue; // anon (incl. anon rwx heap) or [stack]/[anon:*] — not a module image
+            s_exec_ranges.push_back({start, end});
         }
         fclose(f);
     }
@@ -192,9 +206,34 @@ namespace mod_tracker
 
     static void restore_patch(const CodePatch &p)
     {
+        // Defense in depth: a recorded address may no longer be safely writable
+        // at teardown (module unmapped, or — pre-fix — a heap object that was
+        // mis-recorded and has since been freed/unmapped). Verify the exact
+        // range is still a live mapping via /proc/self/mem BEFORE touching it,
+        // so a stale record degrades to a skipped restore, never a SIGSEGV in
+        // __clear_cache that takes the whole game down on reload.
+        static int probe_fd = -1;
+        if (probe_fd < 0)
+            probe_fd = open("/proc/self/mem", O_RDWR);
+        if (probe_fd >= 0)
+        {
+            uint8_t tmp[16];
+            size_t n = p.original.size();
+            if (n == 0 || n > sizeof(tmp))
+                return;
+            if (pread64(probe_fd, tmp, n, (off64_t)p.addr) != (ssize_t)n)
+            {
+                logger::log_warn("MODTRK", "skip restore at 0x%zx — not mapped (stale record)", p.addr);
+                return;
+            }
+        }
         void *addr = reinterpret_cast<void *>(p.addr);
         void *page = reinterpret_cast<void *>(p.addr & ~0xFFFULL);
-        mprotect(page, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+        if (mprotect(page, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+        {
+            logger::log_warn("MODTRK", "skip restore at 0x%zx — mprotect failed", p.addr);
+            return;
+        }
         std::memcpy(addr, p.original.data(), p.original.size());
         __builtin___clear_cache(
             reinterpret_cast<char *>(addr),

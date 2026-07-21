@@ -14,6 +14,7 @@
 #include "modloader/class_rebuilder.h"
 #include "modloader/object_monitor.h"
 #include "modloader/symbols.h"
+#include "modloader/native_hooks.h"
 #include "modloader/safe_call.h"
 #include "modloader/logger.h"
 #include "modloader/paths.h"
@@ -355,6 +356,36 @@ namespace adb_bridge
             result.push_back(entry);
         }
         return ok_response(result);
+    }
+
+    // ── Native-patch registry: list + live toggle ──────────────────────────
+    // native_patch_list -> [{id,desc,enabled,kind,addr}]; native_patch_set flips
+    // one live (enable=apply patch/logic, disable=restore original). The setters
+    // are byte writes or atomic flips (thread-safe), so these run on the bridge
+    // thread directly — no game-thread queue needed.
+    static std::string handle_native_patch_list()
+    {
+        json arr = json::parse(native_hooks::native_patch_list_json(), nullptr, false);
+        if (arr.is_discarded())
+            return error_response("native_patch_list: internal JSON build failed");
+        return ok_response(arr);
+    }
+
+    static std::string handle_native_patch_set(const json &payload)
+    {
+        if (!payload.contains("id"))
+            return error_response("native_patch_set: missing 'id'");
+        if (!payload.contains("enabled"))
+            return error_response("native_patch_set: missing 'enabled' (bool)");
+        std::string id = payload["id"];
+        bool enabled = payload["enabled"].get<bool>();
+        std::string err;
+        if (!native_hooks::native_patch_set(id, enabled, err))
+            return error_response(err.empty() ? "native_patch_set failed" : err);
+        json r;
+        r["id"] = id;
+        r["enabled"] = enabled;
+        return ok_response(r);
     }
 
     // enable/disable/unload a single mod — must run on the game thread because
@@ -1133,6 +1164,10 @@ namespace adb_bridge
             return handle_mod_toggle(cmd, 2);
         if (command == "set_all_mods")
             return handle_set_all_mods(cmd);
+        if (command == "native_patch_list")
+            return handle_native_patch_list();
+        if (command == "native_patch_set")
+            return handle_native_patch_set(cmd);
         if (command == "exec_lua")
             return handle_exec_lua(cmd);
         if (command == "list_hooks")
@@ -1377,6 +1412,7 @@ namespace adb_bridge
             std::vector<std::string> built = {
                 "list_mods", "reload_mod", "load_mod",
                 "enable_mod", "disable_mod", "unload_mod", "set_all_mods",
+                "native_patch_list", "native_patch_set",
                 "exec_lua", "list_hooks",
                 "dump_sdk", "dump_ida", "mount_pak", "list_paks", "log_tail", "get_stats",
                 "find_object", "find_class", "list_classes", "class_counts",

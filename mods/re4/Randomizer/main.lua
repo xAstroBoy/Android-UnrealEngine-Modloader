@@ -1,4 +1,4 @@
--- mods/Randomizer/main.lua v12.9
+-- mods/Randomizer/main.lua v13.2
 -- ═══════════════════════════════════════════════════════════════════════
 -- UE4SS-enhanced Enemy Randomizer — re-randomizes on EVERY level load
 --
@@ -123,7 +123,15 @@ end
 -- and not a single enemy changed until you restarted the game with it already on.
 -- That is the "randomizer isn't randomizing even though it's on" bug: the switch
 -- was wired to a light that had been unplugged at boot.
-local INSTALL_HOOKS_WHEN_DISABLED = true
+-- ★ FALSE now. When true, this installed the native hooks on readEmList /
+-- EmSetFromList2 / EmSetEvent — the SCENARIO'S ENEMY-PLACEMENT PATH — even while
+-- the Randomizer was toggled OFF. That path is what places the escort Ashley
+-- (em id 3, via a scenario command), and with the hooks live on it she stopped
+-- being placed at all (her em-row was absent from EM_LIST; the door-kick and
+-- cart triggers that ride the same path broke too). "Off" must mean OFF: no hook
+-- on the placement path unless the user actually enables randomization
+-- (ensureHooksInstalled runs on the ON toggle). Do NOT set this back to true.
+local INSTALL_HOOKS_WHEN_DISABLED = false
 
 -- ── Pointer helpers ─────────────────────────────────────────────────
 -- Native hooks and CallNative with 'p' return pass lightuserdata (void*).
@@ -651,10 +659,38 @@ end
 -- Deliberately conservative: with no IsEmIdSupported binding we only verify the
 -- bytes exist, because assuming "unsupported" there would silently disable the
 -- whole mod rather than one enemy.
+-- ── PROVEN-BROKEN PICKS, LEARNED PER ROOM ───────────────────────────────
+-- This is NOT a pool restriction and NOT room-scoping. Every enemy stays
+-- eligible everywhere; nothing is capped, weighted or pre-filtered. An emId
+-- only lands here after it has ALREADY been tried in THIS room and observed to
+-- come up broken (see repairBrokenSpawns). Cleared on every level change, so a
+-- pick that fails in one room is fully eligible again in the next.
+--
+-- Without it the repair would be a treadmill: revert the row, the next spawn
+-- redraws the same broken enemy, revert again, forever.
+local badEmIdsThisRoom = {}
+local brokenRepairs    = 0
+
 local function pickIsUsable(e)
     if not e or not e.bytes then return false end
     local id = e.bytes[1]
     if id == nil then return false end
+    -- Proven broken in THIS room already — see badEmIdsThisRoom above.
+    if badEmIdsThisRoom[id] then return false end
+    -- ★ THE REAL GATE: can the engine actually LOAD this enemy's archive?
+    -- This is the same question cEmMgr::construct asks (EmReadSearch != 0)
+    -- moments later. If the answer is no, construct BAILS and leaves a cEm with
+    -- no model and no parts — which is what has been crashing in MotionMove /
+    -- calling a NULL fn pointer out of the getPartsPtr dummy. Rejecting the pick
+    -- here means the caller redraws, and if nothing usable comes up it leaves
+    -- the row alone so THE LEVEL'S ORIGINAL ENEMY SPAWNS. No dummy, no shell.
+    if EmIdHasData then
+        local okd, has = pcall(EmIdHasData, id)
+        if okd and has == false then
+            badEmIdsThisRoom[id] = true      -- don't ask again this room
+            return false
+        end
+    end
     if IsEmIdSupported then
         local ok, sup = pcall(IsEmIdSupported, id)
         if not ok or not sup then return false end
@@ -1815,6 +1851,102 @@ local function saveGuardRestoreScramble()
     return n
 end
 
+-- ═══════════════════════════════════════════════════════════════════════
+-- BROKEN-SPAWN REPAIR — keep full crossover, delete only what actually broke
+-- ═══════════════════════════════════════════════════════════════════════
+-- Full crossover means a pick can be an enemy this room has no data for. The
+-- engine does not refuse it; it builds a model with NO PARTS and carries on,
+-- and every guard downstream then just picks the manner of death:
+--     *(model+264) == 0  ->  cModel::getPartsPtr returns the modloader's zeroed
+--                            dummy  ->  cSubChar::move loads a FUNCTION pointer
+--                            out of it, gets 0, and calls it  ->  PC = 0.
+--   (crash log: PC=0, X0=X20=0x74f69b85d0 inside libmodloader, LR=cSubChar::move
+--    +0x1A04, stack cSubChar::move -> cEmMgr::move -> gameMainLoop; with three
+--    EmSetFromList/EmSetFromList2 SIGSEGV recoveries logged just before it.)
+--
+-- So the test is EXACT, not a heuristic: `*(cEm + 264) == 0` is the very field
+-- getPartsPtr reads to decide it has nothing to return. An enemy failing it IS
+-- the one that will reach that NULL call. No guessing, no sampling.
+--
+-- On a hit: put the row back to what the level authored (so the ORIGINAL enemy
+-- takes that slot) and record the emId as broken FOR THIS ROOM ONLY, so the
+-- next draw does not immediately reintroduce it. Both effects are local and
+-- self-clearing — the pool itself is never touched, which is the whole point.
+local PARTS_OFF = 264            -- cModel +0x108; matches getparts_safe's read
+
+local function repairBrokenSpawns()
+    if not state.enabled or not sym_GetEmPtrFromList then return 0 end
+    if not originalRows or snapshotCount == 0 then return 0 end
+    if settleCounter > 0 then return 0 end     -- room still populating
+
+    local repaired = 0
+    for key, info in pairs(slotMap) do
+        local idx = info and info.idx
+        if idx then
+            local ok = pcall(function()
+                local em = CallNative(sym_GetEmPtrFromList, "pi", idx)
+                if not em or IsNull(em) then return end       -- not alive yet
+                local parts = ReadU64(Offset(em, PARTS_OFF))
+                if parts ~= 0 then return end                 -- healthy
+
+                -- Broken. Revert this row to the authored enemy.
+                local row = originalRows[idx]
+                local p   = getListPtrFromIndex(idx)
+                if row and p and ptrval(p) >= 0x100000000 then
+                    if pcall(writeRow, p, row) then
+                        repaired = repaired + 1
+                        brokenRepairs = brokenRepairs + 1
+                        if info.replEmId then badEmIdsThisRoom[info.replEmId] = true end
+                        slotMap[key] = nil
+                        if brokenRepairs <= 20 then
+                            Log(TAG .. ": REPAIR idx=" .. tostring(idx)
+                                .. " '" .. tostring(info.name) .. "' (emId="
+                                .. tostring(info.replEmId) .. ") spawned with NO PARTS"
+                                .. " — row restored to the level's own enemy")
+                        end
+                    end
+                end
+            end)
+            if not ok then hookErrors = (hookErrors or 0) + 1 end
+        end
+    end
+    if repaired > 0 then invalidatePool() end
+    return repaired
+end
+
+-- 1s poll: slow enough to be free, fast enough to catch a bad spawn before it
+-- has done much. Bounded by slotMap (only rows WE changed), never the full 255.
+-- Everything is pcall'd — an uncaught sol::error at a native boundary aborts
+-- the process, and this runs on the game thread.
+-- ★ DISABLED — v13.0 shipped this ON and it was WORSE THAN THE BUG.
+-- It never repaired anything (zero REPAIR lines) and crashed in a loop:
+--     [LUA]      CallNative @ 0x7500b5e154 crashed (recovered) — returning nil
+--     [SAFECALL] SIGNAL RECOVERY: CallNative (sig=11, fault=0x7372600010)
+-- 0x...154 is GetEmPtrFromList. Cause, visible in the same log:
+--     EmSetFromList2 FIRE #2 gen=2 idx=userdata: 0xdd
+-- The hooks deliver `idx` as LIGHT USERDATA, not a number. It was stored into
+-- slotMap verbatim and handed to CallNative(..., "pi", idx), so the "i"
+-- conversion produced garbage and GetEmPtrFromList indexed the ESL with it.
+--
+-- ptrval(idx) would convert it, but that fix is NOT enough to re-enable this:
+-- calling GetEmPtrFromList from a timer means calling into enemy state at an
+-- arbitrary point in the frame, and the fault address (0x7372600010) says it
+-- dereferenced something mid-update. Any retry must (a) convert the index and
+-- (b) run from a hook where the ESL is known-consistent, not a 1s poll.
+--
+-- The detection idea is still right — *(cEm+264)==0 is exactly the condition
+-- that makes getPartsPtr hand back the dummy that cSubChar::move then calls
+-- through. Getting the cEm* safely is the unsolved part.
+local ENABLE_BROKEN_SPAWN_REPAIR = false
+
+if ENABLE_BROKEN_SPAWN_REPAIR and LoopAsync then
+    pcall(function()
+        LoopAsync(1000, function()
+            pcall(repairBrokenSpawns)
+        end)
+    end)
+end
+
 -- ── SNAPSHOT READERS ────────────────────────────────────────────────────
 -- The snapshot is the only record of what a level ACTUALLY authored, so make it
 -- inspectable over the bridge. Two uses:
@@ -2033,6 +2165,9 @@ rewriteListSlotByIndex = function(idx, sourceTag)
         name = pick.name,
         replEmId = finalEmId,
         source = sourceTag or "list",
+        -- repairBrokenSpawns needs the ESL index to look the live cEm* up via
+        -- GetEmPtrFromList; the pointer key alone cannot be turned back into one.
+        idx = idx,
     }
     pushReplacementEvent({
         gen = currentGen,
@@ -2060,6 +2195,12 @@ local function resetRoomTracking(reason)
     lastChoiceBySourceSig = currentChoiceBySourceSig
     currentChoiceBySourceSig = {}
     slotMap = {}
+    -- A pick that had no data in the LAST room is fully eligible again here:
+    -- the bad-list is evidence about one room, not a permanent demotion.
+    badEmIdsThisRoom = {}
+    brokenRepairs = 0
+    -- New room: forget which rows we deactivated (they were that room's rows).
+    deactivatedRows = {}
     levelSwaps = 0
     protectedSkips = 0
     settleCounter = SETTLE_CALLS
@@ -2079,6 +2220,78 @@ local function resetRoomTracking(reason)
     fullLevelRewriteChanged = 0
     Log(TAG .. ": === ROOM LOAD #" .. currentGen
         .. " === " .. tostring(reason) .. " — clearing caches, settle=" .. SETTLE_CALLS)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- KILL INVISIBLE PLAYER-CONSTRUCT "ENEMIES" (emId 0)
+-- ═══════════════════════════════════════════════════════════════════════
+-- Reported symptom: an INVISIBLE enemy that rockets still collide with. Traced
+-- live: EM_LIST had active rows with emId 0x00, and a live cEm with emId 0 whose
+-- AVR4Model pointer (cModel+988) was NULL — a collision body, no model.
+--
+-- emId 0 is NOT an enemy. cEmMgr::construct case 0 builds a PLAYER construct
+-- (cPlLeon / cPlAshley), which has a collision body but no enemy model, hence
+-- invisible-but-solid. The Randomizer never writes emId 0 (its POOL contains no
+-- such entry and applyReplacementToEmListRow only writes pick.bytes[1]) — these
+-- rows are authored/game-activated. Before the crash guards they used to crash;
+-- now they linger.
+--
+-- Deactivating emId-0 rows is SAFE where deactivating a real enemy row is not:
+-- the r10b breakage came from clobbering BOSS / scripted-ENEMY rows a level's SCE
+-- beats key off. A player-construct is categorically not one of those — no room
+-- intends a killable invisible player as an enemy. We ONLY touch emId 0, save the
+-- original flags for a full restore, and it is toggleable.
+-- ★ DEFAULT OFF — emId 0 constructs cPlAshley / cPlLeon. Deactivating those rows
+--   would DELETE ASHLEY (the escort companion) and break story mode. The user
+--   flagged this exactly in time. emId 0 is the player/companion, not a spawnable
+--   dummy — so the fix is NOT to remove it but to keep the RANDOMIZER's hands off
+--   it (see PROTECT_COMPANION_EMIDS below). This kill switch stays only as an
+--   explicit, off-by-default tool.
+local KILL_PLAYER_CONSTRUCTS = false      -- deactivate active emId-0 rows
+local NON_ENEMY_EMID = { [0x00] = true }  -- ONLY emId 0; object ids 0x50-0x61 are real scenery
+local deactivatedRows = {}                -- [idx] = original flags byte (for restore)
+
+local function clearInvisiblePlayerConstructs()
+    if not KILL_PLAYER_CONSTRUCTS then return 0 end
+    initNativePointers()
+    if not addr_pG then return 0 end
+    if not pG_ptr or ptrval(pG_ptr) == 0 then
+        pcall(function() pG_ptr = ReadPtr(addr_pG) end)
+    end
+    if not pG_ptr or ptrval(pG_ptr) <= 0x100000000 then return 0 end
+    local killed = 0
+    for i = 0, 255 do
+        local row = Offset(pG_ptr, 32 * i + 0x549C)
+        local okF, flags = pcall(ReadU8, row)
+        if okF and flags and (flags & 3) == 1 then
+            local okI, emId = pcall(ReadU8, Offset(row, 1))
+            if okI and NON_ENEMY_EMID[emId] then
+                -- Clear the active bits so the engine stops treating it as live.
+                if deactivatedRows[i] == nil then deactivatedRows[i] = flags end
+                pcall(WriteU8, row, flags & ~0x03)
+                killed = killed + 1
+                if killed <= 10 then
+                    pcall(function()
+                        Log(TAG .. ": deactivated invisible player-construct (emId 0) at row "
+                            .. i .. " — was flags 0x" .. string.format("%02X", flags))
+                    end)
+                end
+            end
+        end
+    end
+    return killed
+end
+
+local function restoreDeactivatedRows()
+    initNativePointers()
+    if not pG_ptr or ptrval(pG_ptr) <= 0x100000000 then return 0 end
+    local n = 0
+    for idx, flags in pairs(deactivatedRows) do
+        local row = Offset(pG_ptr, 32 * idx + 0x549C)
+        if pcall(WriteU8, row, flags) then n = n + 1 end
+    end
+    deactivatedRows = {}
+    return n
 end
 
 local function ensureLevelDetected(reason)

@@ -69,7 +69,7 @@ namespace lua_bindings
     // A '>' separator marks the return type: ">f" = float return in D0.
     struct NativeHookSig
     {
-        std::vector<char> arg_types; // 'p' or 'f' per parameter position
+        std::vector<char> arg_types; // 'p' pointer(X, lightuserdata), 'i' integer(X, Lua number), 'f' float(D, Lua number)
         bool float_return;           // true if return is float (D0), false = X0
     };
 
@@ -90,10 +90,12 @@ namespace lua_bindings
         }
         for (char c : args_part)
         {
-            if (c == 'p' || c == 'i')
-                result.arg_types.push_back('p');
+            if (c == 'p')
+                result.arg_types.push_back('p');   // pointer  → X reg, lightuserdata
+            else if (c == 'i')
+                result.arg_types.push_back('i');   // integer  → X reg, Lua NUMBER (fix: was aliased to 'p'/lightuserdata)
             else if (c == 'f' || c == 'd')
-                result.arg_types.push_back('f');
+                result.arg_types.push_back('f');   // float    → D reg, Lua number
         }
         return result;
     }
@@ -244,9 +246,16 @@ namespace lua_bindings
         char ret_type = (sig.empty()) ? 'v' : sig[0];
         std::string arg_types = (sig.size() > 1) ? sig.substr(1) : "";
 
-        // Collect args into registers — ARM64 passes first 8 int/ptr in x0-x7, floats in d0-d7
+        // Collect args into registers — ARM64 passes first 8 int/ptr in x0-x7,
+        // float/double in v0-v7. d_bits holds the RAW 64-bit contents each vector
+        // register must contain: for a 'float' param the callee reads s_n = the
+        // LOW 32 bits, so we store the float32 bit pattern zero-extended (NOT a
+        // double conversion — that put the wrong bits in the low word and made
+        // every float arg read as 0/garbage). For a 'double' param, the full
+        // 64-bit double pattern. A uniform `ldr d_n` in the asm then loads the
+        // right value for both, since s_n is just the low half of v_n.
         uint64_t x_regs[8] = {0};
-        double d_regs[8] = {0};
+        uint64_t d_bits[8] = {0};
         int x_idx = 0;
         int d_idx = 0;
 
@@ -300,17 +309,23 @@ namespace lua_bindings
                 }
                 break;
 
-            case 'f': // float — passed in SIMD/FP registers on ARM64
+            case 'f': // float — low 32 bits of v_n, zero-extended
                 if (d_idx < 8)
                 {
-                    d_regs[d_idx++] = static_cast<double>(arg.as<float>());
+                    float fv = arg.as<float>();
+                    uint32_t fb;
+                    memcpy(&fb, &fv, sizeof(fb));
+                    d_bits[d_idx++] = static_cast<uint64_t>(fb);
                 }
                 break;
 
-            case 'd': // double
+            case 'd': // double — full 64 bits of v_n
                 if (d_idx < 8)
                 {
-                    d_regs[d_idx++] = arg.as<double>();
+                    double dv = arg.as<double>();
+                    uint64_t db;
+                    memcpy(&db, &dv, sizeof(db));
+                    d_bits[d_idx++] = db;
                 }
                 break;
 
@@ -321,16 +336,64 @@ namespace lua_bindings
             }
         }
 
-        // Call via function pointer casting based on arg count
-        // ARM64 ABI: x0-x7 for int/ptr args, d0-d7 for float/double
-        // We use a generic approach with typed casts for the common cases
-
+        // ── The call ─────────────────────────────────────────────────────────
+        // AArch64: ONE raw asm call that loads BOTH register banks (x0-x7 AND
+        // d0-d7) — the same pattern call_original_with_regs uses for hooks.
+        // The old typed-cast dispatch passed only the x-registers on integer-
+        // returning calls: every 'f'/'d' ARGUMENT was silently dropped (root
+        // cause of the FireGrenadeLauncher fuse=0 muzzle explosions — the
+        // callee read garbage from d0), and a float RETURN was mis-decoded by
+        // reading s0 through a double-returning cast. d0 is captured as raw
+        // bits and decoded per the declared return type instead.
         uint64_t result_int = 0;
         double result_float = 0.0;
-        bool is_float_ret = (ret_type == 'f' || ret_type == 'd');
 
-        // Common calling patterns — cast to appropriate function pointer type
-        // This handles up to 8 integer arguments (most common case)
+        // Guard the raw native call: a bad game function can stack-overflow/smash.
+        // With the per-thread alt-stack the handler recovers via siglongjmp instead
+        // of killing the game; we then return nil. FULL TOLERANCE for any callee.
+        crash_handler::ensure_thread_sigaltstack();
+#if defined(__aarch64__)
+        (void)x_idx;
+        uint64_t result_d0_bits = 0;
+        bool native_call_ok = safe_call::execute([&]()
+        {
+            __asm__ volatile(
+                "ldp d0, d1, [%[da], #0]    \n"
+                "ldp d2, d3, [%[da], #16]   \n"
+                "ldp d4, d5, [%[da], #32]   \n"
+                "ldp d6, d7, [%[da], #48]   \n"
+                "ldp x0, x1, [%[xa], #0]    \n"
+                "ldp x2, x3, [%[xa], #16]   \n"
+                "ldp x4, x5, [%[xa], #32]   \n"
+                "ldp x6, x7, [%[xa], #48]   \n"
+                "blr %[fn]                  \n"
+                "mov %[rx], x0              \n"
+                "fmov %[rd], d0             \n"
+                : [rx] "=r"(result_int), [rd] "=r"(result_d0_bits)
+                : [xa] "r"(x_regs), [da] "r"(d_bits), [fn] "r"(addr)
+                : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+                  "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+                  "x16", "x17", "x30",
+                  "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7",
+                  "d16", "d17", "d18", "d19", "d20", "d21", "d22", "d23",
+                  "d24", "d25", "d26", "d27", "d28", "d29", "d30", "d31",
+                  "cc", "memory");
+        }, "CallNative").ok;
+        if (ret_type == 'f')
+        {
+            float rf;
+            uint32_t lo = static_cast<uint32_t>(result_d0_bits);
+            memcpy(&rf, &lo, sizeof(rf));
+            result_float = static_cast<double>(rf);
+        }
+        else if (ret_type == 'd')
+        {
+            memcpy(&result_float, &result_d0_bits, sizeof(result_float));
+        }
+#else
+        // ARM32 (softfp): every argument travels in the core registers, so the
+        // typed-cast dispatch is ABI-correct there. Unchanged.
+        bool is_float_ret = (ret_type == 'f' || ret_type == 'd');
         typedef uint64_t (*fn_0)();
         typedef uint64_t (*fn_1)(uint64_t);
         typedef uint64_t (*fn_2)(uint64_t, uint64_t);
@@ -340,78 +403,41 @@ namespace lua_bindings
         typedef uint64_t (*fn_6)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
         typedef uint64_t (*fn_7)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
         typedef uint64_t (*fn_8)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
-
-        // Guard the raw native call: a bad game function can stack-overflow/smash.
-        // With the per-thread alt-stack the handler recovers via siglongjmp instead
-        // of killing the game; we then return nil. FULL TOLERANCE for any callee.
-        crash_handler::ensure_thread_sigaltstack();
         bool native_call_ok = safe_call::execute([&]()
         {
         if (!is_float_ret)
         {
             switch (x_idx)
             {
-            case 0:
-                result_int = ((fn_0)addr)();
-                break;
-            case 1:
-                result_int = ((fn_1)addr)(x_regs[0]);
-                break;
-            case 2:
-                result_int = ((fn_2)addr)(x_regs[0], x_regs[1]);
-                break;
-            case 3:
-                result_int = ((fn_3)addr)(x_regs[0], x_regs[1], x_regs[2]);
-                break;
-            case 4:
-                result_int = ((fn_4)addr)(x_regs[0], x_regs[1], x_regs[2], x_regs[3]);
-                break;
-            case 5:
-                result_int = ((fn_5)addr)(x_regs[0], x_regs[1], x_regs[2], x_regs[3], x_regs[4]);
-                break;
-            case 6:
-                result_int = ((fn_6)addr)(x_regs[0], x_regs[1], x_regs[2], x_regs[3], x_regs[4], x_regs[5]);
-                break;
-            case 7:
-                result_int = ((fn_7)addr)(x_regs[0], x_regs[1], x_regs[2], x_regs[3], x_regs[4], x_regs[5], x_regs[6]);
-                break;
-            case 8:
-                result_int = ((fn_8)addr)(x_regs[0], x_regs[1], x_regs[2], x_regs[3], x_regs[4], x_regs[5], x_regs[6], x_regs[7]);
-                break;
-            default:
-                result_int = ((fn_8)addr)(x_regs[0], x_regs[1], x_regs[2], x_regs[3], x_regs[4], x_regs[5], x_regs[6], x_regs[7]);
-                break;
+            case 0: result_int = ((fn_0)addr)(); break;
+            case 1: result_int = ((fn_1)addr)(x_regs[0]); break;
+            case 2: result_int = ((fn_2)addr)(x_regs[0], x_regs[1]); break;
+            case 3: result_int = ((fn_3)addr)(x_regs[0], x_regs[1], x_regs[2]); break;
+            case 4: result_int = ((fn_4)addr)(x_regs[0], x_regs[1], x_regs[2], x_regs[3]); break;
+            case 5: result_int = ((fn_5)addr)(x_regs[0], x_regs[1], x_regs[2], x_regs[3], x_regs[4]); break;
+            case 6: result_int = ((fn_6)addr)(x_regs[0], x_regs[1], x_regs[2], x_regs[3], x_regs[4], x_regs[5]); break;
+            case 7: result_int = ((fn_7)addr)(x_regs[0], x_regs[1], x_regs[2], x_regs[3], x_regs[4], x_regs[5], x_regs[6]); break;
+            default: result_int = ((fn_8)addr)(x_regs[0], x_regs[1], x_regs[2], x_regs[3], x_regs[4], x_regs[5], x_regs[6], x_regs[7]); break;
             }
         }
         else
         {
-            // Float return — use double-returning function pointers
             typedef double (*fn_f0)();
             typedef double (*fn_f1)(uint64_t);
             typedef double (*fn_f2)(uint64_t, uint64_t);
             typedef double (*fn_f3)(uint64_t, uint64_t, uint64_t);
             typedef double (*fn_f4)(uint64_t, uint64_t, uint64_t, uint64_t);
-
             switch (x_idx)
             {
-            case 0:
-                result_float = ((fn_f0)addr)();
-                break;
-            case 1:
-                result_float = ((fn_f1)addr)(x_regs[0]);
-                break;
-            case 2:
-                result_float = ((fn_f2)addr)(x_regs[0], x_regs[1]);
-                break;
-            case 3:
-                result_float = ((fn_f3)addr)(x_regs[0], x_regs[1], x_regs[2]);
-                break;
-            default:
-                result_float = ((fn_f4)addr)(x_regs[0], x_regs[1], x_regs[2], x_regs[3]);
-                break;
+            case 0: result_float = ((fn_f0)addr)(); break;
+            case 1: result_float = ((fn_f1)addr)(x_regs[0]); break;
+            case 2: result_float = ((fn_f2)addr)(x_regs[0], x_regs[1]); break;
+            case 3: result_float = ((fn_f3)addr)(x_regs[0], x_regs[1], x_regs[2]); break;
+            default: result_float = ((fn_f4)addr)(x_regs[0], x_regs[1], x_regs[2], x_regs[3]); break;
             }
         }
         }, "CallNative").ok;
+#endif
         if (!native_call_ok)
         {
             logger::log_error("LUA", "CallNative @ %p crashed (recovered via alt-stack guard) — returning nil", addr);
@@ -1663,6 +1689,16 @@ namespace lua_bindings
                                     }
                                     xi++;
                                 }
+                            } else if (t == 'i') { // integer → X reg, from Lua number
+                                if (xi < 8) {
+                                    if (ri.get_type() == sol::type::number)
+                                        ctx.x[xi] = static_cast<uint64_t>(ri.as<int64_t>());
+                                    else if (ri.get_type() == sol::type::boolean)
+                                        ctx.x[xi] = ri.as<bool>() ? 1ULL : 0ULL;
+                                    else if (ri.get_type() == sol::type::lightuserdata)
+                                        ctx.x[xi] = reinterpret_cast<uintptr_t>(ri.as<void*>());
+                                    xi++;
+                                }
                             } else { // 'f'
                                 if (di < 8) {
                                     if (ri.get_type() == sol::type::number) {
@@ -1703,6 +1739,11 @@ namespace lua_bindings
                             if (xi < 8) {
                                 args.push_back(sol::make_object(lua,
                                     sol::lightuserdata_value(reinterpret_cast<void*>(ctx.x[xi]))));
+                                xi++;
+                            }
+                        } else if (t == 'i') { // integer → X reg, as Lua number
+                            if (xi < 8) {
+                                args.push_back(sol::make_object(lua, static_cast<int64_t>(ctx.x[xi])));
                                 xi++;
                             }
                         } else { // 'f'
@@ -1787,7 +1828,12 @@ namespace lua_bindings
                                     sol::lightuserdata_value(reinterpret_cast<void*>(ctx.x[xi]))));
                                 xi++;
                             }
-                        } else {
+                        } else if (t == 'i') { // integer → X reg, as Lua number
+                            if (xi < 8) {
+                                args.push_back(sol::make_object(lua, static_cast<int64_t>(ctx.x[xi])));
+                                xi++;
+                            }
+                        } else { // 'f'
                             if (di < 8) {
                                 args.push_back(sol::make_object(lua, ctx.d[di]));
                                 di++;
@@ -1897,7 +1943,7 @@ namespace lua_bindings
                         for (int i = 0; i < std::min(n, (int)sig.arg_types.size()); i++) {
                             sol::object ri = result[i];
                             char t = sig.arg_types[i];
-                            if (t == 'p') {
+                            if (t == 'p' || t == 'i') { // integer & pointer both write back to X reg
                                 if (xi < 8) {
                                     if (ri.get_type() == sol::type::lightuserdata)
                                         ctx.x[xi] = reinterpret_cast<uintptr_t>(ri.as<void*>());
@@ -1932,6 +1978,7 @@ namespace lua_bindings
                     int xi = 0, di = 0;
                     for (char t : sig.arg_types) {
                         if (t == 'p') { if (xi < 8) { args.push_back(sol::make_object(lua, sol::lightuserdata_value(reinterpret_cast<void*>(ctx.x[xi])))); xi++; } }
+                        else if (t == 'i') { if (xi < 8) { args.push_back(sol::make_object(lua, static_cast<int64_t>(ctx.x[xi]))); xi++; } }
                         else { if (di < 8) { args.push_back(sol::make_object(lua, ctx.d[di])); di++; } }
                     }
                     switch (args.size()) {
@@ -1986,6 +2033,7 @@ namespace lua_bindings
                     int xi = 0, di = 0;
                     for (char t : sig.arg_types) {
                         if (t == 'p') { if (xi < 8) { args.push_back(sol::make_object(lua, sol::lightuserdata_value(reinterpret_cast<void*>(ctx.x[xi])))); xi++; } }
+                        else if (t == 'i') { if (xi < 8) { args.push_back(sol::make_object(lua, static_cast<int64_t>(ctx.x[xi]))); xi++; } }
                         else { if (di < 8) { args.push_back(sol::make_object(lua, ctx.d[di])); di++; } }
                     }
                     return args;
@@ -2360,6 +2408,70 @@ namespace lua_bindings
         // How many times a NULL was substituted — 0 means the family never fired.
         lua.set_function("GetPartsPtrDummyCount", []() -> uint64_t {
             return native_hooks::getpartsptr_dummy_count();
+        });
+
+        // Reject diagnostics: {count, self, ra} — the plausibility heuristic's hit
+        // count plus the LAST pointer it rejected and the caller that passed it.
+        // Shoot the mis-behaving object, then read this to see the exact `this` and
+        // return-address, so the heuristic can be tightened from data not guesswork.
+        lua.set_function("GetPartsPtrRejectInfo", [&lua]() -> sol::table {
+            sol::table t = lua.create_table();
+            t["count"] = native_hooks::getpartsptr_reject_count();
+            t["self"]  = native_hooks::getpartsptr_last_reject_self();
+            t["ra"]    = native_hooks::getpartsptr_last_reject_ra();
+            return t;
+        });
+
+        // ── SetNativePatch — toggle a registered native patch from Lua ────────
+        // Same action as PCBridge's native_patch_set: ENABLE applies the patch/
+        // hook logic, DISABLE restores the original. Lets a mod couple a guard to
+        // its own state (e.g. a spawner mod enabling the getPartsPtr guard only
+        // while it is active). Returns false if the id is unknown.
+        // ── GetNativePatch — read a registered patch's live state ────────────
+        // Returns true/false for a known id, or nil if the id is not registered
+        // (so a menu can tell "OFF" apart from "this build doesn't have it").
+        lua.set_function("GetNativePatch", [](sol::this_state ts, std::string id) -> sol::object {
+            bool enabled = false;
+            if (!native_hooks::native_patch_get(id, enabled))
+                return sol::lua_nil;
+            return sol::make_object(ts, enabled);
+        });
+
+        lua.set_function("SetNativePatch", [](std::string id, bool enabled) -> bool {
+            std::string err;
+            bool ok = native_hooks::native_patch_set(id, enabled, err);
+            if (!ok && !err.empty())
+                logger::log_warn("NPATCH", "SetNativePatch(%s): %s", id.c_str(), err.c_str());
+            return ok;
+        });
+
+        // ── RegisterNativePatch — expose a Lua byte patch to PCBridge ─────────
+        // Makes a single-word code patch (orig <-> patched) appear in the native-
+        // patch registry so PCBridge can toggle it live (ENABLE writes `patched`,
+        // DISABLE restores `orig`). Call it right after you apply the patch, with
+        // enabledNow reflecting whether it is currently applied. This is what turns
+        // the per-mod on/off into per-PATCH bisection.
+        // Sig: RegisterNativePatch(id, desc, addr, origWord, patchedWord[, enabledNow=true])
+        lua.set_function("RegisterNativePatch",
+            [](std::string id, std::string desc, void* addr,
+               uint32_t orig_word, uint32_t patched_word,
+               sol::optional<bool> enabled_now) {
+                native_hooks::register_native_patch_bytes(
+                    id, desc, addr, orig_word, patched_word, enabled_now.value_or(true));
+            });
+
+        // ── EmIdHasData — can the engine actually LOAD this enemy? ────────────
+        // Mirrors the test cEmMgr::construct makes before initialising an enemy:
+        //     result = EmReadSearch(id, nullptr, 0);
+        //     if (!result) return result;      // no archive -> construct bails
+        // A false here means writing that emId into EM_LIST produces a cEm with
+        // no model and no parts, which later dies in MotionMove / calls a NULL
+        // function pointer out of the getPartsPtr dummy. Callers should keep the
+        // level's ORIGINAL enemy instead of writing the pick.
+        // EmReadSearch caches, so repeated calls are cache hits.
+        // Sig: EmIdHasData(emId) -> bool
+        lua.set_function("EmIdHasData", [](uint32_t id) -> bool {
+            return native_hooks::em_id_has_data(id);
         });
 
         // ── InstallXsbTrackBoundsGuard — the enemy sound-bank over-run ────────

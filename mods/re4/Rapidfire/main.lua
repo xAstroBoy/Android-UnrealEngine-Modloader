@@ -1,4 +1,4 @@
--- mods/Rapidfire/main.lua v20.0
+-- mods/Rapidfire/main.lua v20.7
 -- ═══════════════════════════════════════════════════════════════════════
 -- TWO INDEPENDENT TOGGLES, both patching one instruction each:
 --
@@ -29,8 +29,8 @@
 --        NOTHING. UpdateTrigger only raises the OnTriggerPulled *Blueprint
 --        delegate*; that is not the shot path.
 --     b) Redirect AVR4GamePlayerGun::WasTriggerJustPressed to
---        IsTriggerPressed. Also wrong layer: AVR4GamePlayerGun::TryFire is
---        NOT the shot either — it checks a cooldown then does
+--        IsTriggerPressed. Also wrong layer on its own: AVR4GamePlayerGun::
+--        TryFire is NOT the shot either — it checks a cooldown then does
 --        cItemMgr::ArmSearchWeaponNo -> cItemMgr::arm -> WeaponChange() ->
 --        PlMotionReset(), i.e. weapon ARM/EQUIP. Nothing there fires a bullet.
 --     Also a dead end: AVR4GamePlayerGun::IsFullyAutomatic (vtable +0x7A8;
@@ -47,18 +47,23 @@
 --                  -> RE4 native weapon code
 --   joyFireOn  (0x600A890): ldrb w8,[x8,#0x18]  ; HELD  -> true while held
 --   joyFireTrg (0x600A978): ldr  x8,[x8,#0x20]  ; EDGE  -> true on press only
---   Both then `tbz w8,#7` and apply the same secondary gates (pPL+0xA54, the
---   pG state flags). joyFireTrg IS the semi-auto limiter, natively, for every
---   weapon that uses it.
 --
---   So the engine already supports continuous fire — point joyFireTrg at the
---   HELD mask and "just pressed" becomes "is held":
---       0x600a990  ldr x8,[x8,#0x20]  ->  ldr x8,[x8,#0x18]
---                  0xF9401108         ->  0xF9400D08          (imm12 4 -> 3)
---   One immediate, one instruction, all weapons, every safety gate intact.
+--   Auto-fire needs BOTH gates open (patching only the native one is not
+--   enough — "handcannon still shoots once" proved it):
+--     * native: joyFireTrg reads the HELD mask instead of the EDGE one
+--         0x600a990  ldr x8,[x8,#0x20]  ->  ldr x8,[x8,#0x18]
+--                    0xF9401108         ->  0xF9400D08          (imm12 4 -> 3)
+--     * UE upstream: PreBio4Tick only calls TryFire when WasTriggerJustPressed()
+--       is true (the EDGE), so the UE layer only pumps the fire bit for ONE
+--       frame per pull. Make WasTriggerJustPressed report "trigger is down NOW"
+--       by tail-calling IsTriggerPressed:
+--         0x62daad8  sub sp,sp,#0x50  ->  b #0x62dc198
+--                    0xD10143FF       ->  0x140005B0
+--       Both functions are in libUE4, so the delta (0x16C0, imm26 0x5B0) is
+--       constant at any load address — hardcoded, not recomputed at runtime.
 --
---   CAVEAT: anything else keyed on fire-EDGE sees "held" too (some QTE /
---   prompt inputs may repeat). That is why this is opt-in and OFF by default.
+--   CAVEAT: anything else keyed on fire-EDGE sees "held" too (some QTE / prompt
+--   inputs may repeat). That is why this is opt-in and OFF by default.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "Rapidfire"
 local VERBOSE = false
@@ -76,6 +81,7 @@ local ARM64_NOP = 0xD503201F
 
 local PATCHES = {
     cooldown = {
+        id       = "re4.rapidfire.cooldown",
         name     = "TryFire cooldown branch (0 cooldown, all guns)",
         mangled  = "_ZN17AVR4GamePlayerGun7TryFireEv",
         fb       = 0x062DC490,
@@ -87,9 +93,7 @@ local PATCHES = {
         -- joyFireTrg: read the HELD key mask instead of the EDGE one.
         --   0x600a990   ldr x8,[x8,#0x20]   0xF9401108   ; +0x20 = KEY_TRG (edge)
         --           ->  ldr x8,[x8,#0x18]   0xF9400D08   ; +0x18 = KEY_ON  (held)
-        -- Only the load offset changes (imm12 4 -> 3); everything else in the
-        -- function, including all its safety gates, is untouched. That one load
-        -- feeds BOTH branches of joyFireTrg, so a single word covers all paths.
+        id       = "re4.rapidfire.autofire",
         name     = "joyFireTrg edge -> held (native fire gate)",
         mangled  = "_Z10joyFireTrgv",
         fb       = 0x0600A978,
@@ -97,24 +101,9 @@ local PATCHES = {
         word     = 0xF9400D08,
         expect   = 0xF9401108, -- ldr x8,[x8,#0x20] — refuse to patch anything else
     },
-    -- Auto-fire needs BOTH gates open. Patching only the native one is not
-    -- enough, and that is exactly what "handcannon still shoots once" showed:
-    --   * AVR4GamePlayerGun::TryFire is what SETS the fire bit
-    --         xmmword_A562B48 |= 0x80        (the KEY_ON/held mask)
-    --   * but PreBio4Tick only calls TryFire when WasTriggerJustPressed() is
-    --     true — the EDGE. So the UE layer pumps that bit for ONE frame per
-    --     pull, and joyFireTrg then faithfully reads a bit that is already gone.
-    -- So open the upstream gate too: make WasTriggerJustPressed report "the
-    -- trigger is down NOW" by tail-calling IsTriggerPressed (same signature
-    -- this -> bool; it still returns false when paused / flourishing / debug
-    -- controls are active, so those guards survive).
-    --     0x62daad8  sub sp,sp,#0x50  ->  b #0x62dc198
-    --                0xD10143FF       ->  0x140005B0
-    -- The branch is PC-relative but BOTH functions are in libUE4, so the delta
-    -- (0x62DC198 - 0x62DAAD8 = 0x16C0, imm26 = 0x5B0) is constant at any load
-    -- address. v20.1 tried to "recompute it at runtime", the helper failed, and
-    -- the patch silently never applied — hence the [WARN] in the log. Constant.
     trigger_edge = {
+        id       = "re4.rapidfire.trigger_edge",
+        -- WasTriggerJustPressed -> tail-call IsTriggerPressed (the UE fire gate).
         name     = "WasTriggerJustPressed -> IsTriggerPressed (UE fire gate)",
         mangled  = "_ZNK17AVR4GamePlayerGun21WasTriggerJustPressedEv",
         fb       = 0x062DAAD8,
@@ -126,13 +115,21 @@ local PATCHES = {
 
 -- NOTE: this mod deliberately has NO toggle debounce.
 -- Auto-fire used to switch itself off, and the cause was two real bugs in
--- DebugMenuAPI, both now fixed there rather than worked around here:
+-- DebugMenuAPI, both fixed there rather than worked around here:
 --   1. its confirm handler ran even with the menu CLOSED, so every gameplay
 --      trigger pull dispatched a confirm on the last-selected item;
 --   2. its "safety valve" re-armed on HOLD DURATION and then re-dispatched, so
 --      a held button repeated the action every 2s.
 -- If a toggle ever flickers again, fix it at the menu layer — do not add a
 -- debounce here, it only hides the input bug from one mod.
+
+-- ── ROCKET-LAUNCHER CRASH: FIXED IN THE ObjectPool MOD, NOT HERE ────────
+-- Holding the trigger on the rocket launcher used to crash. That is NOT a
+-- Rapidfire bug and is no longer patched here: cObjLauncher::loadRocket falls
+-- through a failed pool allocation into a NULL vtable tail call. The ObjectPool
+-- mod patches the missing null-bail (and the 40-slot object cap). A crash guard
+-- on cObjRocket::init was tried here and REMOVED — it sat downstream of the
+-- decision and let execution walk into the NULL tail call anyway. Do not re-add.
 
 -- Guarded patcher: verifies the instruction is the one we reverse-engineered
 -- before overwriting it, so a shifted binary is a no-op instead of corruption.
@@ -141,23 +138,28 @@ local function applyPatch(p)
     pcall(function()
         local sym = Resolve(p.mangled, p.fb)
         if not sym or IsNull(sym) then
-            Log(TAG .. ": [WARN] " .. p.mangled .. " not resolved — " .. p.name .. " skipped")
+            LogWarn(TAG .. ": " .. p.name .. " unresolved — skipped")
             return
         end
-        p.addr = Offset(sym, p.insn_off)
-        local cur = ReadU32(p.addr)
+        local addr = Offset(sym, p.insn_off)
+        local cur  = ReadU32(addr)
         if p.expect and cur ~= p.expect and cur ~= p.word then
-            Log(TAG .. ": [WARN] unexpected word " .. string.format("0x%08X", cur or 0)
-                .. " at " .. ToHex(p.addr) .. " (expected " .. string.format("0x%08X", p.expect)
-                .. ") — refusing to patch " .. p.name)
-            p.addr = nil
+            LogWarn(TAG .. ": " .. p.name .. " UNEXPECTED word 0x"
+                .. string.format("%08X", cur or 0) .. " (expected 0x"
+                .. string.format("%08X", p.expect) .. ") — refusing to patch")
             return
         end
-        if not p.orig then p.orig = cur end
-        WriteU32(p.addr, p.word)
+        p.addr = addr
+        p.orig = p.orig or cur
+        WriteU32(addr, p.word)
         ok = true
-        Log(TAG .. ": PATCHED " .. p.name .. " @ " .. ToHex(p.addr)
-            .. " (was " .. string.format("0x%08X", p.orig or 0) .. " -> NOP)")
+        -- Expose to PCBridge's native-patch registry so it can be toggled live
+        -- (per-patch bisection). Guarded: older modloader .so lacks the binding.
+        if p.id and RegisterNativePatch then
+            pcall(RegisterNativePatch, p.id, TAG .. ": " .. p.name, addr, p.orig, p.word, true)
+        end
+        Log(TAG .. ": PATCHED " .. p.name .. " @ " .. ToHex(addr)
+            .. " (was 0x" .. string.format("%08X", p.orig) .. ")")
     end)
     return ok
 end
@@ -165,29 +167,15 @@ end
 local function restorePatch(p)
     if p.addr and p.orig then
         pcall(function() WriteU32(p.addr, p.orig) end)
+        if p.id and RegisterNativePatch then
+            pcall(RegisterNativePatch, p.id, TAG .. ": " .. p.name, p.addr, p.orig, p.word, false)
+        end
         Log(TAG .. ": restored " .. p.name)
     end
 end
 
-local function applyCooldown()  applyPatch(PATCHES.cooldown)   end
-local function restoreCooldown() restorePatch(PATCHES.cooldown) end
--- ── ROCKET-LAUNCHER CRASH: FIXED IN THE ObjectPool MOD, NOT HERE ────────
--- Holding the trigger on the rocket launcher CRASHED the game:
---     fault addr 0x0,  #00 pc 0x0 <unknown>
---     #01 cObjLauncher::moveFire+104        (no loadRocket frame — TAIL CALL)
--- v20.6 tried to fix that from here with InstallCrashGuard on cObjRocket::init.
--- IT DID NOT WORK, and the reason is worth keeping: the guard fired correctly
--- (the recovery line is in the tombstone's stack memory), but init was never
--- the problem. cObjLauncher::loadRocket @0x5FB6B94 does not null-check a failed
--- pool allocation — it sets X20=0 and FALLS THROUGH into init(NULL),
--- setParent(NULL), then `LDR X8,[X0]` / `BR X1` on a NULL vtable. Guarding init
--- aborted one call in the middle of that and let execution continue straight
--- into the NULL tail call. The guard was downstream of the decision.
---
--- Auto-fire only EXPOSED it: holding the trigger drains the 40-slot cObjMgr
--- headroom (gameRoomInit+0x2FC `ADD W22,W8,#0x28`), and exhaustion is what
--- takes the unchecked branch. The ObjectPool mod patches both the missing
--- null-bail and that immediate. Do not re-add a crash guard here.
+local function applyCooldown()  return applyPatch(PATCHES.cooldown)  end
+local function restoreCooldown()       restorePatch(PATCHES.cooldown) end
 
 -- Auto-fire = BOTH gates. Apply upstream (UE) first, then the native one, and
 -- report each so a half-applied state is visible in the log instead of silently
@@ -207,38 +195,34 @@ local function restoreAutoFire()
     restorePatch(PATCHES.trigger_edge)
 end
 
+-- ═══════════════════════════════════════════════════════════════════════
+-- APPLY ON LOAD
+-- ═══════════════════════════════════════════════════════════════════════
 if state.enabled  then applyCooldown() end
 if state.autoFire then applyAutoFire() end
 
--- ── Commands ────────────────────────────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- COMMANDS
+-- ═══════════════════════════════════════════════════════════════════════
 RegisterCommand("rapidfire", function()
     state.enabled = not state.enabled
     if state.enabled then applyCooldown() else restoreCooldown() end
     ModConfig.Save("Rapidfire", state)
-    Log(TAG .. ": rapid fire " .. (state.enabled and "ON" or "OFF"))
-    Notify(TAG, state.enabled and "Rapid Fire ON (0 cooldown)" or "Rapid Fire OFF")
-    return state.enabled and "ON" or "OFF"
+    Log(TAG .. ": Rapid Fire " .. (state.enabled and "ON" or "OFF"))
+    Notify(TAG, "Rapid Fire " .. (state.enabled and "ON" or "OFF"))
 end)
 
 RegisterCommand("autofire", function()
     state.autoFire = not state.autoFire
     if state.autoFire then applyAutoFire() else restoreAutoFire() end
     ModConfig.Save("Rapidfire", state)
-    local msg = "auto-fire " .. (state.autoFire and "ON (hold the trigger)" or "OFF")
-    Log(TAG .. ": " .. msg)
-    Notify(TAG, state.autoFire and "Auto-Fire ON — hold trigger" or "Auto-Fire OFF")
-    return msg
+    Log(TAG .. ": Auto-Fire " .. (state.autoFire and "ON" or "OFF"))
+    Notify(TAG, "Auto-Fire " .. (state.autoFire and "ON (hold trigger)" or "OFF"))
 end)
 
-RegisterCommand("rapidfire_status", function()
-    local info = TAG .. ": rapidFire=" .. tostring(state.enabled)
-        .. " (" .. (PATCHES.cooldown.addr and ToHex(PATCHES.cooldown.addr) or "unresolved") .. ")"
-        .. " | autoFire=" .. tostring(state.autoFire)
-        .. " (" .. (PATCHES.autofire.addr and ToHex(PATCHES.autofire.addr) or "unresolved") .. ")"
-    Log(info); return info
-end)
-
--- ── Debug menu ──────────────────────────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- DEBUG MENU
+-- ═══════════════════════════════════════════════════════════════════════
 if SharedAPI and SharedAPI.DebugMenu then
     SharedAPI.DebugMenu.RegisterToggle("Rapidfire", "Rapid Fire (0 cooldown)",
         function() return state.enabled end,
@@ -248,8 +232,6 @@ if SharedAPI and SharedAPI.DebugMenu then
             ModConfig.Save("Rapidfire", state)
         end)
 
-    -- No debounce here by design: DebugMenuAPI now ignores confirms while the
-    -- menu is closed, and no longer re-dispatches a held button.
     SharedAPI.DebugMenu.RegisterToggle("Rapidfire", "Auto-Fire (hold trigger)",
         function() return state.autoFire end,
         function(v)

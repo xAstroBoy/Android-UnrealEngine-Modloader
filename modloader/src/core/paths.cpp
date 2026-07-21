@@ -80,34 +80,15 @@ namespace paths
         if (s_data_dir.empty())
             return;
 
+        // NO scoped fallback. The user forbids /sdcard/Android/data/<pkg>/files/
+        // modloader and deleted it. If the public path is not writable we keep it
+        // anyway (reads work; files are managed over root SFTP) and only shout.
         if (!verify_writable(s_data_dir))
         {
-            std::string pkg = read_package_name();
-            __android_log_print(ANDROID_LOG_ERROR, LOG_TAG,
-                                "paths: ⚠ DATA DIR IS NOT WRITABLE: %s — "
-                                "trying fallbacks",
+            __android_log_print(ANDROID_LOG_WARN, LOG_TAG,
+                                "paths: %s not verified writable — keeping it (no scoped fallback; "
+                                "grant the game LEGACY_STORAGE via root if writes must work)",
                                 s_data_dir.c_str());
-
-            // Try scoped external storage first (MTP visible)
-            std::string scoped = "/sdcard/Android/data/" + pkg + "/files/modloader";
-            ensure_dir(scoped);
-            if (verify_writable(scoped))
-            {
-                __android_log_print(ANDROID_LOG_WARN, LOG_TAG,
-                                    "paths: REPAIR — using scoped external: %s", scoped.c_str());
-                s_data_dir = scoped;
-                return;
-            }
-
-            // Last resort: internal storage
-            std::string internal = "/data/data/" + pkg + "/modloader";
-            ensure_dir(internal);
-            if (verify_writable(internal))
-            {
-                __android_log_print(ANDROID_LOG_WARN, LOG_TAG,
-                                    "paths: REPAIR — falling back to internal storage: %s", internal.c_str());
-                s_data_dir = internal;
-            }
         }
         else
         {
@@ -257,8 +238,14 @@ namespace paths
         if (attached)
             vm->DetachCurrentThread();
 
-        // Priority 1: /sdcard/UnrealModloader/<pkg>/ — best UX, fully MTP visible
-        // Requires MANAGE_EXTERNAL_STORAGE (granted by installer via appops).
+        // ★ THE UNSCOPED PUBLIC PATH IS THE ONLY PATH. The user manages mods at
+        // /sdcard/UnrealModloader/<pkg>/ over SFTP/MTP and does NOT want the
+        // scoped /sdcard/Android/data/<pkg>/files/modloader folder to exist. With
+        // root granting the app LEGACY_STORAGE (and the folder owned by the game
+        // uid, 0777), reads always work and writes work under legacy access. We
+        // return it UNCONDITIONALLY — no scoped fallback that would resurrect the
+        // folder the user deleted. If a write ever fails it is logged loudly, but
+        // we never silently divert to scoped again.
         std::string pkg = read_package_name();
         ensure_dir("/sdcard/UnrealModloader");
         std::string preferred = "/sdcard/UnrealModloader/" + pkg;
@@ -266,30 +253,15 @@ namespace paths
         if (verify_writable(preferred))
         {
             __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
-                                "paths: using preferred path: %s", preferred.c_str());
-            return preferred;
+                                "paths: using preferred UNSCOPED path: %s", preferred.c_str());
         }
-
-        __android_log_print(ANDROID_LOG_WARN, LOG_TAG,
-                            "paths: /sdcard/UnrealModloader/ not writable (MANAGE_EXTERNAL_STORAGE missing?) — "
-                            "falling back to scoped external storage");
-
-        // Priority 2: JNI getExternalFilesDir — scoped but always writable, MTP visible
-        if (!result.empty())
+        else
         {
-            std::string scoped = result + "/modloader";
-            ensure_dir(scoped);
-            if (verify_writable(scoped))
-            {
-                __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
-                                    "paths: using scoped external: %s", scoped.c_str());
-                return scoped;
-            }
+            __android_log_print(ANDROID_LOG_WARN, LOG_TAG,
+                                "paths: %s not verified writable — USING IT ANYWAY (user forbids the scoped "
+                                "fallback; reads still work, files are managed over SFTP)", preferred.c_str());
         }
-
-        __android_log_print(ANDROID_LOG_WARN, LOG_TAG,
-                            "paths: JNI external dir also failed — returning empty for init() fallback");
-        return "";
+        return preferred;
     }
 
     void init()
@@ -308,34 +280,18 @@ namespace paths
             __android_log_print(ANDROID_LOG_WARN, LOG_TAG,
                                 "paths: JNI resolution failed — using /proc/self/cmdline package: %s", pkg.c_str());
 
-            // Try /sdcard/UnrealModloader/<pkg>/ first
+            // FORCE the unscoped public path — same rule as resolve_via_jni():
+            // no scoped fallback, ever. The user deleted that folder and forbids
+            // its return; root + LEGACY_STORAGE makes the public path usable.
             ensure_dir("/sdcard/UnrealModloader");
             std::string candidate = "/sdcard/UnrealModloader/" + pkg;
             ensure_dir(candidate);
-            if (verify_writable(candidate))
+            s_data_dir = candidate;
+            if (!verify_writable(candidate))
             {
-                s_data_dir = candidate;
-            }
-            else
-            {
-                // Fall back to scoped external storage
-                std::string scoped = "/sdcard/Android/data/" + pkg + "/files/modloader";
-                ensure_dir("/sdcard/Android/data/" + pkg + "/files");
-                ensure_dir(scoped);
-                if (verify_writable(scoped))
-                {
-                    __android_log_print(ANDROID_LOG_WARN, LOG_TAG,
-                                        "paths: using scoped fallback: %s", scoped.c_str());
-                    s_data_dir = scoped;
-                }
-                else
-                {
-                    // Last resort: internal storage
-                    s_data_dir = "/data/data/" + pkg + "/modloader";
-                    ensure_dir(s_data_dir);
-                    __android_log_print(ANDROID_LOG_WARN, LOG_TAG,
-                                        "paths: using internal storage fallback: %s", s_data_dir.c_str());
-                }
+                __android_log_print(ANDROID_LOG_WARN, LOG_TAG,
+                                    "paths: %s not verified writable — USING IT ANYWAY (no scoped fallback)",
+                                    candidate.c_str());
             }
         }
 

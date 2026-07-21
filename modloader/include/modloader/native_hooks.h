@@ -193,12 +193,162 @@ uint64_t null_guard_substitutions();
 // caller loop terminates on NULL (0 sites), so the dummy cannot hang anything.
 // Does NOT bound ARRAY mode's `+= 496*idx` — that needs the part count.
 bool install_getpartsptr_guard(uintptr_t getparts);
+// EspCommonTrans (effect-sprite transform) reads the effect's parent at
+// *(cEsp+64) and concats its world matrix at +24. When the parent is freed (actor
+// churn / cutscene teardown / Randomizer pool leak) that pointer dangles and
+// MTXConcat SIGSEGVs (tombstone_02/03). This DobbyHooks EspCommonTrans and skips
+// any effect whose parent-matrix page is unmapped (live msync probe). Pass the
+// EspCommonTrans address (0x5F14E7C). Toggleable via the native-patch registry.
+bool install_esp_parent_guard(uintptr_t espcommontrans);
+uint64_t esp_parent_skip_count();
+// Block the cutscene pawn takeover: hook AVR4PlayerController::PossessPlayerPawn
+// (static, type in X0) @0x6390948; when the toggle is ON and type==3 (cutscene
+// pawn), redirect to the current pawn so the controller keeps YOUR pawn instead of
+// the theatre pawn. Registered as re4.keep_pawn_in_cutscene (default OFF).
+bool install_keep_pawn_in_cutscene(uintptr_t possess);
+// Hook KeyStop @0x5FC249C for the cutscene input unfreeze.
+// SceEventStart calls KeyStop(0xF12000EFCF1000), which ANDs the pad globals with
+// that mask AND sets pG+0x198 |= 0x80000000. KeyClear is byte-identical except it
+// does NOT set that bit — so the bit is scene state, and the MASK is what takes
+// your stick. When the toggle is ON and a Bio4 event is playing we substitute an
+// all-ones mask (nothing gets masked out) and still call through, so pG+0x198 is
+// left exactly as the engine wants it and the scene cannot stall. Scripted scenes
+// are safe: if the cutscene is animating Leon his state function ignores the pad.
+// re4.cutscene_unfreeze_input (default OFF).
+bool install_cutscene_input_unfreeze(uintptr_t keystop);
+uint32_t cutscene_input_unfreeze_count();   // KeyStop calls we neutralized
+// Hook cModel::UpdateVR4ModelVisibility @0x5F825A0. SceEventStart's
+// UpdateSuspendedVisibility runs this per model; during the suspend its
+// vtable+80 predicate returns HIDDEN, so with the theatre screen off there is
+// nothing left to draw (that is why forceScreenOff went black). When the toggle
+// is ON and a Bio4 event is playing we re-assert SetModelVisibility(model,true)
+// AFTER the original runs. Prerequisite for in-world 3D cutscenes.
+// re4.cutscene_force_models_visible (default OFF).
+bool install_cutscene_force_models_visible(uintptr_t updvis);
+uint32_t cutscene_forced_visible_count();
+// Hook AVR4CutscenePlayerPawn::PostBio4Tick @0x628F550 (runs every cutscene
+// frame). The cutscene lock is that cPlayer::move never runs — gated by
+// pG+0x50AC bit 0x10000000, which must NOT be cleared globally (that un-suspends
+// the world and the SCE script loses its scripted beats). Instead, when the
+// toggle is ON and a Bio4 event is playing, call cPlayer::move(pPL) ourselves
+// from the tick's post edge: world stays suspended, only Leon updates. Pair with
+// re4.cutscene_unfreeze_input or the pad stays masked.
+// re4.drive_player_in_cutscene (default OFF).
+bool install_drive_player_in_cutscene(uintptr_t postbio4tick);
+uint32_t cutscene_driven_frame_count();
+// Entity move() calls driven so the scene's NPCs animate instead of standing
+// idle (re4.drive_entities_in_cutscene, registered by the installer above).
+uint32_t cutscene_driven_entity_count();
+// Hook cPlayer::ArmVrHasControl @0x5FDF88C — THE cutscene movement gate.
+// ArmVrAllowFirstPersonMovement is gated entirely on it, and it requires Leon's
+// state (this+276) to be 0; scripted scenes use state 5, so the game revokes VR
+// control by design. Forced true during a Bio4 event when the toggle is ON.
+// re4.force_vr_control (default OFF).
+bool install_force_vr_control(uintptr_t hasctl);
+uint32_t cutscene_forced_control_count();
+// Hook AVR4Bio4PlayerPawn::UpdateMovement @0x6264140 — the GAMEPLAY pawn's own
+// movement update, so it runs while keep_pawn_in_cutscene keeps you in your pawn
+// (unlike the cutscene pawn's PostBio4Tick, which goes silent then). Runs the
+// original (sets movement INTENT via UpdateFirstPersonMovement) then calls
+// cPlayer::move to APPLY it — proven live: intent alone moved Leon zero.
+// Shares the re4.drive_player_in_cutscene toggle.
+bool install_drive_player_on_movement(uintptr_t updmove);
+// THE cutscene blocker. ABio4::Tick @0x6206A98 runs the engine main loop as
+//   while (!spInstance[594] || spInstance[595]) { gameMainLoop(); }
+// and a cutscene sets [594]=1, so the body NEVER runs — no cPlayer::move, no pad
+// refill, no state machine, hence no walking and no firing. Clears that byte per
+// frame while a Bio4 event plays. re4.cutscene_unlock_gameloop (default OFF).
+bool install_cutscene_unlock_gameloop(uintptr_t bio4tick);
+uint32_t cutscene_unlock_gameloop_count();
+// cObjMgr::move null-vtable guard @0x5F89C8C. unlock_gameloop makes gameMainLoop
+// run mid-scene; cObjMgr::move then calls vtable[0] on objects the scene tore
+// down (PC=0, tombstone_09). Zeroes the flags of pending-destroy slots whose
+// vtable is not a sane pointer so the original skips them. Hook the FUNCTION
+// ENTRY, never the faulting BLR at +52 (that smashes the frame -> SIGABRT).
+// re4.objmgr_move_guard (default ON — required by unlock_gameloop).
+bool install_objmgr_move_guard(uintptr_t move_fn);
+uint32_t objmgr_guard_skip_count();
+// Fades BRACKET a scene (fade-in before SceEventStart, fade-out after the event
+// ends), so gating suppression on "event playing" never catches either one.
+// These open a grace window around the boundary. re4.cutscene_no_fade gates them.
+void cutscene_open_fade_window();
+bool install_scene_start_fade_window(uintptr_t sceeventstart);
+// Missing subtitles / unusable button prompts: GetTextPromptUi caches the
+// AVR4FloaterUI in this[78] and returns NULL forever once that actor is GC'd
+// (the stale pointer is never cleared, so the lazy spawn cannot re-run). Both
+// OnShowSceneMessage and DisplayCommandPrompt are `else if (ui)`, so a NULL ui
+// silently draws nothing. re4.cutscene_prompt_respawn (default ON).
+bool install_prompt_ui_respawn(uintptr_t gettextpromptui);
+uint32_t cutscene_prompt_respawn_count();
+// THE VR FADE. Hooking the legacy FadeSet does NOT remove the black fade — that
+// is the flat-screen path. The VR build fades via AVR4FadeManager, so drop the
+// calls that CREATE a fade (SetFade / SetTimedFade) inside the cutscene window.
+bool install_vr_fade_suppress(uintptr_t setfade, uintptr_t timedfade);
+uint32_t cutscene_vr_fades_killed_count();
+// Kill the black fade into/out of cutscenes. Hooks FadeSet @0x5F39930 and drops
+// the call while a Bio4 event is playing (the fade covered the hand-off to the
+// 2D theatre screen, which we no longer use). Fades outside scenes are stock.
+// re4.cutscene_no_fade (default OFF).
+bool install_cutscene_no_fade(uintptr_t fadeset);
+uint32_t cutscene_fades_killed_count();
+// Un-glue the VR camera from Leon during a cutscene. Hooks
+// cPlayer::ArmUpdateRideTransform @0x5FE0134 (first thing cPlayer::move calls)
+// and anchors the pawn to where the player stood when the scene STARTED, so an
+// overview cutscene neither teleports the view across the level nor renders from
+// inside Leon's model. Hides nothing. re4.cutscene_camera_offset (default OFF).
+bool install_cutscene_camera_offset(uintptr_t ride);
+uint32_t cutscene_camera_offset_count();
+void set_cutscene_camera_offset(int back, int up);
+// True if the engine can actually load this enemy id's archive. Mirrors the
+// test cEmMgr::construct makes (EmReadSearch != 0); false means construct would
+// bail and leave a model-less shell that crashes downstream. Returns true if
+// EmReadSearch cannot be resolved, so it never blocks a pick by accident.
+bool em_id_has_data(uint32_t id);
+// Skips MotionMove entirely for a model with no parts (*(model+264)==0), which
+// is what feeds the getPartsPtr dummy into MTXInverse (fault 0x30). Pass 0 to
+// resolve the address automatically. Installed by install_getpartsptr_guard.
+bool install_motionmove_guard(uintptr_t addr);
+uint64_t motionmove_skip_count();
+// Maps page 0 RWX with `mov x0,#0; ret` at offset 0, so NULL derefs read 0 and
+// calls through NULL return 0 instead of SIGSEGV / PC=0. Needs
+// vm.mmap_min_addr=0 on the device. Idempotent.
+bool install_null_page_guard();
 uint64_t getpartsptr_dummy_count();
 // Pointers the guard refused as impossible (non-canonical / unaligned / tiny) or
 // ARRAY indices past kMaxPartIdx. Distinct from the dummy count, which counts
 // legitimate NULLs the engine never checked: a nonzero value here means garbage
 // was actively in flight (see the IKInit/moveWepDown tombstone).
 uint64_t getpartsptr_reject_count();
+// The last `this` the plausibility heuristic rejected, and the caller that passed
+// it (return address). Used to learn WHY a legit pointer (e.g. a shootable cart's
+// model) trips the heuristic, so it can be tightened instead of guessed at.
+uint64_t getpartsptr_last_reject_self();
+uint64_t getpartsptr_last_reject_ra();
+
+// ── Native-patch registry ───────────────────────────────────────────────────
+// Every toggleable native code patch/hook registers itself here so PCBridge can
+// flip it live (enable = apply patch/logic, disable = restore ORIGINAL game
+// behaviour) without a rebuild. This is the culprit-bisection tool: when a native
+// change breaks gameplay, the user turns each patch off one at a time and finds it.
+//
+// Two flavours:
+//   * bytes   — a fixed 32-bit code word (orig <-> patched via patch_code). Simple
+//               byte patches (Lua-side included) register through this.
+//   * toggle  — a setter(enable)->ok callback, for patches that cannot be a single
+//               word (e.g. a Dobby hook whose teardown would race a hot function;
+//               those flip an internal atomic bypass flag instead).
+void register_native_patch_bytes(const std::string& id, const std::string& desc,
+                                 void* addr, uint32_t orig_word, uint32_t patched_word,
+                                 bool enabled_now);
+void register_native_patch_toggle(const std::string& id, const std::string& desc,
+                                  std::function<bool(bool)> setter, bool enabled_now);
+// Read a registered patch's current enabled state. Returns false if id unknown.
+bool native_patch_get(const std::string& id, bool& out_enabled);
+// JSON array: [{"id","desc","enabled","kind","addr"}]. Safe to call any thread.
+std::string native_patch_list_json();
+// Enable/disable a registered patch by id. Returns false + err_out if unknown or
+// the setter failed. Idempotent (setting to the current state is a no-op success).
+bool native_patch_set(const std::string& id, bool enabled, std::string& err_out);
 
 // CArmSoundBlock::ExtractTrackIndex (0x61AF06C) calls strtol on its cursor BEFORE
 // applying the end-of-name-table bound it then checks four instructions later. An
@@ -289,6 +439,10 @@ bool install_crossover_enemy_remap(uintptr_t construct_entry);
 // (tombstone: SEGV_MAPERR fault 0x0, #01 gameRoomInit()+2260). Instrument the
 // load so a NULL is redirected to a no-op stub. Site = 0x5F43B38.
 bool install_gameroominit_vcall_guard(uintptr_t site);
+// Absorbs the NULL virtual slot-4 call in cSubChar::moveFace (PC=0 on the game
+// thread) and logs this/vptr so the corrupted class can be identified. Installed
+// automatically with the getPartsPtr guard; idempotent.
+bool install_subchar_vcall_guard();
 
 // EmSetFromList2(id, flags) @0x5EE9A6C runs BEFORE cEmMgr::construct, so the
 // construct remap is too late — an id the room cannot build faults inside the

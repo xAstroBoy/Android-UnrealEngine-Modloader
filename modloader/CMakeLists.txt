@@ -30,6 +30,7 @@ set(MOD_SOURCES
     src/hook/process_event_hook.cpp
     src/hook/pe_trace.cpp
     src/hook/native_hooks.cpp
+    src/hook/re4_cutscene.cpp
     src/hook/re4_native_hooks.cpp
     src/reflection/reflection_walker.cpp
     src/reflection/lua_dump_generator.cpp
