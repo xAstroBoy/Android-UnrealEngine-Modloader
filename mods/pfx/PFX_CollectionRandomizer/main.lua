@@ -1,5 +1,11 @@
 -- ============================================================================
--- PFX_CollectionRandomizer v34 — Hub Slot Scramble + Per-Table Cosmetics
+-- PFX_CollectionRandomizer v35 — Hub Slot Scramble + Per-Table Cosmetics
+--   * v35 FIX: statue/gadget pods never randomized — every pod's slot component
+--     is named "CollectibleSlotRoot", so the incremental SEEN key (GetName())
+--     collided across ALL pods: the first one processed marked the rest "seen"
+--     and late-streaming stations kept their default (Silver Ball everywhere).
+--     SEEN now keys by outer station + component. Batches also abort when a
+--     table load starts mid-sweep (stale-ref crash guard).
 -- ============================================================================
 -- v27 CHANGES from v26:
 --   * FIX: robust slot assignment validation. If ChangeSlotEntry is a no-op,
@@ -926,7 +932,21 @@ local function scramble_all_slots(incremental)
     if not incremental then _G._RAND_SLOT_SEEN = {} end
     _G._RAND_SLOT_SEEN = _G._RAND_SLOT_SEEN or {}
     local SEEN = _G._RAND_SLOT_SEEN
-    local function seen_key(s) local n = nil; pcall(function() n = s:GetName() end); return n end
+    -- SEEN key MUST be unique per slot. Component names COLLIDE: every statue
+    -- pod's slot component is literally named "CollectibleSlotRoot", so keying
+    -- by GetName() alone marked ALL pods seen after the first one — late-
+    -- streaming statue/gadget stations were then skipped forever and kept
+    -- their default (the "all pods stay Silver Ball" bug). Key by the OUTER
+    -- station (unique per pod, e.g. ...BP_Statue_Slot_C_CAT_110) + component.
+    local function seen_key(s)
+        local n = nil; pcall(function() n = s:GetName() end)
+        local o = nil
+        pcall(function() local out = s:GetOuter(); if out then o = out:GetName() end end)
+        if n and o then return o .. "/" .. n end
+        local id = entry_id(s)
+        if id ~= "" then return id end
+        return n
+    end
 
     -- Build work list: {slot, picked_entry} pairs
     local workList = {}
@@ -1064,6 +1084,10 @@ local function scramble_all_slots(incremental)
         local delay = (batch - 1) * SCRAMBLE_BATCH_DELAY
 
         ExecuteWithDelay(delay, function()
+            -- a table load between queue time and this tick means the hub is
+            -- being torn down — swapping into streaming-out stations is the
+            -- classic stale-ref crash; drop the remaining batches instead
+            if not hub_active() then return end
             local batchOk, batchErr, batchEmpty = 0, 0, 0
             for i = startIdx, endIdx do
                 local work = workList[i]
