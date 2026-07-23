@@ -263,38 +263,36 @@ local ACTIONS = {
     },
 
     -- == WILLIAMS OPERATOR ====================================================
-    -- Real coin-door service buttons on the emulated Williams ROMs
-    -- (PFX_OperatorMenu). ENTER on a WPC table opens the ROM's own
-    -- operator/service menu on the DMD: tests, adjustments, audits.
+    -- The emulated Williams ROM's OWN operator/service menu (tests, adjustments,
+    -- audits) — cracked via sw21 "COIN DOOR CLOSED" from the TAF ROM. Toggle the
+    -- coin door OPEN, then ENTER opens the menu; Up/Down cycle items, ESCAPE backs
+    -- out. Opening it halts play (authentic WPC) — do it from attract/game-over.
     { id="hdr_op", header=true, label="== WILLIAMS OPERATOR ==" },
 
-    {
-        id="op_enter", label=function()
-            local api = rawget(_G, "PFX_Operator")
-            local m = (api and api.mode and api.mode()) or "?"
-            return "Service ENTER / Test  [" .. tostring(m) .. "]"
-        end,
-        fn=function()
-            local api = rawget(_G, "PFX_Operator")
-            if not api then return "Operator: mod not loaded" end
-            return "ENTER: " .. tostring(select(2, api.enter()))
-        end,
-    },
-    { id="op_up",   label="Service  +  (Up)",     fn=function()
+    { id="op_door", toggle=true, label=function()
+        local api = rawget(_G, "PFX_Operator")
+        local on = api and api.door_on and api.door_on()
+        return "Coin Door: " .. (on and "OPEN (held)" or "closed") .. "  [" .. tostring(api and api.mode and api.mode() or "?") .. "]"
+    end, fn=function()
+        local api = rawget(_G, "PFX_Operator"); if not api then return "Operator: mod not loaded" end
+        local on = api.door(not (api.door_on and api.door_on()))
+        return "Coin door " .. (on and "OPEN (held) — now press ENTER" or "closed")
+    end },
+    { id="op_enter", label="Service ENTER / Begin Test", fn=function()
+        local api = rawget(_G, "PFX_Operator"); if not api then return "Operator: mod not loaded" end
+        return "ENTER: " .. tostring(select(2, api.enter())) end },
+    { id="op_up",   label="Service  +  (Up / next)",  fn=function()
         local api = rawget(_G, "PFX_Operator"); if not api then return "Operator: mod not loaded" end
         return "+: " .. tostring(select(2, api.up())) end },
-    { id="op_down", label="Service  -  (Down)",   fn=function()
+    { id="op_down", label="Service  -  (Down / prev)", fn=function()
         local api = rawget(_G, "PFX_Operator"); if not api then return "Operator: mod not loaded" end
         return "-: " .. tostring(select(2, api.down())) end },
-    { id="op_esc",  label="Service ESCAPE (Exit)", fn=function()
+    { id="op_esc",  label="Service ESCAPE (back)", fn=function()
         local api = rawget(_G, "PFX_Operator"); if not api then return "Operator: mod not loaded" end
         return "ESC: " .. tostring(select(2, api.escape())) end },
-    { id="op_coin", label="Insert Coin", fn=function()
+    { id="op_close", label="Close Operator Menu (release)", fn=function()
         local api = rawget(_G, "PFX_Operator"); if not api then return "Operator: mod not loaded" end
-        return "Coin: " .. tostring(select(2, api.coin())) end },
-    { id="op_dbg",  toggle=true, label="ROM Debug Display", fn=function()
-        local api = rawget(_G, "PFX_Operator"); if not api then return "Operator: mod not loaded" end
-        return "Debug: " .. tostring(select(2, api.toggle_debug())) end },
+        return "Closed: " .. tostring(select(2, api.release_all())) end },
 
     -- == MAX & UNLOCK ==========================================================
     { id="hdr_max", header=true, label="== MAX & UNLOCK ==" },

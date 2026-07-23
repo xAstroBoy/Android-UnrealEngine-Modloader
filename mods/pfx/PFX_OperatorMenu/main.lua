@@ -152,41 +152,81 @@ local function argslot()
   ST.presses = (ST.presses + 1) % 4
   return ST.buf + 16 * ST.presses, ST.bufr + 16 * ST.presses
 end
-local function set_switch(kind, m, sw, on)
-  local fn = (kind == "matrix") and "swset" or "coindoor"
-  local cls = machine_ok(ST.wpc) and (m == ST.wpc) and "wpc_" or "s11_"
-  local a, ar = argslot()
-  MemWriteU64(ar, (on and (sw | 0x100000000) or sw))   -- bytes0-3=sw LE, byte4=on
-  local ok = pcall(function()
-    CallNative(IntToPtr(resolve(cls .. fn)), "vpp", IntToPtr(m), IntToPtr(a))
+-- ── WPC operator-menu control (direct memory PIN — beats the per-frame sync) ──
+-- CRACKED from the TAF ROM's own switch-name table (anchored by sw14=PLUMB BOB
+-- TILT, which NoTilt confirms): the emulated WPC ROM gates its service menu on
+-- the "COIN DOOR CLOSED" switch = **sw21** = matrix byte machine+25186 bit0. The
+-- service BUTTONS are the cabinet byte machine+25181: coins bits0-3, ESCAPE bit4,
+-- DOWN bit5, UP bit6, ENTER bit7. The game re-syncs these every frame, so a
+-- one-shot write is stomped — we PIN the door open every frame while operator
+-- mode is on, and TAP a button by pinning its bit ~180ms. Entering the menu
+-- HALTS play (authentic WPC behaviour) — use it in attract / between games.
+local COIN_BYTE = 25181
+local DOOR_BYTE = 25186          -- sw21 lives here (WPC col 2 = m+25185+1)
+local DOOR_BIT  = 0x01           -- sw21 bit0 = COIN DOOR CLOSED
+-- door-open polarity: sw21 reads 0 while the ROM shows "door closed", so the
+-- OPEN state is the opposite (SET). Flip if a build proves inverted.
+local DOOR_OPEN_SET = true
+local BTN = { enter = 0x80, up = 0x40, down = 0x20, escape = 0x10, coin = 0x01 }
+
+local function wpc_live() return machine_ok(ST.wpc) end
+local function door_write(open)
+  if not wpc_live() then return end
+  pcall(function()
+    local v = MemReadU64(ST.wpc + DOOR_BYTE) & 0xFF
+    local want = (open == DOOR_OPEN_SET) and (v | DOOR_BIT) or (v & (~DOOR_BIT & 0xFF))
+    MemWriteU8(ST.wpc + DOOR_BYTE, want)
   end)
-  return ok
 end
--- press = on now + auto-release after ~180ms (ROM IRQ scans switches every ms;
--- a real human press is ~100ms+, service menus expect distinct presses)
-local function press(sw, kind)
-  local m, cls = machine()
-  if not m then return false, cls end
+
+-- Persistent "operator mode": hold the coin door OPEN every frame so the ROM's
+-- service buttons work. One gen-guarded loop; toggling off releases the door.
+local function set_door(on)
+  ST.door_on = on and true or false
+  if ST.door_on then unharden() end
+  if ST.door_on and not ST.door_loop then
+    ST.door_loop = true
+    LoopAsync(1, function()
+      if _G._OPM_GEN ~= MY_GEN or not ST.door_on then
+        door_write(false)                    -- release (door "closed") on exit
+        ST.door_loop = false
+        return true
+      end
+      door_write(true)                        -- pin door OPEN
+      return false
+    end)
+  end
+  return ST.door_on
+end
+
+-- Tap a cabinet service button (~180ms), auto-holding the door open first.
+local function tap(name)
+  if not wpc_live() then return false, "no WPC machine (play a Williams table)" end
+  local bit = BTN[name]; if not bit then return false, "unknown button " .. tostring(name) end
   unharden()
-  if not set_switch(kind, m, sw, true) then return false, "native call failed" end
-  local slotm, slotsw = m, sw
-  LoopAsync(180, function()
-    -- table could unload mid-hold: never touch a machine that stopped
-    -- passing the vtable check
-    if machine_ok(slotm) then
-      pcall(function() set_switch(kind, slotm, slotsw, false) end)
-    end
-    return true                                        -- one-shot
+  set_door(true)                              -- ensure the door is held open
+  local held = 0
+  LoopAsync(1, function()
+    held = held + 1
+    if not wpc_live() then return true end
+    pcall(function()
+      local v = MemReadU64(ST.wpc + COIN_BYTE) & 0xFF
+      -- one clean press: assert ~90ms, then release + hold released a few frames
+      -- so the ROM sees a single edge (a longer hold auto-repeats and over-steps).
+      if held <= 9 then v = v | bit else v = v & (~bit & 0xFF) end
+      MemWriteU8(ST.wpc + COIN_BYTE, v)
+    end)
+    return held > 16
   end)
-  return true, string.format("%s %s sw%d pressed", cls, kind or "coindoor", sw)
+  return true, name .. " tapped (door held open)"
 end
--- panic: force-release everything we could have left held
+
+-- panic: release the door AND all cabinet buttons
 local function release_all()
-  local m, cls = machine()
-  if not m then return false, cls end
-  if cls == "WPC" then pcall(function() MemWriteU8((m & 0x00FFFFFFFFFFFFFF) + WPC_COINBYTE, 0) end)
-  else for sw = 1, 8 do set_switch(nil, m, sw, false) end end
-  return true, cls .. " coin-door switches cleared"
+  if not wpc_live() then return false, "no WPC machine" end
+  set_door(false)
+  pcall(function() MemWriteU8(ST.wpc + COIN_BYTE, 0) end)
+  return true, "coin door released + buttons cleared"
 end
 
 -- ── debug displays ───────────────────────────────────────────────────────────
@@ -255,13 +295,18 @@ end)
 
 -- ── Public API (menu / other mods) ──────────────────────────────────────────
 _G.PFX_Operator = {
-  -- WPC service buttons (coin-door column): the ROM's own operator UI
-  enter  = function() return press(8) end,   -- ENTER / BEGIN TEST -> service menu
-  up     = function() return press(7) end,   -- + / volume up / navigate
-  down   = function() return press(6) end,   -- - / volume down / navigate
-  escape = function() return press(5) end,   -- ESCAPE / service credit
-  coin   = function() return press(1) end,   -- left coin chute
-  press        = press,                      -- (sw, kind: nil=coindoor|"matrix")
+  -- Operator mode: hold the coin door OPEN so the ROM's service buttons work.
+  -- Toggling ON then tapping ENTER opens the real WPC operator menu (halts play).
+  door        = set_door,                    -- set_door(true/false)
+  door_toggle = function() return set_door(not ST.door_on) end,
+  door_on     = function() return ST.door_on == true end,
+  -- WPC service buttons — tap (door auto-held open)
+  enter  = function() return tap("enter")  end,   -- ENTER / BEGIN TEST
+  up     = function() return tap("up")     end,   -- + / navigate up
+  down   = function() return tap("down")   end,   -- - / navigate down
+  escape = function() return tap("escape") end,   -- ESCAPE / back / exit
+  coin   = function() return tap("coin")   end,   -- insert a coin
+  tap          = tap,
   release_all  = release_all,
   toggle_debug = toggle_debug,               -- per-machine emulator debug display
   toggle_romdbg= toggle_romdbg,              -- global YUP ROM-debug flag
@@ -280,17 +325,17 @@ pcall(function() RegisterCommand("op_status", function()
     TAG, API.mode(), ST.wpc or 0, ST.s11 or 0,
     tostring(machine_ok(ST.wpc)), tostring(machine_ok(ST.s11)))
 end) end)
+pcall(function() RegisterCommand("op_door",   function() return TAG..": coin door "..(set_door(not ST.door_on) and "OPEN (held)" or "closed") end) end)
 pcall(function() RegisterCommand("op_enter",  function() return r(API.enter)  end) end)
 pcall(function() RegisterCommand("op_up",     function() return r(API.up)     end) end)
 pcall(function() RegisterCommand("op_down",   function() return r(API.down)   end) end)
 pcall(function() RegisterCommand("op_esc",    function() return r(API.escape) end) end)
 pcall(function() RegisterCommand("op_coin",   function() return r(API.coin)   end) end)
-pcall(function() RegisterCommand("op_press",  function(a) return TAG..": "..tostring(select(2, press(tonumber(a) or 8))) end) end)
-pcall(function() RegisterCommand("op_matrix", function(a) return TAG..": "..tostring(select(2, press(tonumber(a) or 14, "matrix"))) end) end)
+-- probe helper: flip the door-open polarity if a build proves inverted
 pcall(function() RegisterCommand("op_release",function() return r(API.release_all) end) end)
 pcall(function() RegisterCommand("op_dbg",    function() return r(API.toggle_debug) end) end)
 pcall(function() RegisterCommand("op_romdbg", function() return r(API.toggle_romdbg) end) end)
 pcall(function() RegisterCommand("op_text",   function(a) return TAG..": "..tostring(select(2, debug_text(a or ""))) end) end)
 pcall(function() RegisterCommand("op_sound",  function(a) return TAG..": "..tostring(select(2, play_sound(tonumber(a) or 1))) end) end)
 
-Log(TAG .. ": v1 ready — op_status, op_enter/up/down/esc/coin, op_press <n>, op_matrix <n>, op_dbg, op_romdbg, op_text <s>, op_sound <n>")
+Log(TAG .. ": v2 ready — WPC operator menu via sw21 (COIN DOOR CLOSED). op_door (toggle hold-open), op_enter/up/down/esc/coin, op_release, op_dbg. Open from attract/game-over (opening it halts play, authentic WPC).")
