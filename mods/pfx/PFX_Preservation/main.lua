@@ -373,18 +373,18 @@ end
 --   (chunkId = 2000 + PitID verified live: all 31 loose paks + all 11 OBB
 --    chunks on the dev Quest map 1:1 onto the 42 PitIDs)
 --
--- Descriptor identity is unknown (16-byte {descriptor,package} pairs, state
--- byte at desc+73, nothing readable ties a desc to a table), so every rule
--- must be safe while blind:
+-- Descriptor identity: desc+40/desc+48 is that descriptor's tableID
+-- array/count (from the IDA reverse of GetTableState), so the pin is EXACT
+-- when those read sane, with blind-safe fallbacks when they don't:
 --   * only Remote(2) descs are ever flipped — NEVER Downloading/Downloaded/
 --     Mounting(3/4/5): a real download in progress is never disturbed
---   * nothing missing on disk  -> flip Remote immediately (v1 softlock fix)
---   * something missing        -> bShouldAcquireMissingChunksOnLoad=true so
---     the game ACTUALLY downloads it; a Remote desc is only flipped once it
---     has sat still for DLPIN_STUCK_TICKS with no download running anywhere —
---     a genuinely-missing table leaves Remote by itself once acquisition
---     starts, a bogus-Remote never does, so flipping only the stuck ones
---     rescues the softlock without eating anyone's download
+--   * Remote desc, ALL its tables' content on disk -> flip (softlock fix)
+--   * Remote desc with missing content -> leave it alone; acquire is on and
+--     the game downloads it for real
+--   * id array unreadable -> blind rules: flip immediately when nothing is
+--     missing anywhere; else only after DLPIN_STUCK_TICKS with no download
+--     running (a downloadable desc leaves Remote by itself, a bogus one never
+--     does)
 --   * a finished download appears as the loose pak -> presence cache refresh,
 --     acquire drops back to false when nothing is missing anymore
 --
@@ -392,6 +392,7 @@ end
 --   0x76AE910 = table/package manager global (NULL until a load is in flight)
 --   mgr+96  = descriptor array (16-byte {descriptor, package} pairs)
 --   mgr+104 = descriptor count
+--   desc+40 = int32 tableID array for this descriptor, desc+48 = its count
 --   desc+73 = EPFXPackageState byte (Invalid=0 Validating=1 Remote=2
 --             Downloading=3 Downloaded=4 Mounting=5 Mounted=6 Attached=7)
 -- ============================================================================
@@ -466,6 +467,23 @@ local function sync_acquire()
     return miss
 end
 
+local DESC_IDS   = 40
+local DESC_IDCNT = 48
+
+-- desc -> list of tableIDs it covers, or nil when the array reads as garbage
+local function desc_pits(desc)
+    local arr = MemReadU64(desc + DESC_IDS)
+    local cnt = MemReadU64(desc + DESC_IDCNT) & 0xFFFFFFFF
+    if not (arr and arr > 0x1000 and arr < 0x8000000000 and cnt > 0 and cnt <= 16) then return nil end
+    local pits = {}
+    for j = 0, cnt - 1 do
+        local id = MemReadU64(arr + j * 4) & 0xFFFFFFFF
+        if id == 0 or id > 100000 then return nil end          -- not a plausible PitID
+        pits[#pits + 1] = id
+    end
+    return pits
+end
+
 local function pin_download_states()
     local base = YUP.GetLibBase(); if not base or base == 0 then return 0 end
     local mgr = MemReadU64(base + MGR_RVA)
@@ -494,10 +512,25 @@ local function pin_download_states()
         if states[desc] == 2 then                               -- Remote only
             local ticks = (remote_seen[desc] or 0) + 1
             seen_now[desc] = ticks
-            -- flip immediately when nothing is missing; while content is
-            -- missing, flip only a STUCK Remote with no download running
-            -- (the game would have moved a downloadable desc to 3 by now)
-            if (not have_missing) or (ticks >= DLPIN_STUCK_TICKS and not downloading) then
+
+            local flip, hold = false, false
+            local pits = desc_pits(desc)
+            if pits then
+                -- exact identity: flip only when every table this descriptor
+                -- covers is actually on disk; hold a missing one for the real
+                -- download (acquire is already on)
+                flip = true
+                for _, pid in ipairs(pits) do
+                    if not content_present(pid, false) then flip = false; hold = true; break end
+                end
+            end
+            if not flip and not hold then
+                -- blind fallback: immediate when nothing is missing anywhere,
+                -- else only a stuck Remote with no download running (the game
+                -- would have moved a downloadable desc to 3 by now)
+                flip = (not have_missing) or (ticks >= DLPIN_STUCK_TICKS and not downloading)
+            end
+            if flip then
                 local w = MemReadU64(desc + STATE_OFF)
                 MemWriteU64(desc + STATE_OFF, (w & ~0xFF) | 6)  -- -> Mounted
                 flipped = flipped + 1
