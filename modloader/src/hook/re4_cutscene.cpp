@@ -78,6 +78,13 @@ namespace re4_cutscene
         constexpr uintptr_t kVrSetFade      = 0x62B3A10;
         constexpr uintptr_t kVrSetTimedFade = 0x62B4998;
 
+        // Fire gates. joyFireTrg is the native EDGE, joyFireOn the native HELD
+        // (called, never hooked — it is how we ask "is the trigger down?" without
+        // knowing the key-mask layout). WasTriggerJustPressed is the UE-side edge.
+        constexpr uintptr_t kJoyFireTrg            = 0x600A978;
+        constexpr uintptr_t kJoyFireOn             = 0x600A890;
+        constexpr uintptr_t kWasTriggerJustPressed = 0x62DAAD8;
+
         // cObjMgr::move — the pool tick gameMainLoop runs. Unguarded, it calls
         // vtable[0] on scene-torn-down objects (PC=0). This is the FUNCTION ENTRY;
         // the crash site is +52 and must NOT be hooked directly.
@@ -134,6 +141,10 @@ namespace re4_cutscene
 
         // THE VR fade — the one you actually see in the headset.
         if (native_hooks::install_vr_fade_suppress(b + kVrSetFade, b + kVrSetTimedFade)) ++ok;
+
+        // Rapidfire that keeps the gun's laser dot (pulsed edge, not stuck level).
+        if (native_hooks::install_rapidfire_pulse(b + kJoyFireTrg, b + kJoyFireOn,
+                                                  b + kWasTriggerJustPressed)) ++ok;
 
         // MUST come before unlock_gameloop: running gameMainLoop mid-scene drives
         // cObjMgr::move over objects the scene tore down, and it calls vtable[0]

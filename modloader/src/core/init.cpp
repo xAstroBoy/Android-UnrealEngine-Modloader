@@ -45,6 +45,7 @@
 #include <cstring>
 #include <cinttypes>
 #include <fstream>
+#include <exception>
 
 namespace
 {
@@ -403,8 +404,17 @@ namespace init
             (!classes.empty() || !structs.empty() || !enums.empty()))
         {
             logger::log_info("DEFER", "Generating SDK (one-time boot dump)...");
-            sdk_gen::generate();
-            logger::log_info("DEFER", "SDK written to %s", paths::sdk_dir().c_str());
+            // The boot dump must never take the game down. sdk_gen::generate()
+            // now isolates each pass, but keep a hard backstop here so nothing
+            // (this block's own gnames/gobjects walks included) can escape to
+            // std::terminate. On a memory-starved device the realistic failure is
+            // std::bad_alloc; we swallow it, leave the marker UNwritten, and let a
+            // future launch retry when memory is free.
+            bool dump_threw = false;
+            try
+            {
+                sdk_gen::generate();
+                logger::log_info("DEFER", "SDK written to %s", paths::sdk_dir().c_str());
 
             // ── GNames dump (best-effort — FName pool walking can fault) ────
             {
@@ -485,7 +495,27 @@ namespace init
                 }
             }
 
-            // Mark the one-time boot dump as done — skip it on future launches.
+            }
+            catch (const std::exception &e)
+            {
+                dump_threw = true;
+                logger::log_error("DEFER", "SDK boot dump threw '%s' (likely OOM under memory pressure). "
+                                           "Game continues; marker NOT written — a future launch will retry.",
+                                  e.what());
+            }
+            catch (...)
+            {
+                dump_threw = true;
+                logger::log_error("DEFER", "SDK boot dump threw an unknown exception. "
+                                           "Game continues; marker NOT written — a future launch will retry.");
+            }
+
+            // Mark the one-time boot dump as done ONLY on a clean run — skip it on
+            // future launches. If a pass failed (sdk_gen::had_errors) or the block
+            // threw, we deliberately leave the marker absent so the auto-dump runs
+            // again next launch (honouring "no SDK ⇒ auto-dump") — but now without
+            // crashing, since the failure is caught either way.
+            if (!dump_threw && !sdk_gen::had_errors())
             {
                 FILE *mf = fopen(dump_marker.c_str(), "w");
                 if (mf)
@@ -496,6 +526,11 @@ namespace init
                 logger::log_info("DEFER", "One-time boot dump complete — marker written (%s). "
                                           "Future launches skip auto-dump; use bridge dump_sdk/dump_ida to refresh.",
                                  dump_marker.c_str());
+            }
+            else
+            {
+                logger::log_warn("DEFER", "SDK boot dump incomplete — marker NOT written; auto-dump will "
+                                          "retry on the next launch. Free device memory (reboot) for the best chance.");
             }
         }
         else if (!reflection_ok)

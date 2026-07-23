@@ -79,7 +79,12 @@ local function unharden()
   if _G.PFXCore then _G.PFXCore.unharden()
   else pcall(function() CallNativeBySymbol("prctl", "iuuuuu", 4, 1, 0, 0, 0) end) end
 end
-local function heap(p) return p and p > 0x7000000000 and p < 0x8000000000 end
+-- Game heap floor was 0x7000000000, but the heap base VARIES per launch (ASLR +
+-- memory pressure): some sessions it lands at 0x6F.. (verified this device), which
+-- a 0x70 floor wrongly rejects → nothing captured (mode wrongly falls back to ZEN).
+-- 0x60 covers the observed 0x6F–0x7F game heap; downstream structure checks validate.
+local HEAP_LO = 0x6000000000
+local function heap(p) return p and p > HEAP_LO and p < 0x8000000000 end
 local function resolve(name)
   local s = SIG[name]
   if _G.PFXCore and _G.PFXCore.resolve then return _G.PFXCore.resolve(name, s[1], s[2]) end
@@ -123,13 +128,16 @@ local function refresh_captures()
   if heap(w) then ST.wpc = w end
 end
 local function install()
-  if ST.hooked then return end
+  -- Gate on MY_GEN, not a bare bool: ST persists in _G across a hot-reload, so a
+  -- plain `if ST.hooked` skips re-registration after a reload, leaving the OLD
+  -- capture closures (old heap range / freed slots) live. Re-arm once per (re)load.
+  if ST.hooked == MY_GEN then return end
   if not alloc_slots() then Log(TAG .. ": capture-slot alloc FAILED — score control disabled"); return end
   local function cap(rva_addr, name, slot)
     local ok = false
     pcall(function()
-      -- capture x0 (the object ptr) into `slot` when it's a heap ptr [0x70..,0x80..)
-      ok = RegisterNativeCapture(IntToPtr(rva_addr), name, 0, IntToPtr(slot), 0x7000000000, 0x8000000000)
+      -- capture x0 (the object ptr) into `slot` when it's a heap ptr [HEAP_LO,0x80..)
+      ok = RegisterNativeCapture(IntToPtr(rva_addr), name, 0, IntToPtr(slot), HEAP_LO, 0x8000000000)
     end)
     return ok ~= false
   end
@@ -137,7 +145,7 @@ local function install()
   cap(resolve("rom_refresh"), "sctl_rm",  ST.slot.rm)
   cap(resolve("rom_read"),    "sctl_mm",  ST.slot.mm)
   cap(resolve("wpc_read"),    "sctl_wpc", ST.slot.wpc)
-  ST.hooked = true
+  ST.hooked = MY_GEN
   Log(TAG .. ": capture hooks armed (PURE-C++, no Lua on ROM thread) — Zen sb + S11 rm/mm + WPC")
 end
 
@@ -182,7 +190,7 @@ local function is_wpc() return heap(ST.wpc) end
 local function wpc_sb()
   if not heap(ST.wpc) then return 0 end
   local sb = ST.wpc - WPC_SB_OFF
-  if MemReadU64(sb + 8) < 0x7000000000 then return 0 end   -- *(sb+8) = S must be a heap ptr
+  if MemReadU64(sb + 8) < HEAP_LO then return 0 end        -- *(sb+8) = S must be a heap ptr
   return sb
 end
 local function wpc_total()

@@ -12,6 +12,8 @@
 #include <cstring>
 #include <algorithm>
 #include <atomic>
+#include <sys/uio.h>   // process_vm_readv — fault-tolerant probe, see safe_probe_readable
+#include <unistd.h>    // getpid
 
 namespace rebuilder
 {
@@ -147,6 +149,21 @@ namespace rebuilder
         return nullptr;
     }
 
+    // Fault-tolerant readability probe. Unlike a direct dereference (which raises
+    // SIGSEGV on an unmapped page) process_vm_readv on our OWN pid returns -1/EFAULT,
+    // so a freed object can be detected instead of killing the process. Used to close
+    // the TOCTOU between is_readable_ptr's cached map and the actual load.
+    static bool safe_probe_readable(const void *p, size_t n)
+    {
+        if (!p) return false;
+        unsigned char buf[64];
+        if (n > sizeof(buf)) n = sizeof(buf);
+        struct iovec local  { buf, n };
+        struct iovec remote { const_cast<void *>(p), n };
+        ssize_t got = ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0);
+        return got == static_cast<ssize_t>(n);
+    }
+
     std::vector<ue::UObject *> RebuiltClass::get_all_instances()
     {
         // Flags that indicate the object's C++ fields are not yet populated or are being freed.
@@ -170,6 +187,19 @@ namespace rebuilder
             // pointers that aren't in a mapped page BEFORE any dereference. (Tombstone: crash in
             // get_all_instances+144 reading obj+0x10 during a FindAllOf mid-tick.)
             if (!obj || !reflection::is_readable_ptr(obj))
+                continue;
+            // ⚠ is_readable_ptr is NOT sufficient — it consults a CACHED memory map
+            // (see refresh_memory_map()), so a page unmapped since the last refresh
+            // still reads as "mapped". FindAllOf also runs OFF the game thread, so the
+            // game can free an object between the check and the load. That is a
+            // genuine TOCTOU and no pointer test can close it.
+            //   Tombstone 14 (2026-07-21): SIGSEGV at get_all_instances+156,
+            //   fault addr = x24+0x10 — the very read is_valid_uobject does, on an
+            //   object that passed is_readable_ptr one instruction earlier. An earlier
+            //   crash at +144 was "fixed" by adding that check; it came back.
+            // So probe the header through process_vm_readv, which returns EFAULT
+            // instead of raising SIGSEGV. This cannot fault, only fail.
+            if (!safe_probe_readable(obj, 0x20))
                 continue;
             if (!ue::is_valid_uobject(obj))
                 continue;

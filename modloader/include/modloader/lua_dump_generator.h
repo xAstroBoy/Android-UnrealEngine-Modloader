@@ -37,4 +37,9 @@ namespace sdk_gen
     int struct_count();
     int enum_count();
 
+    // True if any pass of the most recent generate() failed (e.g. std::bad_alloc
+    // under memory pressure). Callers use this to avoid marking a partial dump as
+    // a completed one-time dump.
+    bool had_errors();
+
 } // namespace sdk_gen

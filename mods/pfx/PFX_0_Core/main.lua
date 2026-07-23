@@ -15,6 +15,12 @@
 local TAG = "PFX_0_Core"
 Log(TAG .. ": loading — anti-tamper unbind + shared YUP access")
 
+-- Reload generation: bumps on every (re)load so install() re-registers its native
+-- hooks after a hot-reload instead of skipping (a bare bool guard left the old,
+-- now-dead GetBall closure in place and S went stale across table reloads).
+_G._CORE_GEN = (_G._CORE_GEN or 0) + 1
+local MY_GEN = _G._CORE_GEN
+
 -- ── 1. Anti-tamper: keep the process DUMPABLE ───────────────────────────────
 local PR_SET_DUMPABLE = 4
 local function unharden()
@@ -29,7 +35,14 @@ local function base()
   local b = YUP.GetLibBase()
   return (type(b) == "number") and b or PtrToInt(b)
 end
-local function heap(p) return p and p > 0x7000000000 and p < 0x8000000000 end
+-- Game heap floor. Was 0x7000000000, but the heap base VARIES per launch (ASLR +
+-- memory pressure): this session it landed at 0x6F.. (verified: ball array/holders/
+-- structs in 0x6f21e04000-0x6f27215000). A 0x70 floor made each_ball() reject every
+-- holder → 0 balls found → FingerMode "can't grab", score/operator captured nothing.
+-- 0x60 covers the observed 0x6F–0x7F game heap; valid_S()'s vtable check (not this
+-- floor) remains the strong validator, so a looser floor is safe. Exported as
+-- PFXCore.heap and used by every PFX mod's pointer validation.
+local function heap(p) return p and p > 0x6000000000 and p < 0x8000000000 end
 
 -- ── UPDATE-RESISTANT address resolution (AOB signature → RVA fallback) ───────
 -- Mods should NOT hardcode libUnreal.so RVAs (they rot every game update).
@@ -78,7 +91,7 @@ local OFF = {
 
 -- ── S (board) + M (manager) capture via native hooks ─────────────────────────
 local function install()
-  if _G._CORE_SHOOK then return end
+  if _G._CORE_SHOOK == MY_GEN then return end
   local ok = false
   pcall(function()
     ok = RegisterNativeHookAt(IntToPtr(base() + OFF.GETBALL), "core_getS",
@@ -91,7 +104,7 @@ local function install()
         if MemReadU64(m + 8) == (_G._CORE_S or 0) then _G._CORE_M = m end
       end, nil)
   end)
-  _G._CORE_SHOOK = ok
+  if ok then _G._CORE_SHOOK = MY_GEN end
   Log(TAG .. ": S/M capture hooks = " .. tostring(ok))
 end
 
@@ -100,7 +113,21 @@ local function valid_S(s)
   local vp = 0; pcall(function() vp = MemReadU64(s) end)
   return vp == base() + OFF.VTABLE_S
 end
-local function get_S() local s = _G._CORE_S or 0; if valid_S(s) then return s end return 0 end
+-- get_S SELF-HEALS. The GetBall-captured _CORE_S goes stale across a table reload
+-- (the board S is freed + realloc'd, and GetBall may not re-fire before a caller
+-- needs S — that's the "can't grab after reload" bug). The manager M is long-lived
+-- and *(M+8) always points at the CURRENT board, so when the fast-path S fails its
+-- vtable check, re-derive from M+8, validate it, and re-seed the fast path.
+local function get_S()
+  local s = _G._CORE_S or 0
+  if valid_S(s) then return s end
+  local m = _G._CORE_M or 0
+  if m ~= 0 then
+    local s2 = 0; pcall(function() s2 = MemReadU64(m + 8) end)
+    if valid_S(s2) then _G._CORE_S = s2; return s2 end
+  end
+  return 0
+end
 local function get_M() return _G._CORE_M or 0 end
 
 -- iterate the real in-array balls: fn(index, ball_struct, holder)

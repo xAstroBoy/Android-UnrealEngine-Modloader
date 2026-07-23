@@ -262,6 +262,40 @@ local ACTIONS = {
         end,
     },
 
+    -- == WILLIAMS OPERATOR ====================================================
+    -- Real coin-door service buttons on the emulated Williams ROMs
+    -- (PFX_OperatorMenu). ENTER on a WPC table opens the ROM's own
+    -- operator/service menu on the DMD: tests, adjustments, audits.
+    { id="hdr_op", header=true, label="== WILLIAMS OPERATOR ==" },
+
+    {
+        id="op_enter", label=function()
+            local api = rawget(_G, "PFX_Operator")
+            local m = (api and api.mode and api.mode()) or "?"
+            return "Service ENTER / Test  [" .. tostring(m) .. "]"
+        end,
+        fn=function()
+            local api = rawget(_G, "PFX_Operator")
+            if not api then return "Operator: mod not loaded" end
+            return "ENTER: " .. tostring(select(2, api.enter()))
+        end,
+    },
+    { id="op_up",   label="Service  +  (Up)",     fn=function()
+        local api = rawget(_G, "PFX_Operator"); if not api then return "Operator: mod not loaded" end
+        return "+: " .. tostring(select(2, api.up())) end },
+    { id="op_down", label="Service  -  (Down)",   fn=function()
+        local api = rawget(_G, "PFX_Operator"); if not api then return "Operator: mod not loaded" end
+        return "-: " .. tostring(select(2, api.down())) end },
+    { id="op_esc",  label="Service ESCAPE (Exit)", fn=function()
+        local api = rawget(_G, "PFX_Operator"); if not api then return "Operator: mod not loaded" end
+        return "ESC: " .. tostring(select(2, api.escape())) end },
+    { id="op_coin", label="Insert Coin", fn=function()
+        local api = rawget(_G, "PFX_Operator"); if not api then return "Operator: mod not loaded" end
+        return "Coin: " .. tostring(select(2, api.coin())) end },
+    { id="op_dbg",  toggle=true, label="ROM Debug Display", fn=function()
+        local api = rawget(_G, "PFX_Operator"); if not api then return "Operator: mod not loaded" end
+        return "Debug: " .. tostring(select(2, api.toggle_debug())) end },
+
     -- == MAX & UNLOCK ==========================================================
     { id="hdr_max", header=true, label="== MAX & UNLOCK ==" },
 

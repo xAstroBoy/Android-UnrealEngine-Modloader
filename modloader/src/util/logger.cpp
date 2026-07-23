@@ -202,7 +202,15 @@ namespace logger
         if (s_file)
         {
             fprintf(s_file, "%s\n", line);
-            fflush(s_file);
+            // Flush only WARN/ERROR. A per-line fflush() is a SYNCHRONOUS storage
+            // write on the CALLING (often game) thread; a burst of verbose INFO
+            // lines (menu CreateWidget, TMap walks, class rebuilds) turned into
+            // dozens of blocking fsyncs inside a single frame → visible lag spikes.
+            // INFO/DEBUG rely on stdio buffering + the in-memory ring (get_tail and
+            // the crash handler dump the ring, NOT the live file), so no diagnostic
+            // content is lost; the file still gets every line, just batched.
+            if (level[0] == 'W' || level[0] == 'E')
+                fflush(s_file);
         }
 
         // Buffer recent lines
@@ -251,6 +259,10 @@ namespace logger
 
     void log_info(const char *source, const char *fmt, ...)
     {
+        if (s_min_level > 1) return;   // gated: INFO suppressed at warn/error level.
+                                       // (Was unconditional — the log_level control
+                                       // only ever gated DEBUG, so setting "warn"
+                                       // never actually quieted the INFO flood.)
         std::lock_guard<std::mutex> lock(s_mutex);
         char buf[4096];
         va_list args;
@@ -262,6 +274,7 @@ namespace logger
 
     void log_warn(const char *source, const char *fmt, ...)
     {
+        if (s_min_level > 2) return;   // gated: WARN suppressed at error level
         std::lock_guard<std::mutex> lock(s_mutex);
         char buf[4096];
         va_list args;

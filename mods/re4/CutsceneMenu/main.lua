@@ -29,6 +29,7 @@ local ITEMS = {
     { "re4.cutscene_unfreeze_input",       "Unfreeze input",       "KeyStop masks nothing during a scene" },
     { "re4.cutscene_hide_dupes",           "Hide duplicate Leon",  "WARNING: hides YOUR Leon - char vanishes in door-kick scenes" },
     { "re4.cutscene_normal_move_state",    "Force normal state",   "WARNING: PINS YOU (stand-idle handler). Off unless testing." },
+    { "re4.cutscene_smart_move_state",     "Collision try v2",     "restore Leon's SAVED pre-scene state so his collided move path runs" },
     { "re4.cutscene_ride_along",           "Ride-along camera",    "anchor the rig behind Leon each frame" },
     { "re4.drive_player_in_cutscene",      "Drive player",         "call cPlayer::move from the cutscene pawn tick" },
     { "re4.drive_entities_in_cutscene",    "Drive NPCs",           "tick every scene entity so NPCs animate" },
@@ -75,7 +76,13 @@ local function register()
         Log(TAG .. ": [WARN] SharedAPI.DebugMenu.RegisterSubMenu missing - is DebugMenuAPI loaded?")
         return false
     end
-    api.RegisterSubMenu(TAG, "Cutscenes", function()
+    -- ⚠ onEnter must call NavigateTo. RegisterSubMenu only puts an entry on the
+    -- root Mods page whose callback is onEnter; it does NOT open a page by itself.
+    -- api.AddItem is only valid INSIDE a populate() running under NavigateTo, so
+    -- calling AddItem straight from onEnter silently does nothing and the entry
+    -- looks dead ("is not entering"). populate() re-runs on every render/Refresh,
+    -- which is what makes the [ON]/[OFF] labels update after a toggle.
+    local function populate()
         for _, item in ipairs(ITEMS) do
             api.AddItem(label_for(item), function()
                 toggle(item)
@@ -103,6 +110,10 @@ local function register()
             Notify(TAG, "Working set restored")
             if api.Refresh then pcall(api.Refresh) end
         end)
+    end
+
+    api.RegisterSubMenu(TAG, "Cutscenes", function()
+        api.NavigateTo({ name = "Cutscenes", populate = populate })
     end)
     registered = true
     Log(TAG .. ": registered Cutscenes sub-page (" .. #ITEMS .. " toggles)")

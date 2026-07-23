@@ -82,7 +82,12 @@ local MOVE_THRESH = 0.10  -- m/s; staged balls measured ~0.01, in-play ~0.3+
 -- lock-state — not per-frame like velocity), so a launched ball keeps 0xE2==1 and a
 -- ball that gets locked flips to 0. holder+0x4A==0 (not in a kicker) is kept as a cheap
 -- extra gate. No get_M / lock-array walk needed → 3 reads, fast at 90 Hz.
-local function fm_mapped(p) return p > 0x7000000000 and p < 0x8000000000 end
+-- Heap floor was 0x7000000000, but the game heap base VARIES per launch (ASLR +
+-- memory pressure). This session it landed at 0x6F.. (verified: S/ball structs in
+-- 0x6f21e04000-0x6f27215000), which a 0x70 floor wrongly rejected → the ball-scan
+-- found 0 in-play balls (active_balls=0, "can't grab"). 0x60 covers 0x6F–0x7F.
+local FM_HEAP_LO = 0x6000000000
+local function fm_mapped(p) return p > FM_HEAP_LO and p < 0x8000000000 end
 local function ball_active(h)
   local bs = MemReadU64(h + HOLDER_BS)                                    -- 0xA8 -> ball_struct
   if not fm_mapped(bs) then return false end
@@ -100,6 +105,7 @@ local enabled     = false   -- armed: loop runs and watches grip
 local grabbing    = false   -- derived each frame: is grip actually held right now
 local hand_side   = "MC_Right"
 local loop_active = false
+local idle_tick   = 0       -- idle-throttle counter for the steering loop (see start_loop)
 local cab_cache   = nil
 local cab_S       = 0       -- the S (physics container) the cached cabinet belongs to
 local force       = false   -- bridge test override (ignore grip)
@@ -117,7 +123,7 @@ local prev_hand   = nil     -- last good hand world pos (reject tracking-glitch 
 local HAND_JUMP   = 40.0    -- cm/frame: >this = a tracking glitch (hand can't teleport)
 
 local function clamp(v,lo,hi) if v<lo then return lo elseif v>hi then return hi else return v end end
-local function heap(p) return p and p > 0x7000000000 and p < 0x8000000000 end
+local function heap(p) return p and p > FM_HEAP_LO and p < 0x8000000000 end
 local function finite(v) return v == v and v < 1e6 and v > -1e6 end
 local function live(o) if not o then return false end local ok,v=pcall(function() return o:IsValid() end) return ok and v end
 
@@ -515,9 +521,25 @@ end
 local function start_loop()
   if loop_active then return end
   loop_active = true
-  LoopAsync(11, function()   -- ~90 Hz: plenty for steering + grip poll
+  LoopAsync(11, function()   -- ~90 Hz while steering; throttled to ~30 Hz when idle
     if _G._FM_GEN ~= MY_GEN then return true end   -- superseded by a newer reload -> die
     if not enabled then loop_active = false; grabbing = false; grab_h0 = nil; return true end
+
+    -- ── IDLE THROTTLE ────────────────────────────────────────────────────────
+    -- This body used to run at the full 90 Hz ALL THE TIME: the not-gripping path
+    -- returns false (= keep looping), so every tick still paid get_S() + an
+    -- OVRPlugin grip poll + Lua dispatch on the GAME THREAD even with both hands
+    -- empty. That is ~90 wasted passes/sec for the entire session, which is pure
+    -- frame-time for the 99% of play where nobody is grabbing a ball.
+    -- While actually steering we keep the full rate (it is a physics chase and
+    -- needs it). Idle, a third of that is plenty: worst-case grab detection is
+    -- delayed ~22ms, which is imperceptible, and idle cost drops by ~66%.
+    if not grabbing then
+      idle_tick = (idle_tick or 0) + 1
+      if idle_tick % 3 ~= 0 then return false end
+    else
+      idle_tick = 0
+    end
 
     local s = get_S(); if s == 0 then grabbing = false; grab_h0 = nil; return false end
 

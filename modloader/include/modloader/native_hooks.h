@@ -285,6 +285,22 @@ uint32_t cutscene_prompt_respawn_count();
 // calls that CREATE a fade (SetFade / SetTimedFade) inside the cutscene window.
 bool install_vr_fade_suppress(uintptr_t setfade, uintptr_t timedfade);
 uint32_t cutscene_vr_fades_killed_count();
+// Rapidfire that does NOT kill the gun's laser dot. The old byte patches turn the
+// fire signal from an EDGE into a LEVEL, so the 0->1 transition never recurs and
+// the laser (re-armed on that transition) stays off after the first shot. This
+// synthesises a fresh edge every N frames while the trigger is held instead.
+// re4.rapidfire.pulse (default OFF; turn the byte patches off when using it).
+// Cutscene collision via a RIG TETHER (re4.cutscene_rig_tether, default OFF).
+// The rig locomotes independently of Leon during a scene and nothing collides it,
+// so bound it to a radius around its start-of-scene anchor. Needs the pawn
+// pointer, captured into a slot by the caller (RegisterNativeCapture on a
+// function that takes the pawn in x0, e.g. AVR4GamePlayerPawn::UpdateVisibility).
+void cutscene_set_tether_pawn_slot(uintptr_t slot);
+void cutscene_set_tether_radius(uint32_t r);
+uint32_t cutscene_tether_pull_count();
+bool install_rapidfire_pulse(uintptr_t joyfiretrg, uintptr_t joyfireon, uintptr_t wastrigjust);
+uint32_t rapidfire_pulse_count();
+void rapidfire_set_interval(uint32_t frames);
 // Kill the black fade into/out of cutscenes. Hooks FadeSet @0x5F39930 and drops
 // the call while a Bio4 event is playing (the fade covered the hand-off to the
 // 2D theatre screen, which we no longer use). Fades outside scenes are stock.

@@ -30,6 +30,8 @@
 #include <ctime>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <new>
+#include <exception>
 
 namespace sdk_gen
 {
@@ -37,6 +39,11 @@ namespace sdk_gen
     static int s_class_count = 0;
     static int s_struct_count = 0;
     static int s_enum_count = 0;
+    // Set true when any pass of the last generate() failed (e.g. std::bad_alloc
+    // under memory pressure). The boot path uses this to decide whether to write
+    // the one-time .sdk_dumped marker — a partial/failed dump must NOT mark itself
+    // complete, so it re-attempts on a future launch when memory is free.
+    static bool s_had_errors = false;
 
     // ═══════════════════════════════════════════════════════════════════════
     // Utility helpers
@@ -1718,31 +1725,57 @@ namespace sdk_gen
         logger::log_info("SDK", "Generating SDK: %d classes, %d structs, %d enums...",
                          s_class_count, s_struct_count, s_enum_count);
 
+        s_had_errors = false;
         int total_files = 0;
 
-        // 1. UE4SS CXX Header Dump
-        total_files += generate_cxx_headers();
+        // Each pass runs in isolation: an exception (std::bad_alloc under memory
+        // pressure on a long-uptime device is the realistic one) is caught and
+        // logged instead of propagating to std::terminate and killing the game —
+        // a diagnostic dump must never crash the host. Catching also UNWINDS the
+        // failed pass's transient allocations, returning that memory to the
+        // allocator for the passes that follow to reuse, so an OOM in one pass
+        // doesn't doom the others.
+        //
+        // Order is by value-if-truncated: the outputs most useful for modding run
+        // first, and the legacy per-class SDK (thousands of tiny files, least
+        // essential, heaviest) runs last — so an OOM near the end still leaves the
+        // CXX headers, Lua annotations, and mappings on disk.
+        auto run_pass = [&](const char *name, int (*fn)())
+        {
+            try
+            {
+                total_files += fn();
+            }
+            catch (const std::exception &e)
+            {
+                s_had_errors = true;
+                logger::log_error("SDK", "pass '%s' failed: %s — continuing with remaining passes",
+                                  name, e.what());
+            }
+            catch (...)
+            {
+                s_had_errors = true;
+                logger::log_error("SDK", "pass '%s' failed (unknown exception) — continuing", name);
+            }
+        };
 
-        // 2. UE4SS Lua Type Annotations
-        total_files += generate_lua_types();
-
-        // 3. Legacy per-class SDK
-        total_files += generate_legacy_sdk();
-
-        // 4. Usmap binary mappings (FModel/UE4SS compatible)
-        total_files += generate_usmap();
-
-        // 5. IDA / Ghidra function-rename mappings (Dumper-7 style)
-        total_files += ida_map::generate();
+        run_pass("cxx_headers", &generate_cxx_headers);   // most useful for modding
+        run_pass("lua_types", &generate_lua_types);
+        run_pass("usmap", &generate_usmap);               // FModel/UE4SS mappings
+        run_pass("ida_map", []() -> int { return ida_map::generate(); });
+        run_pass("legacy_sdk", &generate_legacy_sdk);     // heaviest / least essential → last
 
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start);
 
-        logger::log_info("SDK", "SDK complete: %d classes, %d structs, %d enums (%d files in %lldms)",
+        logger::log_info("SDK", "SDK %s: %d classes, %d structs, %d enums (%d files in %lldms)",
+                         s_had_errors ? "completed WITH ERRORS" : "complete",
                          s_class_count, s_struct_count, s_enum_count, total_files, (long long)elapsed.count());
 
         return total_files;
     }
+
+    bool had_errors() { return s_had_errors; }
 
     int regenerate()
     {

@@ -2620,6 +2620,11 @@ static std::atomic<uint32_t>  g_unlock_hits{0};
 // room-transition fades, which must keep working.
 static std::atomic<uint32_t>  g_fade_window{0};        // frames of grace remaining
 static constexpr uint32_t     kFadeWindowFrames = 180; // ~3s at 60fps
+
+// Defined in the CUTSCENE COLLISION section below; called per frame from the
+// tick hook. Forward-declared because ABio4::Tick is the only per-frame hook we
+// own and it appears earlier in this file than the tether itself.
+static void tether_rig_to_leon(uintptr_t b);
 // LAYER 4: rewrite the scripted player state 5 -> 0 during a scene.
 // ⚠ DEFAULT OFF — THIS PINS THE PLAYER. Tried 2026-07-21 as a collision fix on the
 // theory that state 0 is a "superset" of the scene handler. It is NOT: state 0 with
@@ -2629,6 +2634,10 @@ static constexpr uint32_t     kFadeWindowFrames = 180; // ~3s at 60fps
 // Leave OFF unless you have a better dispatch target than plMove 0.
 static std::atomic<bool>      g_normal_move_state{false};
 static std::atomic<uint32_t>  g_state_rewrites{0};
+// LAYER 5: restore Leon's SAVED pre-scene state (dword_A5A3F38) instead of a
+// hardcoded 0. Default OFF until the collision probe says which way it goes.
+static std::atomic<bool>      g_smart_move_state{false};
+static std::atomic<uint32_t>  g_smart_rewrites{0};
 
 static uint64_t bio4tick_unlock_gameloop(void* self, float dt) {
     {
@@ -2682,6 +2691,9 @@ static uint64_t bio4tick_unlock_gameloop(void* self, float dt) {
                 // ── LAYER 3: rebuild the trigger EDGE so weapons actually fire ──
                 if (g_fire_edge.load(std::memory_order_relaxed)) synth_key_edge(b);
 
+                // ── LAYER 6: keep the rig inside the level (see tether above) ──
+                tether_rig_to_leon(b);
+
                 // ── LAYER 4: THE COLLISION FIX ────────────────────────────
                 // cPlayer::move dispatches Pl_func_tbl[pPL+276]. A scene sets
                 // state 5 (Pl_R0_Event), which sub-dispatches on pPL+277 into
@@ -2712,6 +2724,41 @@ static uint64_t bio4tick_unlock_gameloop(void* self, float dt) {
                         if (*st == 5u) {
                             *st = 0u;
                             g_state_rewrites.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+
+                // ── LAYER 5: SMART state restore (the collision attempt, v2) ──
+                // v1 (LAYER 4 above) blindly forced state 5 -> 0. That pins you:
+                // state 0 with pPL+277 == 0 dispatches Pl_func_move_tbl[0], the
+                // STAND-IDLE handler, which moves nothing. Reported live.
+                //
+                // v2 uses the engine's own bookkeeping instead of a hardcoded 0.
+                // SceEventStart stashes Leon's PRE-SCENE state machine index at
+                // dword_A5A3F38 before it takes him over. So:
+                //     *(pPL+276) == saved  -> the scene did NOT take him over;
+                //                             he already owns himself, do nothing.
+                //     *(pPL+276) != saved  -> the scene IS driving him; restoring
+                //                             `saved` (NOT 0) hands him back his
+                //                             real pre-scene state, which is the
+                //                             collision-bearing gameplay path.
+                // Restoring `saved` also avoids v1's failure mode: we never invent
+                // a state the game was not already in.
+                //
+                // ⚠ DEFAULT OFF and it stays off until measured. In a scene that
+                // genuinely animates Leon this WILL fight the script (both he and
+                // the scene drive him). It is exposed so it can be tested against
+                // the collision probe rather than argued about.
+                if (g_smart_move_state.load(std::memory_order_relaxed)) {
+                    uintptr_t ppl = *reinterpret_cast<volatile uintptr_t*>(b + 0xA54AB40ull);
+                    if (ppl) {
+                        uint8_t saved = *reinterpret_cast<volatile uint8_t*>(b + 0xA5A3F38ull);
+                        volatile uint8_t* st = reinterpret_cast<volatile uint8_t*>(ppl + 276ull);
+                        // Only act when the scene took him over AND the saved state
+                        // is a real gameplay state (never restore 5 onto itself).
+                        if (*st != saved && saved != 5u && saved < 10u) {
+                            *st = saved;
+                            g_smart_rewrites.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
                 }
@@ -2871,6 +2918,185 @@ static uint64_t fadeset_no_cutscene_fade(uint64_t a, uint64_t b1, uint64_t c,
 
 uint32_t cutscene_fades_killed_count() {
     return g_fades_killed.load(std::memory_order_relaxed);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CUTSCENE COLLISION — TETHER THE RIG TO LEON
+// ═══════════════════════════════════════════════════════════════════════
+// Why the state-machine approach was a dead end (two failures, both measured):
+//   * A scene sets pPL+276 = 5; that handler (sub_5FED624) only calls
+//     cModel::motionMove. It never consumes the movement intent at pPL+2592 and
+//     never collides. So Leon does not walk.
+//   * Forcing state 5 -> 0 dispatches Pl_func_move_tbl[0] = STAND-IDLE, which
+//     moves nothing => "stuck in a pos whenever cutscenes happen".
+// The probe then showed Leon and the rig travelling by wildly different amounts
+// (6678 vs 667, 36758 vs 3661) — they are NOT rigidly coupled. The rig locomotes
+// on its own, and nothing in the engine collides a rig the scene does not think
+// is moving. That is the phasing.
+//
+// So: constrain the RIG. Leon is always inside legal geometry (the scene places
+// him), so bounding the rig's distance from him keeps you inside the level
+// without pinning you — you still walk freely within the radius, you just cannot
+// sail through a wall into the next room.
+//
+// This is a TETHER, not a swept collision test. It does not know where walls are;
+// it knows where Leon is. That is a deliberate trade: a real sweep needs
+// ComnHitCheck with an ABI I have not verified, and guessing at that is exactly
+// what produced the earlier crash.
+//
+// Rig world position: pawn root component +0x130 -> location +0x11C (verified by
+// the probe reading sane coordinates from it).
+static std::atomic<bool>      g_rig_tether{false};    // default OFF, UNVERIFIED
+static std::atomic<uint32_t>  g_tether_radius{900};   // engine units
+static std::atomic<uint32_t>  g_tether_pulls{0};
+static uintptr_t              s_tether_pawn_slot = 0; // filled by the capture hook
+
+void cutscene_set_tether_pawn_slot(uintptr_t slot) { s_tether_pawn_slot = slot; }
+uint32_t cutscene_tether_pull_count() { return g_tether_pulls.load(std::memory_order_relaxed); }
+void cutscene_set_tether_radius(uint32_t r) { g_tether_radius.store(r ? r : 1, std::memory_order_relaxed); }
+
+// Called once per frame from bio4tick while a scene is playing.
+static void tether_rig_to_leon(uintptr_t b) {
+    if (!g_rig_tether.load(std::memory_order_relaxed)) return;
+    if (!s_tether_pawn_slot) return;
+    uintptr_t pawn = *reinterpret_cast<volatile uintptr_t*>(s_tether_pawn_slot);
+    if (!pawn) return;
+    uintptr_t ppl = *reinterpret_cast<volatile uintptr_t*>(b + 0xA54AB40ull);
+    if (!ppl) return;
+
+    uintptr_t root = *reinterpret_cast<volatile uintptr_t*>(pawn + 0x130ull);
+    if (root < 0x1000ull) return;
+    volatile float* loc = reinterpret_cast<volatile float*>(root + 0x11Cull);
+
+    // Leon (engine units) vs rig (UE units) live in different spaces, so the
+    // tether is applied in the RIG's own space around the rig's start-of-scene
+    // anchor rather than by converting coordinates — converting without a
+    // verified transform is how the ride-along ended up outside the map.
+    static float anchor[3] = {0, 0, 0};
+    static bool  anchored = false;
+    uint8_t depth = *reinterpret_cast<volatile uint8_t*>(b + 0xA5A3EFCull + 2);
+    if (!depth) { anchored = false; return; }
+    if (!anchored) {
+        anchor[0] = loc[0]; anchor[1] = loc[1]; anchor[2] = loc[2];
+        anchored = true;
+        return;
+    }
+    float dx = loc[0] - anchor[0];
+    float dy = loc[1] - anchor[1];
+    float d2 = dx * dx + dy * dy;                    // horizontal only; let height be
+    float r  = static_cast<float>(g_tether_radius.load(std::memory_order_relaxed));
+    if (d2 <= r * r) return;
+    float d = __builtin_sqrtf(d2);
+    if (d < 0.001f) return;
+    loc[0] = anchor[0] + dx / d * r;                 // clamp back onto the boundary
+    loc[1] = anchor[1] + dy / d * r;
+    uint32_t n = g_tether_pulls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 3 || (n % 300) == 0)
+        logger::log_info("CUTTETHER", "rig clamped to %.0f units from anchor (#%u)", (double)r, n);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// RAPIDFIRE THAT KEEPS THE LASER DOT — pulsed edge @0x600A978 / 0x62DAAD8
+// ═══════════════════════════════════════════════════════════════════════
+// The old byte patches turn the fire signal from an EDGE into a LEVEL:
+//   re4.rapidfire.autofire     : joyFireTrg reads +0x18 (HELD) not +0x20 (EDGE)
+//   re4.rapidfire.trigger_edge : WasTriggerJustPressed -> IsTriggerPressed
+// Both mean "trigger is down" is true on EVERY frame you hold it, so the 0->1
+// transition never occurs again after the first shot.
+//
+// The gun's laser sight is suppressed while firing and re-armed on that
+// transition — so with the old patches it is switched off by the first shot and
+// never switched back on. Reported live 2026-07-21: "is there, but once i fire
+// is gone!", and it came back the moment all three rapidfire patches were off.
+//
+// Fix: keep the EDGE semantics and synthesise a NEW edge every N frames while the
+// trigger is genuinely held. The state machine still sees discrete press events,
+// so whatever re-arms the laser keeps firing — and you still get automatic fire.
+//   original edge true            -> pass through (a real press)
+//   edge false + held + N elapsed -> return true once (a synthetic press)
+//   otherwise                     -> false, so the level drops between pulses
+static dobby_dummy_func_t     s_joyfiretrg_orig = nullptr;
+static dobby_dummy_func_t     s_wastrigjust_orig = nullptr;
+static uintptr_t              s_joyfireon_addr = 0;   // called, never hooked
+static std::atomic<bool>      g_rf_pulse{false};      // default OFF until measured
+static std::atomic<uint32_t>  g_rf_interval{5};       // frames between synthetic edges
+static std::atomic<uint32_t>  g_rf_pulses{0};
+static std::atomic<uint32_t>  s_rf_tick_trg{0};
+static std::atomic<uint32_t>  s_rf_tick_ue{0};
+
+// Ask the engine whether the fire button is HELD, using its own accessor so we
+// never have to know the key-mask layout ourselves.
+static bool rf_fire_held() {
+    if (!s_joyfireon_addr) return false;
+    return reinterpret_cast<uint64_t (*)()>(s_joyfireon_addr)() != 0;
+}
+
+static uint64_t joyfiretrg_pulsed() {
+    uint64_t edge = reinterpret_cast<uint64_t (*)()>(s_joyfiretrg_orig)();
+    if (edge) { s_rf_tick_trg.store(0, std::memory_order_relaxed); return edge; }
+    if (!g_rf_pulse.load(std::memory_order_relaxed)) return 0;
+    if (!rf_fire_held()) { s_rf_tick_trg.store(0, std::memory_order_relaxed); return 0; }
+    uint32_t n = s_rf_tick_trg.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint32_t iv = g_rf_interval.load(std::memory_order_relaxed);
+    if (iv && n >= iv) {
+        s_rf_tick_trg.store(0, std::memory_order_relaxed);
+        g_rf_pulses.fetch_add(1, std::memory_order_relaxed);
+        return 1;   // synthetic press: one frame only, so the edge can re-arm
+    }
+    return 0;
+}
+
+static uint64_t wastriggerjustpressed_pulsed(void* self) {
+    uint64_t edge = reinterpret_cast<uint64_t (*)(void*)>(s_wastrigjust_orig)(self);
+    if (edge) { s_rf_tick_ue.store(0, std::memory_order_relaxed); return edge; }
+    if (!g_rf_pulse.load(std::memory_order_relaxed)) return 0;
+    if (!rf_fire_held()) { s_rf_tick_ue.store(0, std::memory_order_relaxed); return 0; }
+    uint32_t n = s_rf_tick_ue.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint32_t iv = g_rf_interval.load(std::memory_order_relaxed);
+    if (iv && n >= iv) {
+        s_rf_tick_ue.store(0, std::memory_order_relaxed);
+        return 1;
+    }
+    return 0;
+}
+
+uint32_t rapidfire_pulse_count() { return g_rf_pulses.load(std::memory_order_relaxed); }
+
+void rapidfire_set_interval(uint32_t frames) {
+    g_rf_interval.store(frames ? frames : 1, std::memory_order_relaxed);
+}
+
+bool install_rapidfire_pulse(uintptr_t joyfiretrg, uintptr_t joyfireon, uintptr_t wastrigjust) {
+    static bool installed = false;
+    if (installed) return true;
+    s_joyfireon_addr = joyfireon;
+    bool any = false;
+    if (joyfiretrg && DobbyHook(reinterpret_cast<void*>(joyfiretrg),
+                                reinterpret_cast<dobby_dummy_func_t>(joyfiretrg_pulsed),
+                                &s_joyfiretrg_orig) == RT_SUCCESS) {
+        any = true;
+        logger::log_info("RAPIDFIRE", "joyFireTrg pulsed-edge hooked @0x%lX", (unsigned long)joyfiretrg);
+    }
+    if (wastrigjust && DobbyHook(reinterpret_cast<void*>(wastrigjust),
+                                 reinterpret_cast<dobby_dummy_func_t>(wastriggerjustpressed_pulsed),
+                                 &s_wastrigjust_orig) == RT_SUCCESS) {
+        any = true;
+        logger::log_info("RAPIDFIRE", "WasTriggerJustPressed pulsed-edge hooked @0x%lX",
+                         (unsigned long)wastrigjust);
+    }
+    if (!any) { logger::log_error("RAPIDFIRE", "failed to hook either fire gate"); return false; }
+    installed = true;
+    register_native_patch_toggle(
+        "re4.rapidfire.pulse",
+        "RAPIDFIRE that keeps the gun's LASER DOT. The old byte patches "
+        "(rapidfire.autofire / rapidfire.trigger_edge) turn the fire signal from an EDGE into "
+        "a LEVEL, so the 0->1 transition never happens again after the first shot - and the "
+        "laser sight, which re-arms on that transition, stays off forever. This instead "
+        "synthesises a fresh edge every N frames while the trigger is held, so the state "
+        "machine still sees discrete presses. TURN THE OTHER TWO OFF when using this.",
+        [](bool en) { g_rf_pulse.store(en, std::memory_order_relaxed); return true; },
+        g_rf_pulse.load(std::memory_order_relaxed));
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3230,6 +3456,28 @@ bool install_cutscene_unlock_gameloop(uintptr_t bio4tick) {
         "states are untouched). OFF = walk through walls again.",
         [](bool en) { g_normal_move_state.store(en, std::memory_order_relaxed); return true; },
         g_normal_move_state.load(std::memory_order_relaxed));
+    register_native_patch_toggle(
+        "re4.cutscene_rig_tether",
+        "CUTSCENE COLLISION (rig tether). The state-machine route is a dead end: the scene's "
+        "state-5 handler only animates and never collides the movement intent, and forcing "
+        "state 0 lands on the STAND-IDLE handler and pins you. The probe showed Leon and the "
+        "rig travelling by wildly different amounts, i.e. the rig locomotes independently and "
+        "nothing collides it. This bounds the rig to a radius around where it stood when the "
+        "scene began, so you still walk freely but cannot sail through a wall into the next "
+        "room. It is a TETHER, not a swept collision test. Tune with cutscene_tether_radius.",
+        [](bool en) { g_rig_tether.store(en, std::memory_order_relaxed); return true; },
+        g_rig_tether.load(std::memory_order_relaxed));
+    register_native_patch_toggle(
+        "re4.cutscene_smart_move_state",
+        "CUTSCENE COLLISION attempt v2 (default OFF, UNVERIFIED). During a scene the "
+        "state-5 handler sub_5FED624 only plays animation - it never consumes the movement "
+        "intent at pPL+2592 and never collides, so the rig walks through walls. v1 forced "
+        "state 5->0 and PINNED the player (state 0 + move 0 = stand-idle handler). This "
+        "instead restores the PRE-SCENE state SceEventStart saved at dword_A5A3F38, so we "
+        "never invent a state the game was not already in. In scenes that genuinely animate "
+        "Leon this will fight the script - test with the CollisionProbe mod before trusting it.",
+        [](bool en) { g_smart_move_state.store(en, std::memory_order_relaxed); return true; },
+        g_smart_move_state.load(std::memory_order_relaxed));
     logger::log_info("CUTLOOP", "cutscene unlock-gameloop installed on ABio4::Tick @0x%lX (+ normal_move_state collision fix, both default ON)", (unsigned long)bio4tick);
     return true;
 }
