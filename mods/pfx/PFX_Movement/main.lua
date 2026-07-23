@@ -40,19 +40,36 @@ local function unharden()
   else pcall(function() CallNativeBySymbol("prctl", "iuuuuu", 4, 1, 0, 0, 0) end) end
 end
 
+-- CACHED singleton resolution. This LoopAsync runs every 500ms; a bare FindFirstOf
+-- per tick walks the whole 43k+ GUObjectArray (name compare per object) in the
+-- modloader — 4 full scans/sec forever = a steady game-thread reflection tax and a
+-- real chunk of the hub lag. The pawn + settings manager are long-lived singletons,
+-- so cache them and only re-scan when the cached object stops being valid (cheap
+-- IsValid() check). The cache self-heals across a table load: the recreated pawn
+-- fails IsValid() and we re-resolve once.
+local _sm_cache = nil
+local function settings_mgr()
+  if _sm_cache and _sm_cache.IsValid and _sm_cache:IsValid() then return _sm_cache end
+  local o = FindFirstOf("PFXPlayerSettingsManager")
+  _sm_cache = (o and o.IsValid and o:IsValid()) and o or nil
+  return _sm_cache
+end
+
 -- resolve the master settings buffer (A) from the settings manager
 local function settings_buf()
-  local o = FindFirstOf("PFXPlayerSettingsManager")
-  if not (o and o.IsValid and o:IsValid()) then return 0 end
+  local o = settings_mgr()
+  if not o then return 0 end
   local A = MemReadU64(PtrToInt(o:GetAddress()) + 64)
   if A < 0x1000000000 or A > 0x80000000000 then return 0 end
   return A
 end
 
+local _pawn_cache = nil
 local function pawn()
+  if _pawn_cache and _pawn_cache.IsValid and _pawn_cache:IsValid() then return _pawn_cache end
   local p = FindFirstOf("BP_VR_Pawn_C")
-  if p and p.IsValid and p:IsValid() then return p end
-  return nil
+  _pawn_cache = (p and p.IsValid and p:IsValid()) and p or nil
+  return _pawn_cache
 end
 
 -- ── Apply the three settings (idempotent; only writes when different) ────────

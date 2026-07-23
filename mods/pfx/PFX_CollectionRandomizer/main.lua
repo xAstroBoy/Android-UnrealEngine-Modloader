@@ -540,26 +540,84 @@ end
 -- ============================================================================
 -- COUNT REGISTERED SLOTS
 -- ============================================================================
-local function collect_live_slots()
+-- Slot component classes. CRITICAL: FindAllOf matches the EXACT class only (no
+-- superclass walk — verified in the modloader's type_name_matches), so querying
+-- just the base "PFXCollectibleSlotComponent" returns ONLY exact-base objects
+-- (~2 live) and misses every BP-subclass slot. The real slots are
+-- AC_CollectibleSlot_C.
+local SLOT_COMPONENT_CLASSES = {
+    "AC_CollectibleSlot_C",              -- statues, gadgets, posters, music (actor slots)
+    "AC_CollectibleSlot_FloorAndWall_C", -- floor/wall texture slots
+    "AC_CollectibleSlot_Hub_C",          -- hub interior (level-stream)
+    "PFXCollectibleSlotComponent",       -- any exact-base-class slots
+}
+
+-- Slot ACTOR classes. Enumerating components alone is NOT enough: FindAllOf
+-- (find_all_instances) lifecycle-filters component instances that live in a
+-- streamed sublevel, so the statue/music/poster pods' AC_CollectibleSlot_C
+-- components frequently DON'T come back from the component query even though the
+-- pods are fully live and on screen (verified: all 10 BP_Statue_Slot_C actors
+-- resolve, but 0 of their components appear under FindAllOf("AC_CollectibleSlot_C")
+-- when standing at the gadget station). The ACTORS always resolve, and each
+-- exposes its slot as `CollectibleSlotRoot` (AC_CollectibleSlot_C) — so we reach
+-- the pods through their actors. THIS is why statues stayed default ("Silver
+-- Ball") no matter the SEEN/station fixes: they were never in the work list.
+local SLOT_ACTOR_CLASSES = {
+    "BP_Statue_Slot_C", "BP_Gadget_Slot_C", "BP_Poster_Slot_C",
+    "BP_Music_Slot_C", "BP_FloorAndWall_Slot_C",
+}
+
+-- Each of the FindAllOf calls below walks the whole 43k+ GUObjectArray with a
+-- per-object name compare in the modloader — expensive. This function is called
+-- up to 3× per auto-apply tick (count_registered_slots, scramble_all_slots,
+-- maintenance_pass) and by the init/finalize polls, so an uncached rescan was a
+-- steady ~12% CPU tax on the game thread = the hub lag. Cache the result for a
+-- short window so the repeated callers share ONE scan; the slot set changes only
+-- as stations stream in, so a ~1.5s staleness is invisible (is_live re-checks at
+-- use). os.clock() is CPU-time but monotonic, fine for throttling.
+local _slots_cache = nil
+local _slots_cache_t = -1
+local SLOTS_CACHE_TTL = 1.5
+
+local function collect_live_slots(force)
+    local now = os.clock()
+    if not force and _slots_cache and (now - _slots_cache_t) < SLOTS_CACHE_TTL then
+        return _slots_cache
+    end
     local out = {}
     local seen = {}
-    pcall(function()
-        local all = FindAllOf("PFXCollectibleSlotComponent")
-        if not all then return end
-        for _, slot in ipairs(all) do
-            if is_live(slot) then
-                -- Use entry_id for filled slots, object name for empty ones
-                local key = entry_id(slot)
-                if key == "" then
-                    key = "__empty__" .. name_of(slot)
-                end
-                if key ~= "" and not seen[key] then
-                    seen[key] = true
-                    out[#out + 1] = slot
-                end
-            end
+    local function add(slot)
+        if not slot or not is_live(slot) then return end
+        local key = entry_id(slot)
+        if key == "" then key = "__slot__" .. name_of(slot) end
+        if key ~= "" and not seen[key] then
+            seen[key] = true
+            out[#out + 1] = slot
         end
-    end)
+    end
+    -- Reach slots through their ACTORS — reliable for the streamed statue/music/
+    -- poster pods the component scan filters out, and it covers gadgets + floor/
+    -- wall too, so the actor pass alone captures the vast majority of slots.
+    for _, cls in ipairs(SLOT_ACTOR_CLASSES) do
+        pcall(function()
+            for _, actor in ipairs(FindAllOf(cls) or {}) do
+                local comp = nil
+                pcall(function() comp = actor:Get("CollectibleSlotRoot") end)
+                add(comp)
+            end
+        end)
+    end
+    -- Only the classes the actor pass does NOT cover: hub-interior (level-stream)
+    -- and any exact-base-class slots. AC_CollectibleSlot_C / _FloorAndWall_C are
+    -- already reached via their actors above, so they're dropped here (each dropped
+    -- class is one fewer full-array scan per rebuild).
+    for _, cls in ipairs({ "AC_CollectibleSlot_Hub_C", "PFXCollectibleSlotComponent" }) do
+        pcall(function()
+            for _, slot in ipairs(FindAllOf(cls) or {}) do add(slot) end
+        end)
+    end
+    _slots_cache = out
+    _slots_cache_t = now
     return out
 end
 
@@ -659,11 +717,19 @@ end
 -- station (texture/level-stream based), so they're exempt.
 local function slot_swap_ready(slot)
     if not is_live(slot) then return false end
+    -- Floor/wall + hub slots are texture/level-stream based — no station, and they
+    -- take a different (validated) apply path, so they're exempt.
     if is_floor_wall_slot(slot) or is_hub_slot(slot) then return true end
+    -- Actor slots (statue/gadget/poster/music): ChangeSlotEntry is PATCHED to skip
+    -- the game's own station-null check, so we MUST confirm the owner station is a
+    -- live object ourselves — otherwise the patched path derefs a null station and
+    -- SIGSEGVs (which siglongjmp-recovery then escalates into a fatal VM-corruption
+    -- cascade). A statue pod whose sublevel is still streaming has no live station
+    -- yet; skip it (stays default this pass) and let a later pass catch it once its
+    -- station is up. Being STRICT here is deliberate: unready -> skip, never swap.
     local station = nil
     pcall(function() station = slot:Get("m_ownerStationComponent") end)
-    if station == nil then return true end   -- property absent on this slot class => not station-gated
-    return is_live(station)
+    return station ~= nil and is_live(station)
 end
 
 local function swap_slot_entry(slot, newEntry)

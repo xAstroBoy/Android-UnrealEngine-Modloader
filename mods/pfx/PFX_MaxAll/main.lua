@@ -101,6 +101,37 @@ local function is_live(obj)
     return not name:match("^Default__") and not name:match("^REINST_") and not name:match("^SKEL_")
 end
 
+-- Memoized "is this slot component owned by a trophy slot?" check.
+-- HOOK 3 (RestoreSlotEntryFromProfile) and HOOK 4 (ChangeSlotEntry) fire for
+-- EVERY slot on EVERY hub/level load — hundreds of calls in a burst. Resolving
+-- the outer's class NAME via reflection each time (is_live x2 => two GetName()
+-- resolves, plus GetClass():GetName()) made get_short_name/fname_to_string/
+-- is_readable_ptr the dominant modloader cost and produced the per-level-load
+-- lag spike. A slot's owner class never changes, so cache the answer by slot
+-- identity: the first call per slot pays the reflection, the rest of the flood
+-- is a single table lookup. Cache is pointer-keyed and cleared wholesale when it
+-- grows large (guards against pointer reuse across reloads).
+local _trophy_cache = {}
+local _trophy_cache_n = 0
+local function is_trophy_slot(self)
+    if not self then return false end
+    local key = tostring(self)
+    local cached = _trophy_cache[key]
+    if cached ~= nil then return cached end
+    local result = false
+    pcall(function()
+        if not is_live(self) then return end
+        local outer = self:GetOuter()
+        if outer and is_live(outer) and outer:GetClass():GetName() == "BP_TrophyCollectibleSlot_C" then
+            result = true
+        end
+    end)
+    if _trophy_cache_n > 4096 then _trophy_cache = {}; _trophy_cache_n = 0 end
+    _trophy_cache[key] = result
+    _trophy_cache_n = _trophy_cache_n + 1
+    return result
+end
+
 local function find_live(...)
     for _, cls in ipairs({...}) do
         local all = nil
@@ -569,13 +600,32 @@ end
 -- ticks — a few seconds to clear a backlog, then it settles to cheap checks.
 local MAX_RESPAWN_PER_TICK = 2
 
+-- Cached trophy wall — FindFirstOf walks the whole 43k+ GUObjectArray; the
+-- watchdog called it EVERY tick (every 350ms in the hub). The wall is a long-lived
+-- hub actor, so cache it and only re-scan when the cached one dies.
+local _tw_cache = nil
+local function get_trophy_wall()
+    if _tw_cache and is_live(_tw_cache) then return _tw_cache end
+    _tw_cache = nil
+    pcall(function() local w = FindFirstOf("BP_Hub_TrophyWall_C_C"); if w and is_live(w) then _tw_cache = w end end)
+    return _tw_cache
+end
+
+-- Per-slot "already healed" set (keyed by slot-component identity). A healed slot
+-- has a physical, visible, collidable actor — and it CANNOT regress: HOOK 3/4 block
+-- the game from re-holo-ing a trophy slot and IsHologram is patched false. So once
+-- healed we do only a cheap actor-validity re-check and SKIP the ~6 ProcessEvent
+-- Call()s/writes per slot. That turns the steady watchdog from ~17ms/tick (a dropped
+-- frame every 350ms) into a light validity sweep. Cleared on reload (fresh table).
+local _slot_healed = {}
+
 local function heal_trophy_visibility_once()
     if not trophyMapReady then return 0, 0 end
 
     local healed = 0
     local respawn = 0
     pcall(function()
-        local tw = FindFirstOf("BP_Hub_TrophyWall_C_C")
+        local tw = get_trophy_wall()
         if not tw then return end
         local slots = tw:Get("TrophySlots")
         if not slots then return end
@@ -587,6 +637,19 @@ local function heal_trophy_visibility_once()
 
                 local csr = slot:Get("CollectibleSlotRoot")
                 if not csr then return end
+
+                -- Fast path: a slot healed on a previous tick stays healed as long
+                -- as its physical actor is still alive — skip all the re-apply work.
+                local hkey = tostring(csr)
+                if _slot_healed[hkey] then
+                    local sa0 = nil
+                    pcall(function() sa0 = csr:Get("SpawnedActor") end)
+                    if sa0 and is_live(sa0) then
+                        healed = healed + 1
+                        return
+                    end
+                    _slot_healed[hkey] = nil   -- actor gone → re-heal below
+                end
 
                 -- Keep slot visible in wall UI
                 pcall(function() slot:Call("ShowSlot") end)
@@ -636,6 +699,9 @@ local function heal_trophy_visibility_once()
                     if gc then gc:Set("IsLocked", false) end
                 end)
 
+                -- Physical, visible, collidable → mark healed so subsequent ticks
+                -- skip the re-apply (only a cheap SpawnedActor validity check).
+                _slot_healed[hkey] = true
                 healed = healed + 1
             end)
         end
@@ -772,24 +838,8 @@ pcall(function()
     RegisterPreHook(
         "/Script/PFXVRQuest.PFXCollectibleSlotComponent:RestoreSlotEntryFromProfile",
         function(self, funcPtr, parms)
-            -- DIAG: log first 5 calls + every 50th to detect retry storms
-            state._restore_diag = (state._restore_diag or 0) + 1
-            if state._restore_diag <= 5 or state._restore_diag % 50 == 0 then
-                Log(TAG .. ": DIAG: RestoreSlotEntryFromProfile hook #" .. state._restore_diag)
-            end
-            local shouldBlock = false
-            pcall(function()
-                if not is_live(self) then return end
-                local outer = self:GetOuter()
-                if not outer or not is_live(outer) then return end
-                local cls = outer:GetClass():GetName()
-                if cls == "BP_TrophyCollectibleSlot_C" then
-                    shouldBlock = true
-                end
-            end)
-            if shouldBlock then
+            if is_trophy_slot(self) then
                 state.trophy_hook_swaps = state.trophy_hook_swaps + 1
-                V("RestoreSlotEntryFromProfile BLOCK #" .. state.trophy_hook_swaps)
                 return "BLOCK"
             end
         end
@@ -806,17 +856,7 @@ pcall(function()
     RegisterPreHook(
         "/Script/PFXVRQuest.PFXCollectibleSlotComponent:ChangeSlotEntry",
         function(self, funcPtr, parms)
-            local shouldBlock = false
-            pcall(function()
-                if not is_live(self) then return end
-                local outer = self:GetOuter()
-                if not outer or not is_live(outer) then return end
-                local cls = outer:GetClass():GetName()
-                if cls == "BP_TrophyCollectibleSlot_C" then
-                    shouldBlock = true
-                end
-            end)
-            if shouldBlock then
+            if is_trophy_slot(self) then
                 state.trophy_hook_swaps = state.trophy_hook_swaps + 1
                 return "BLOCK"
             end
