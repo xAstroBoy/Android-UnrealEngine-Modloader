@@ -28,7 +28,11 @@ namespace config
     static bool s_pak_loading_enabled = true;
     static bool s_adb_bridge_enabled = true;
     static bool s_log_to_file = true;
-    static std::string s_log_level = "info"; // "debug", "info", "warn", "error"
+    static std::string s_log_level = "warn"; // "debug", "info", "warn", "error"
+    // Default WARN, not INFO: the verbose INFO subsystems (TMap/TArray walks, widget
+    // creation, class rebuilds) log from game-thread contexts and, in bursts, caused
+    // visible frame hitches. WARN keeps errors/warnings; set "info"/"debug" via the
+    // log_level bridge command or config when diagnosing.
     static bool s_crash_guard_enabled = true;
     static std::string s_crash_guard_global = "all"; // "off" | "null" | "all"
     static int s_crash_guard_quarantine_threshold = 20; // 0 = never
@@ -55,7 +59,7 @@ namespace config
         j["pak_loading_enabled"] = true;
         j["adb_bridge_enabled"] = true;
         j["log_to_file"] = true;
-        j["log_level"] = "info";
+        j["log_level"] = "warn";
         j["crash_guard_enabled"] = true;
         j["crash_guard_global"] = "all";
         j["crash_guard_quarantine_threshold"] = 20;
