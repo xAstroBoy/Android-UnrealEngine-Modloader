@@ -814,7 +814,11 @@ def find_what_writes(addr: str, length: int = 8, mode: str = "w", settle_seconds
     a = _addr(addr)
     arm = bridge_exec_lua("return WatchAccess(" + str(a) + ", " + str(int(length)) + ", '" + mode + "')")
     try:
-        fd = int(str(arm).strip().split()[0])
+        # WatchAccess returns a Lua number; the bridge serializes it as a FLOAT
+        # string ("80.000000"), so int() alone throws — parse via float() first.
+        # (This was the "arm failed: 80.000000" bug: fd 80 armed fine but the
+        # int("80.000000") cast raised and we mislabeled a success as a failure.)
+        fd = int(float(str(arm).strip().split()[0]))
     except Exception:
         return "arm failed: " + str(arm)
     if fd < 0:
