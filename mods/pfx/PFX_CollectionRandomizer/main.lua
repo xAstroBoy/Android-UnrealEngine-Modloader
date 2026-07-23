@@ -650,9 +650,26 @@ local function get_room()
     return cachedRoom
 end
 
+-- A slot is only safe to mutate once its OWNER STATION is live. A pod that has
+-- streamed its slot component but not yet its station has a null station
+-- pointer, and ChangeSlotEntry/SetupWithCollectibleEntry deref it => native
+-- SIGSEGV. The modloader siglongjmp-recovers that fault but leaves the Lua VM
+-- corrupt, so the NEXT tick dies hard (the tombstone_2x cascade). Gate every
+-- swap on this so the first fault never happens. Floor/wall + hub slots have no
+-- station (texture/level-stream based), so they're exempt.
+local function slot_swap_ready(slot)
+    if not is_live(slot) then return false end
+    if is_floor_wall_slot(slot) or is_hub_slot(slot) then return true end
+    local station = nil
+    pcall(function() station = slot:Get("m_ownerStationComponent") end)
+    if station == nil then return true end   -- property absent on this slot class => not station-gated
+    return is_live(station)
+end
+
 local function swap_slot_entry(slot, newEntry)
     if not slot or not newEntry then return false end
     if not is_live(slot) or not is_live(newEntry) then return false end
+    if not slot_swap_ready(slot) then return false end
 
     local previousEntry = nil
     pcall(function() previousEntry = slot:Get("m_slotEntry") end)
@@ -1728,7 +1745,7 @@ pcall(function()
         pcall(scramble_all_slots)
         pcall(scramble_table_cosmetics)
         pcall(apply_pending_flipper_overrides)
-        return TAG .. " v34: sweep #" .. stats.sweeps
+        return TAG .. " v35: sweep #" .. stats.sweeps
             .. " ok=" .. stats.sweep_ok
             .. " empty=" .. stats.empty_filled
             .. " ball=" .. stats.table_ball
@@ -1741,7 +1758,7 @@ pcall(function()
     RegisterCommand("randomize_status", function()
         V("randomize_status command fired")
         local slotCount = count_registered_slots()
-        local msg = TAG .. " v34: pool=" .. stats.pool_size
+        local msg = TAG .. " v35: pool=" .. stats.pool_size
             .. " slots=" .. slotCount
             .. " hook=" .. tostring(hookRegistered)
             .. " polls=" .. pollCount .. "/" .. MAX_POLLS
