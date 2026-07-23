@@ -1,23 +1,25 @@
 -- ============================================================================
--- PFX_Preservation v1 — Table Ownership Bypass + Force Download All DLC
+-- PFX_Preservation v2 — Table Ownership Bypass + Presence-Aware Downloads
 -- ============================================================================
 -- PRESERVATION PROJECT: Forces the game to think ALL tables are owned and
--- bypasses entitlement checks — WITHOUT triggering any downloads. Every table's
--- PAK is already present in the game OBB, so we must NOT enable chunk acquisition
--- (that makes the game re-"download" content it already has).
+-- bypasses entitlement checks. v2 DETECTS what content actually exists on this
+-- device (OBB-embedded chunks + loose pakchunk files) instead of assuming the
+-- OBB has everything:
+--   * content on disk    -> loads straight from disk, downloads stay OFF
+--   * content missing    -> the game is allowed to REALLY download it
+--     (bShouldAcquireMissingChunksOnLoad flips on, real download states are
+--      never disturbed by the state pin, and a finished download is detected
+--      by its pak file appearing)
 --
 -- This mod works by:
 -- 1. Setting bDebugUnlockAllTables = true on PFXStoreManager
 -- 2. Hooking IsTableOwned/IsBundleOwned to always return true
 -- 3. Hooking IsPlayDisabled to always return false
--- 4. FORCING bShouldAcquireMissingChunksOnLoad = FALSE (no downloads — OBB has all)
--- 5. Marking all tables IncludedInBaseGame so they load straight from the OBB
---
--- NOTE: auto-download was intentionally removed. The `pres_download_all` /
--- `pres_chunks_on` commands remain for manual use only and are NOT auto-run.
+-- 4. Marking all tables IncludedInBaseGame so they load straight from disk
+-- 5. Presence-aware download fix (see DOWNLOAD FIX v2 below)
 -- ============================================================================
 local TAG = "PFX_Preservation"
-Log(TAG .. ": Loading v1 — Table Preservation & Ownership Bypass...")
+Log(TAG .. ": Loading v2 — Table Preservation & Presence-Aware Downloads...")
 
 -- Reload generation: older LoopAsync callbacks self-terminate on hot-reload.
 _G._PRES_GEN = (_G._PRES_GEN or 0) + 1
@@ -358,20 +360,40 @@ end
 -- ============================================================================
 
 -- ============================================================================
--- DOWNLOAD FIX (native) — the table/package manager marks tables Remote(2)
--- ("needs download") even though the PAKs are already mounted from the OBB, so
--- selecting/switching to one softlocks on a fetch (no network). We flip any
--- Remote/Downloading/Downloaded/Mounting package to Mounted(6); the game then
--- attaches it (6->7 Attached) and it STAYS attached — loading straight from the
--- OBB, no download. Because they don't revert, this is essentially one-shot; a
--- slow 2s pin just catches any NEW Remote descriptors (cheap, no lag).
+-- DOWNLOAD FIX v2 (presence-aware) — the table/package manager marks tables
+-- Remote(2) ("needs download") when entitlement says "not owned", even when the
+-- content IS on disk, so selecting one softlocks on a fetch. v1 blind-flipped
+-- EVERY descriptor in Remote..Mounting(2..5) to Mounted(6) — which also yanked
+-- GENUINELY-missing tables out of their real download and fake-mounted absent
+-- paks: broken table, and the download never happened. v2 knows what content is
+-- actually on this device:
+--
+--   base tables — chunk pak embedded in the OBBs (scan their central dirs)
+--   DLC tables  — loose <obb>/pakchunk<2000+PitID>-Android_ASTC.pak
+--   (chunkId = 2000 + PitID verified live: all 31 loose paks + all 11 OBB
+--    chunks on the dev Quest map 1:1 onto the 42 PitIDs)
+--
+-- Descriptor identity is unknown (16-byte {descriptor,package} pairs, state
+-- byte at desc+73, nothing readable ties a desc to a table), so every rule
+-- must be safe while blind:
+--   * only Remote(2) descs are ever flipped — NEVER Downloading/Downloaded/
+--     Mounting(3/4/5): a real download in progress is never disturbed
+--   * nothing missing on disk  -> flip Remote immediately (v1 softlock fix)
+--   * something missing        -> bShouldAcquireMissingChunksOnLoad=true so
+--     the game ACTUALLY downloads it; a Remote desc is only flipped once it
+--     has sat still for DLPIN_STUCK_TICKS with no download running anywhere —
+--     a genuinely-missing table leaves Remote by itself once acquisition
+--     starts, a bogus-Remote never does, so flipping only the stuck ones
+--     rescues the softlock without eating anyone's download
+--   * a finished download appears as the loose pak -> presence cache refresh,
+--     acquire drops back to false when nothing is missing anymore
 --
 -- Offsets from IDA of libUnreal.so (RVAs relative to YUP.GetLibBase()):
---   0x76AE910 = table/package manager global (holds the manager pointer)
+--   0x76AE910 = table/package manager global (NULL until a load is in flight)
 --   mgr+96  = descriptor array (16-byte {descriptor, package} pairs)
 --   mgr+104 = descriptor count
---   desc+73 = EPFXPackageState byte  (Remote=2 .. Mounted=6 .. Attached=7)
--- Verified live: flipping Remote->Mounted fixed the softlock; states persist.
+--   desc+73 = EPFXPackageState byte (Invalid=0 Validating=1 Remote=2
+--             Downloading=3 Downloaded=4 Mounting=5 Mounted=6 Attached=7)
 -- ============================================================================
 local MGR_RVA    = 0x76AE910
 local DESC_ARR   = 96
@@ -379,6 +401,70 @@ local DESC_CNT   = 104
 local STATE_OFF  = 73
 local dlpin_on   = false
 _G._DLPIN_TOTAL  = 0
+
+local OBB_DIR = "/sdcard/Android/obb/com.zenstudios.PFXVRQuest/"
+local DLPIN_STUCK_TICKS = 3      -- 2s loop -> ~6s grace before flipping a stuck Remote
+local base_chunks = nil          -- set: chunkId -> true (embedded in the OBBs)
+local presence    = {}           -- pit -> true/false (cached content-on-disk)
+local remote_seen = {}           -- desc addr -> consecutive ticks seen in Remote
+
+local function scan_obb_chunks()
+    if base_chunks then return base_chunks end
+    base_chunks = {}
+    local names = { "main.com.zenstudios.PFXVRQuest.obb" }
+    for i = 1, 9 do names[#names + 1] = "overflow" .. i .. ".com.zenstudios.PFXVRQuest.obb" end
+    for _, n in ipairs(names) do
+        local f = io.open(OBB_DIR .. n, "rb")
+        if f then
+            local sz = f:seek("end")
+            local rd = math.min(sz, 3 * 1024 * 1024)
+            f:seek("end", -rd)
+            local tail = f:read(rd) or ""
+            f:close()
+            for id in tail:gmatch("pakchunk(%d+)%-Android_ASTC") do
+                base_chunks[tonumber(id)] = true
+            end
+        end
+    end
+    local cnt = 0; for _ in pairs(base_chunks) do cnt = cnt + 1 end
+    Log(TAG .. ": OBB scan — " .. cnt .. " embedded chunk(s)")
+    return base_chunks
+end
+
+local function pak_on_disk(pit)
+    local f = io.open(OBB_DIR .. "pakchunk" .. (2000 + pit) .. "-Android_ASTC.pak", "rb")
+    if f then f:close(); return true end
+    return false
+end
+
+-- pit -> is this table's content actually on the device?
+local function content_present(pit, refresh)
+    if not refresh and presence[pit] ~= nil then return presence[pit] end
+    local ok = scan_obb_chunks()[2000 + pit] == true or pak_on_disk(pit)
+    presence[pit] = ok
+    return ok
+end
+
+local function missing_tables(refresh)
+    if #tables_found == 0 then enumerate_tables() end
+    local miss = {}
+    for _, t in ipairs(tables_found) do
+        local pit = tonumber(t.pitId) or -1
+        if pit >= 0 and not content_present(pit, refresh) then miss[#miss + 1] = t end
+    end
+    return miss
+end
+
+-- acquire follows reality: content missing -> let the game download it;
+-- everything present -> downloads off (never re-fetch what the OBB has)
+local function sync_acquire()
+    local miss = missing_tables(true)
+    set_auto_acquire_chunks(#miss > 0)
+    if #miss > 0 then
+        Log(TAG .. ": " .. #miss .. " table(s) missing content — real downloads ENABLED")
+    end
+    return miss
+end
 
 local function pin_download_states()
     local base = YUP.GetLibBase(); if not base or base == 0 then return 0 end
@@ -388,18 +474,38 @@ local function pin_download_states()
     local a = MemReadU64(mgr + DESC_ARR)
     -- validate: bogus count/ptr (wrong build/offset) -> safe no-op, never corrupt
     if not (a and a > 0x1000 and a < 0x8000000000 and n > 0 and n < 256) then return 0 end
-    local flipped = 0
+
+    -- pass 1: collect states; any desc in 3/4/5 = a real download/mount running
+    local descs, states, downloading = {}, {}, false
     for i = 0, n - 1 do
         local desc = MemReadU64(a + i * 16)
         if desc and desc > 0x1000 and desc < 0x8000000000 then
-            local w  = MemReadU64(desc + STATE_OFF)
-            local st = w & 0xFF
-            if st >= 2 and st <= 5 then                       -- Remote..Mounting
-                MemWriteU64(desc + STATE_OFF, (w & ~0xFF) | 6) -- -> Mounted (keep other 7 bytes)
+            local st = MemReadU64(desc + STATE_OFF) & 0xFF
+            descs[#descs + 1] = desc
+            states[desc] = st
+            if st >= 3 and st <= 5 then downloading = true end
+        end
+    end
+
+    local have_missing = #missing_tables(false) > 0
+    local flipped = 0
+    local seen_now = {}
+    for _, desc in ipairs(descs) do
+        if states[desc] == 2 then                               -- Remote only
+            local ticks = (remote_seen[desc] or 0) + 1
+            seen_now[desc] = ticks
+            -- flip immediately when nothing is missing; while content is
+            -- missing, flip only a STUCK Remote with no download running
+            -- (the game would have moved a downloadable desc to 3 by now)
+            if (not have_missing) or (ticks >= DLPIN_STUCK_TICKS and not downloading) then
+                local w = MemReadU64(desc + STATE_OFF)
+                MemWriteU64(desc + STATE_OFF, (w & ~0xFF) | 6)  -- -> Mounted
                 flipped = flipped + 1
+                seen_now[desc] = nil
             end
         end
     end
+    remote_seen = seen_now
     _G._DLPIN_TOTAL = _G._DLPIN_TOTAL + flipped
     return flipped
 end
@@ -408,50 +514,97 @@ local function install_download_pin()
     if dlpin_on then return end
     dlpin_on = true
     pcall(pin_download_states)                    -- immediate first pass
+    local tick = 0
     LoopAsync(2000, function()                    -- slow + cheap: states don't revert
         if _G._PRES_GEN ~= MY_GEN then return true end
+        tick = tick + 1
         pcall(pin_download_states)
+        -- ~10s: re-check the disk so a finished download flips its table to
+        -- "present", drops acquire back off, and tells the player
+        if tick % 5 == 0 then
+            pcall(function()
+                local before = #missing_tables(false)
+                if before > 0 then
+                    local after = #sync_acquire()
+                    if after < before then
+                        Notify(TAG, "Table content downloaded (" .. (before - after) .. ")")
+                    end
+                end
+            end)
+        end
         return false
     end)
-    Log(TAG .. ": download fix active (native Remote->Mounted, load from OBB)")
+    Log(TAG .. ": download fix v2 active (presence-aware; real downloads untouched)")
 end
 
 pcall(function() RegisterCommand("pres_dl_status", function()
     local base = YUP.GetLibBase(); local mgr = base and MemReadU64(base + MGR_RVA) or 0
     local n = (mgr and mgr > 0x1000) and (MemReadU64(mgr + DESC_CNT) & 0xFFFFFFFF) or 0
-    return TAG .. ": download-fix total flipped=" .. tostring(_G._DLPIN_TOTAL) .. " descriptors=" .. tostring(n)
+    local miss = missing_tables(true)
+    local names = {}
+    for _, t in ipairs(miss) do names[#names + 1] = t.name .. "(pit " .. tostring(t.pitId) .. ")" end
+    return TAG .. ": flipped=" .. tostring(_G._DLPIN_TOTAL) .. " descriptors=" .. tostring(n)
+        .. " missing=" .. #miss .. (#miss > 0 and (" [" .. table.concat(names, ", ") .. "]") or "")
+end) end)
+
+pcall(function() RegisterCommand("pres_dl_missing", function()
+    local miss = missing_tables(true)
+    if #miss == 0 then return TAG .. ": all table content present on disk" end
+    local lines = { TAG .. ": " .. #miss .. " table(s) missing content:" }
+    for _, t in ipairs(miss) do
+        lines[#lines + 1] = string.format("  [%d] pit=%s chunk=%s %s",
+            t.index, tostring(t.pitId), tostring(2000 + (tonumber(t.pitId) or 0)), t.name)
+    end
+    lines[#lines + 1] = "select one in-game to download it (acquire auto-enables)"
+    return table.concat(lines, "\n")
+end) end)
+
+pcall(function() RegisterCommand("pres_fetch", function(idx)
+    idx = tonumber(idx) or 0
+    if idx < 0 or idx >= #tables_found then return TAG .. ": invalid index" end
+    local t = tables_found[idx + 1]
+    local pit = tonumber(t.pitId) or -1
+    if content_present(pit, true) then return TAG .. ": " .. t.name .. " content already on disk" end
+    set_auto_acquire_chunks(true)
+    local ok = pcall(function()
+        local lib = StaticFindObject("/Script/PinballFX_VR.PFXUIFunctionLibrary")
+        if lib then lib:Call("RequestTable", pit) end
+    end)
+    return TAG .. ": acquire ON + RequestTable(" .. pit .. ") sent (ok=" .. tostring(ok)
+        .. ") — select the table in-game if nothing starts"
 end) end)
 
 local function activate_preservation()
-    Log(TAG .. ": === ACTIVATING PRESERVATION MODE (unlock, NO download) ===")
+    Log(TAG .. ": === ACTIVATING PRESERVATION MODE (unlock + presence-aware downloads) ===")
 
     -- Step 1: Debug unlock flag
     set_debug_unlock(true)
 
-    -- Step 2: DISABLE chunk auto-acquire — the OBB already has every PAK, so the
-    -- game must NOT try to "download" missing chunks. This is the download fix.
-    set_auto_acquire_chunks(false)
-
-    -- Step 3: Install ownership hooks
+    -- Step 2: Install ownership hooks
     install_ownership_hooks()
 
-    -- Step 3b: native download fix (Remote->Mounted, load from OBB)
+    -- Step 2b: native download fix v2 (presence-aware Remote->Mounted)
     install_download_pin()
 
-    -- Step 4: Enumerate tables
+    -- Step 3: Enumerate tables
     enumerate_tables()
 
-    -- Step 5: Force all tables as base game (load straight from the OBB)
+    -- Step 4: Force all tables as base game (load straight from the OBB)
     force_all_tables_included()
 
-    -- Step 6: Enumerate chunks
+    -- Step 5: Enumerate chunks
     enumerate_chunks()
 
+    -- Step 6: acquire follows the disk — content missing somewhere means the
+    -- game is ALLOWED to really download; all present means downloads stay off
+    local miss = sync_acquire()
+
     Log(TAG .. ": === PRESERVATION MODE ACTIVE ===")
-    Log(TAG .. ":   " .. #tables_found .. " tables found")
+    Log(TAG .. ":   " .. #tables_found .. " tables found (" .. #miss .. " missing content on disk)")
     Log(TAG .. ":   " .. #chunks_found .. " chunk mappings found")
     Log(TAG .. ":   bDebugUnlockAllTables = true")
-    Log(TAG .. ":   bShouldAcquireMissingChunksOnLoad = FALSE (no downloads)")
+    Log(TAG .. ":   bShouldAcquireMissingChunksOnLoad = " .. tostring(#miss > 0)
+        .. (#miss > 0 and " (missing tables WILL download for real)" or " (everything on disk, no downloads)"))
     Log(TAG .. ":   All tables marked IncludedInBaseGame")
     Log(TAG .. ":   Ownership hooks active")
 
@@ -623,6 +776,9 @@ _G.PFX_Preservation = {
     get_tables            = function() return tables_found end,
     get_chunks            = function() return chunks_found end,
     is_active             = function() return bypass_active end,
+    content_present       = content_present,
+    missing_tables        = missing_tables,
+    sync_acquire          = sync_acquire,
 }
 
 -- ============================================================================
@@ -636,7 +792,7 @@ pcall(function()
     end)
 end)
 
-Log(TAG .. ": v1 loaded — preservation & ownership bypass")
+Log(TAG .. ": v2 loaded — preservation, ownership bypass, presence-aware downloads")
 Log(TAG .. ": Bridge commands:")
 Log(TAG .. ":   pres_activate     — Full activation (all steps)")
 Log(TAG .. ":   pres_unlock       — Set bDebugUnlockAllTables")
@@ -645,6 +801,9 @@ Log(TAG .. ":   pres_tables       — Enumerate all tables")
 Log(TAG .. ":   pres_chunks       — Enumerate pak chunk mappings")
 Log(TAG .. ":   pres_force_base   — Force all tables as IncludedInBaseGame")
 Log(TAG .. ":   pres_download_all — Force download all missing chunks")
+Log(TAG .. ":   pres_dl_missing   — List tables whose content is NOT on disk")
+Log(TAG .. ":   pres_dl_status    — Download-fix stats + missing summary")
+Log(TAG .. ":   pres_fetch <idx>  — Enable acquire + request one missing table")
 Log(TAG .. ":   pres_status       — Show current state")
 Log(TAG .. ":   pres_check_owned <idx> — Check ownership for table")
 Log(TAG .. ":   pres_table_info <idx>  — Dump table properties")
