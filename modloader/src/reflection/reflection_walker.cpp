@@ -97,13 +97,31 @@ namespace reflection
     }
 
     // ═══ Internal state ═════════════════════════════════════════════════════
-    static std::vector<ClassInfo> s_classes;
-    static std::vector<StructInfo> s_structs;
-    static std::vector<EnumInfo> s_enums;
+    // Reflection data is published as an immutable snapshot (RCU-style).
+    // walk_all() used to clear() + rebuild the live vectors in place — any reader
+    // on another thread (game-thread hook dispatch doing find_class_ptr, the
+    // multi-second SDK dump iterating get_classes()) during a bridge-triggered
+    // re-walk read freed vector memory: garbage string sizes → absurd-length
+    // allocations → bad_alloc/SIGSEGV. Now a re-walk builds a FRESH snapshot and
+    // atomically swaps the pointer; old snapshots are retired but never freed, so
+    // every pointer/reference a reader ever obtained stays valid for the process
+    // lifetime. Re-walks are rare (boot + explicit bridge refresh), so retained
+    // memory is bounded by a handful of snapshots.
+    struct Snapshot
+    {
+        std::vector<ClassInfo> classes;
+        std::vector<StructInfo> structs;
+        std::vector<EnumInfo> enums;
 
-    static std::unordered_map<std::string, size_t> s_class_map; // name → index in s_classes
-    static std::unordered_map<std::string, size_t> s_struct_map;
-    static std::unordered_map<std::string, size_t> s_enum_map;
+        std::unordered_map<std::string, size_t> class_map; // name → index in classes
+        std::unordered_map<std::string, size_t> struct_map;
+        std::unordered_map<std::string, size_t> enum_map;
+    };
+    static std::atomic<Snapshot *> s_snap{new Snapshot()}; // never null
+    static std::vector<Snapshot *> s_retired;              // retired snapshots, kept alive forever
+    static std::mutex s_walk_mutex;                        // serializes walk_all() + retire list
+
+    static inline Snapshot *snap() { return s_snap.load(std::memory_order_acquire); }
 
     static int32_t s_object_count = 0;
 
@@ -272,9 +290,12 @@ namespace reflection
         if (!ue::is_valid_ptr(reinterpret_cast<const void *>(block_ptr)))
             return "";
 
-        // Compute entry address within block
+        // Compute entry address within block. A garbage index's offset can point
+        // past the end of the block's mapping (offset spans up to 128KB; blocks can
+        // be 64KB), so require the header bytes to be actually mapped, not merely
+        // range-plausible.
         uintptr_t entry_addr = block_ptr + static_cast<uintptr_t>(offset_in_block) * ue::FNAME_STRIDE;
-        if (!ue::is_valid_ptr(reinterpret_cast<const void *>(entry_addr)))
+        if (!is_readable_ptr(reinterpret_cast<const void *>(entry_addr)))
             return "";
 
         // Read header
@@ -283,6 +304,14 @@ namespace reflection
         int length = (header >> ue::FNAMENTRY_LEN_SHIFT);
 
         if (length <= 0 || length > 1024)
+            return "";
+
+        // The chars run up to 2*length bytes past the header — a garbage index can
+        // land on an entry whose tail crosses into an unmapped page even though the
+        // header itself read fine (walk_all_fnames checks this; this path must too).
+        int char_size = is_wide ? 2 : 1;
+        uintptr_t last_byte = entry_addr + ue::FNAMENTRY_HEADER_SIZE + static_cast<uintptr_t>(length) * char_size - 1;
+        if (!is_readable_ptr(reinterpret_cast<const void *>(last_byte)))
             return "";
 
         const char *chars = reinterpret_cast<const char *>(entry_addr + ue::FNAMENTRY_HEADER_SIZE);
@@ -498,7 +527,12 @@ namespace reflection
         std::string result = get_short_name(obj);
         ue::UObject *outer = ue::uobj_get_outer(obj);
 
-        while (outer && is_readable_ptr(outer))
+        // A corrupt/stale outer chain can cycle (A→B→A). Without a cap this loop
+        // concatenates forever — unbounded allocation until bad_alloc/OOM. Real
+        // chains are a handful deep and full paths are a few hundred chars; 32
+        // levels / 4KB is far beyond anything legitimate.
+        int depth = 0;
+        while (outer && is_readable_ptr(outer) && ++depth <= 32 && result.size() < 4096)
         {
             std::string outer_name = get_short_name(outer);
             if (outer_name.empty())
@@ -514,10 +548,13 @@ namespace reflection
     {
         if (!obj || !is_readable_ptr(obj))
             return "UnknownPackage";
-        // Walk the outer chain to the top-level UPackage
+        // Walk the outer chain to the top-level UPackage. Same cycle hazard as
+        // get_full_name: a corrupt chain that loops would spin this thread forever
+        // (no allocation to fail us out) — cap the depth.
         const ue::UObject *current = obj;
         const ue::UObject *top = obj;
-        while (current && is_readable_ptr(current))
+        int depth = 0;
+        while (current && is_readable_ptr(current) && ++depth <= 32)
         {
             top = current;
             ue::UObject *outer = ue::uobj_get_outer(current);
@@ -1241,15 +1278,24 @@ namespace reflection
     // ═══ Walk all objects ═══════════════════════════════════════════════════
     void walk_all()
     {
+        // Serialize concurrent walkers (boot defer thread vs bridge refresh).
+        std::lock_guard<std::mutex> walk_lock(s_walk_mutex);
+
         // Snapshot process memory map for safe pointer validation
         build_memory_map();
 
-        s_classes.clear();
-        s_structs.clear();
-        s_enums.clear();
-        s_class_map.clear();
-        s_struct_map.clear();
-        s_enum_map.clear();
+        // Build into a fresh snapshot; readers keep using the published one
+        // untouched until the atomic swap at the end.
+        Snapshot *fresh = new Snapshot();
+
+        // Publish `fresh` (even if empty on the early-return path below) and
+        // retire the old snapshot WITHOUT freeing it — readers may still hold
+        // pointers into it indefinitely.
+        auto publish = [&]()
+        {
+            s_retired.push_back(s_snap.load(std::memory_order_relaxed));
+            s_snap.store(fresh, std::memory_order_release);
+        };
 
         s_object_count = get_num_elements();
         logger::log_info("REFLECT", "Walking GUObjectArray — %d objects found", s_object_count);
@@ -1266,6 +1312,7 @@ namespace reflection
                 logger::log_info("REFLECT", "  GUObjectArray+0x%02X: int32=%d (0x%08X) / ptr=0x%lX",
                                  off, val, (unsigned)val, (unsigned long)val64);
             }
+            publish();
             return;
         }
 
@@ -1341,8 +1388,8 @@ namespace reflection
                 ci.properties = walk_properties(reinterpret_cast<const ue::UStruct *>(cls), false);
                 ci.functions = walk_functions(reinterpret_cast<const ue::UStruct *>(cls), false);
 
-                s_class_map[ci.name] = s_classes.size();
-                s_classes.push_back(ci);
+                fresh->class_map[ci.name] = fresh->classes.size();
+                fresh->classes.push_back(ci);
                 class_count++;
             }
             else if (is_ustruct(obj))
@@ -1362,8 +1409,8 @@ namespace reflection
 
                 si.properties = walk_properties(st, false);
 
-                s_struct_map[si.name] = s_structs.size();
-                s_structs.push_back(si);
+                fresh->struct_map[si.name] = fresh->structs.size();
+                fresh->structs.push_back(si);
                 struct_count++;
             }
             else if (is_uenum(obj))
@@ -1402,42 +1449,50 @@ namespace reflection
                     }
                 }
 
-                s_enum_map[ei.name] = s_enums.size();
-                s_enums.push_back(ei);
+                fresh->enum_map[ei.name] = fresh->enums.size();
+                fresh->enums.push_back(ei);
                 enum_count++;
             }
         }
 
         logger::log_info("REFLECT", "Walk complete: %d classes, %d structs, %d enums (null=%d, invalid=%d)",
                          class_count, struct_count, enum_count, null_count, invalid_count);
+
+        publish();
     }
 
     // ═══ Getters ════════════════════════════════════════════════════════════
-    const std::vector<ClassInfo> &get_classes() { return s_classes; }
-    const std::vector<StructInfo> &get_structs() { return s_structs; }
-    const std::vector<EnumInfo> &get_enums() { return s_enums; }
+    // Each call pins the snapshot current at that moment; references and
+    // pointers returned remain valid forever (snapshots are never freed), they
+    // just go stale relative to a later re-walk.
+    const std::vector<ClassInfo> &get_classes() { return snap()->classes; }
+    const std::vector<StructInfo> &get_structs() { return snap()->structs; }
+    const std::vector<EnumInfo> &get_enums() { return snap()->enums; }
 
     ClassInfo *find_class(const std::string &name)
     {
-        auto it = s_class_map.find(name);
-        if (it != s_class_map.end())
-            return &s_classes[it->second];
+        Snapshot *s = snap();
+        auto it = s->class_map.find(name);
+        if (it != s->class_map.end())
+            return &s->classes[it->second];
         return nullptr;
     }
 
     StructInfo *find_struct(const std::string &name)
     {
-        auto it = s_struct_map.find(name);
-        if (it != s_struct_map.end())
-            return &s_structs[it->second];
+        Snapshot *s = snap();
+        auto it = s->struct_map.find(name);
+        if (it != s->struct_map.end())
+            return &s->structs[it->second];
         return nullptr;
     }
 
     EnumInfo *find_enum(const std::string &name)
     {
-        auto it = s_enum_map.find(name);
-        if (it != s_enum_map.end())
-            return &s_enums[it->second];
+        Snapshot *s = snap();
+        auto it = s->enum_map.find(name);
+        if (it != s->enum_map.end())
+            return &s->enums[it->second];
         return nullptr;
     }
 
