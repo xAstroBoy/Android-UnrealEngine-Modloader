@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-07-23
+
+### Fixed
+- **Game crash at boot on rootless installs (SIGABRT ~8s after launch)** — the
+  one-time SDK boot dump hit `std::bad_alloc` on corrupt-looking reflection
+  strings and, on pre-v1.3.0 builds, the exception escaped to `std::terminate`.
+  Because the dump never finished, its one-time marker was never written, so
+  the game died on *every* launch. Three layers of fix:
+  - reflection data is now published as an immutable snapshot (RCU-style swap);
+    a re-walk can no longer invalidate vectors another thread is reading — the
+    actual producer of the garbage string sizes
+  - `fname_to_string` validates the entry header and full char range are mapped;
+    `get_full_name`/`get_package_name` cap the outer-chain walk (a corrupt
+    cyclic chain previously meant unbounded allocation or a permanent freeze)
+  - every SDK dump pass and entity write is individually isolated (`c292db0`),
+    and the dump marker is only written on a clean run
+- Logger no longer `fflush()`es every line (game-thread lag); default log level
+  is `warn`
+
 ### Added
+- **PFX: Williams operator/service menu** — coin-door switch (sw21) held open
+  per frame unlocks the emulated ROM's own service menu; ModMenu door toggle
+- CI ships the complete release: both ABIs (arm64 + armeabi-v7a, stripped),
+  Windows/Linux installers, PCBridge, one mods zip per supported game
+
+### Changed
+- Modloader also builds for `armeabi-v7a` (32-bit UE4 titles)
+
+### Added (earlier public-repo work)
 - Public GitHub repository with CI/CD
 - GitHub Actions auto-build for ARM64
 - Example mods for learning
