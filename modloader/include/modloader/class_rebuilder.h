@@ -166,6 +166,14 @@ void unhook(HookId id);
 // Tick function — called from ProcessEvent hook to dispatch property dirty checks
 void tick(ue::UObject* self, ue::UFunction* func, void* parms);
 
+// Opt IN to per-ProcessEvent-call live-instance tracking. Rebuilding a class for
+// its schema (properties/functions) does NOT enable this — tracking makes tick()
+// do work on EVERY ProcessEvent call (a level-load object-spawn burst then costs
+// a string-resolve + mutex per call = a visible frame hitch). Only the code paths
+// that actually READ the tracked instance list (RebuildClass():GetAllInstances/
+// GetInstance) turn it on, from first use onward.
+void enable_instance_tracking();
+
 // Get the CDO (Class Default Object) for a class
 ue::UObject* get_cdo(const std::string& class_name);
 

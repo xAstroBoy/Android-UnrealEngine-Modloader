@@ -264,10 +264,23 @@ namespace pe_hook
         // Without this, a game whose loop thread we don't know by name would
         // never capture, and the whole game-thread queue would silently hang
         // (exec_lua / LoopAsync / delayed actions / debug-menu injection dead).
+        // HOT PATH: once the game thread is captured (once, early at boot), decide
+        // game-thread-ness with is_game_thread() — a thread-local id compare, no
+        // syscall. The prior code called is_known_game_thread_name() (a prctl
+        // PR_GET_NAME SYSCALL) on EVERY ProcessEvent call, even though its result
+        // is unused after capture. At a level-load PE burst that was tens of
+        // thousands of wasted syscalls per frame window = a measurable hitch.
         static std::atomic<bool> s_game_thread_captured{false};
-        bool named_game_thread = is_known_game_thread_name();
-        if (!s_game_thread_captured.load(std::memory_order_relaxed))
+        bool safe_for_lua;
+        if (s_game_thread_captured.load(std::memory_order_relaxed))
         {
+            safe_for_lua = lua_ue4ss_globals::is_game_thread();
+        }
+        else
+        {
+            // Pre-capture only (runs a handful of times at boot): the name/streak
+            // syscalls here are fine because they stop the instant we capture.
+            bool named_game_thread = is_known_game_thread_name();
             bool do_capture = named_game_thread;
             if (!do_capture && !is_known_nongame_thread_name())
             {
@@ -294,19 +307,7 @@ namespace pe_hook
                 logger::log_info("HOOK", "Captured Lua game thread from ProcessEvent (thread '%s', %s)",
                                  tname, named_game_thread ? "name-match" : "PE-dominance fallback");
             }
-        }
-
-        // ProcessEvent can fire on non-game worker threads in some engine phases.
-        // Lua VM, delayed actions, and hook callbacks are game-thread-only.
-        // Bypass all hook side effects off-game-thread to avoid cross-thread Lua access.
-        bool safe_for_lua = false;
-        if (s_game_thread_captured.load(std::memory_order_relaxed))
-        {
-            safe_for_lua = lua_ue4ss_globals::is_game_thread();
-        }
-        else
-        {
-            safe_for_lua = named_game_thread;
+            safe_for_lua = do_capture ? true : named_game_thread;
         }
         if (!safe_for_lua)
         {

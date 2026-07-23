@@ -451,8 +451,12 @@ namespace rebuilder
                          inserted.properties.size(), inserted.all_properties.size(),
                          inserted.functions.size(), inserted.all_functions.size());
 
-        // Enable tick() tracking now that at least one class is rebuilt
-        s_has_any_tracking.store(true, std::memory_order_release);
+        // NOTE: rebuilding a class for its SCHEMA (props/funcs — what mod menus and
+        // introspection do) must NOT enable tick() instance tracking. Tracking
+        // makes tick() resolve names + take a mutex on EVERY ProcessEvent call; a
+        // level-load object-spawn burst then hitches the frame. Tracking is opt-in
+        // via enable_instance_tracking(), called only when the tracked-instance
+        // list is actually read.
 
         return &inserted;
     }
@@ -587,11 +591,16 @@ namespace rebuilder
     }
 
     // ═══ Tick — called from ProcessEvent hook ═══════════════════════════════
+    void enable_instance_tracking()
+    {
+        s_has_any_tracking.store(true, std::memory_order_release);
+    }
+
     void tick(ue::UObject *self, ue::UFunction *func, void *parms)
     {
-        // FAST PATH: if no classes have been rebuilt and no instance hooks exist,
-        // this is a single atomic load (< 1 nanosecond) and return.
-        // This makes tick() effectively free when ClassRebuilder is unused.
+        // FAST PATH: instance tracking is OPT-IN (enable_instance_tracking()), so
+        // unless a mod actually reads the tracked-instance list this is a single
+        // relaxed atomic load and return — effectively free on every PE call.
         if (!s_has_any_tracking.load(std::memory_order_relaxed))
             return;
 

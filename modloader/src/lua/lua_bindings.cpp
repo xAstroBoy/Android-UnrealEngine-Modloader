@@ -1287,18 +1287,32 @@ namespace lua_bindings
         cls_table["__parent"] = rc->parent_name;
         cls_table["__raw"] = sol::lightuserdata_value(rc->raw);
 
-        cls_table["GetInstance"] = [rc](sol::this_state ts2, sol::optional<int> index) -> sol::object {
+        // Reading the tracked-instance list opts this process IN to per-PE-call
+        // instance tracking (schema rebuilds don't — see enable_instance_tracking).
+        // The tracked set only fills going forward, so each accessor falls back to
+        // a live GUObjectArray scan when the cache is still empty — correct on the
+        // very first call, fast on repeats.
+        cls_table["GetInstance"] = [rc, name](sol::this_state ts2, sol::optional<int> index) -> sol::object {
             sol::state_view lua2(ts2);
+            rebuilder::enable_instance_tracking();
             ue::UObject* inst = index ? rc->get_instance(*index) : rc->get_first_instance();
+            if (!inst) {
+                auto live = reflection::find_all_instances(name);
+                int want = index ? *index : 0;
+                if (want >= 0 && want < static_cast<int>(live.size())) inst = live[want];
+            }
             return lua_uobject::wrap_or_nil(lua2, inst);
         };
 
-        cls_table["GetAllInstances"] = [rc](sol::this_state ts2) -> sol::table {
+        cls_table["GetAllInstances"] = [rc, name](sol::this_state ts2) -> sol::table {
             sol::state_view lua2(ts2);
+            rebuilder::enable_instance_tracking();
             auto instances = rc->get_all_instances();
+            if (instances.empty()) instances = reflection::find_all_instances(name);
             sol::table t = lua2.create_table();
             int i = 1;
             for (auto* obj : instances) {
+                if (!obj || !ue::is_valid_ptr(obj)) continue;
                 lua_uobject::LuaUObject wrapped;
                 wrapped.ptr = obj;
                 t[i++] = wrapped;
@@ -1306,8 +1320,11 @@ namespace lua_bindings
             return t;
         };
 
-        cls_table["InstanceCount"] = [rc]() -> int {
-            return rc->instance_count();
+        cls_table["InstanceCount"] = [rc, name]() -> int {
+            rebuilder::enable_instance_tracking();
+            int n = rc->instance_count();
+            if (n == 0) n = static_cast<int>(reflection::find_all_instances(name).size());
+            return n;
         };
 
         cls_table["HasProp"] = [rc](const std::string& prop_name) -> bool {
