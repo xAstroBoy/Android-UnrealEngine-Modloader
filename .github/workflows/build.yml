@@ -12,11 +12,19 @@ env:
 
 jobs:
   # ════════════════════════════════════════════════════════════════════
-  #  Job 1: Build libmodloader.so (ARM64 Android)
+  #  Job 1: Build libmodloader.so (Android — both ABIs)
   # ════════════════════════════════════════════════════════════════════
   build-modloader:
-    name: Build libmodloader.so
+    name: Build libmodloader.so (${{ matrix.abi }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            artifact: libmodloader-arm64
+          - abi: armeabi-v7a
+            artifact: libmodloader-arm32
 
     steps:
       - name: Checkout
@@ -42,7 +50,7 @@ jobs:
           mkdir -p build && cd build
           cmake -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_ABI=${{ matrix.abi }} \
             -DANDROID_PLATFORM=android-24 \
             -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=Release \
@@ -52,17 +60,32 @@ jobs:
         working-directory: modloader/build
         run: ninja -j$(nproc)
 
-      - name: Verify output
+      # The release asset must be stripped (~6MB vs ~90MB with debug info).
+      # The unstripped copy is kept as a separate CI artifact for tombstone
+      # symbolication — deployment diagnostics doctrine says never lose it.
+      - name: Strip release copy
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          ls -la modloader/build/libmodloader.so
-          file modloader/build/libmodloader.so
+          STRIP=$(find "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" -name llvm-strip | head -1)
+          "$STRIP" --strip-all -o modloader/build/libmodloader-stripped.so modloader/build/libmodloader.so
+          ls -la modloader/build/libmodloader.so modloader/build/libmodloader-stripped.so
+          file modloader/build/libmodloader-stripped.so
 
-      - name: Upload artifact
+      - name: Upload artifact (stripped)
         uses: actions/upload-artifact@v4
         with:
-          name: libmodloader-arm64
+          name: ${{ matrix.artifact }}
+          path: modloader/build/libmodloader-stripped.so
+          retention-days: 30
+
+      - name: Upload artifact (unstripped, for symbolication)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-unstripped
           path: modloader/build/libmodloader.so
           retention-days: 30
+          compression-level: 9
 
   # ════════════════════════════════════════════════════════════════════
   #  Job 2: Build Installer (Windows GUI + CLI)
@@ -122,13 +145,52 @@ jobs:
           retention-days: 30
 
   # ════════════════════════════════════════════════════════════════════
-  #  Job 3: Package Release
+  #  Job 3: Build PCBridge (Windows desktop control panel)
+  # ════════════════════════════════════════════════════════════════════
+  build-pcbridge:
+    name: Build PCBridge
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: PCBridge
+
+      - name: Build PCBridge (Release)
+        working-directory: PCBridge
+        run: cargo build --release
+
+      - name: Upload PCBridge artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pcbridge
+          path: PCBridge/target/release/pcbridge.exe
+          retention-days: 30
+
+  # ════════════════════════════════════════════════════════════════════
+  #  Job 4: Package Release
   #  • On tag push (v*): creates a full versioned GitHub Release
   #  • On push to main: creates/updates a "dev-latest" pre-release
+  #
+  #  Stable-named assets (fetched programmatically — NEVER rename):
+  #    libmodloader.so             — arm64, stripped; the installer downloads
+  #                                  this via releases/latest/download/
+  #    libmodloader-armeabi-v7a.so — arm32, stripped (32-bit UE4 titles)
+  #    ue-modloader-installer.exe  — Windows installer
+  #    ue-modloader-installer-linux— Linux installer
+  #    pcbridge.exe                — desktop bridge control panel
+  #    <game>-mods.zip             — one per game folder under mods/
   # ════════════════════════════════════════════════════════════════════
   package:
     name: Package Release
-    needs: [build-modloader, build-installer]
+    needs: [build-modloader, build-installer, build-pcbridge]
     if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -138,11 +200,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download libmodloader.so
+      - name: Download libmodloader.so (arm64, stripped)
         uses: actions/download-artifact@v4
         with:
           name: libmodloader-arm64
-          path: release/
+          path: arm64/
+
+      - name: Download libmodloader.so (arm32, stripped)
+        uses: actions/download-artifact@v4
+        with:
+          name: libmodloader-arm32
+          path: arm32/
 
       - name: Download Windows installer
         uses: actions/download-artifact@v4
@@ -155,6 +223,12 @@ jobs:
         with:
           name: installer-x86_64-unknown-linux-gnu
           path: release/linux/
+
+      - name: Download PCBridge
+        uses: actions/download-artifact@v4
+        with:
+          name: pcbridge
+          path: release/
 
       - name: Set release tag
         id: tag
@@ -169,18 +243,23 @@ jobs:
             echo "name=Development Build (latest main)" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Stage stable-named assets
+        run: |
+          # Stripped .so artifacts arrive named libmodloader-stripped.so
+          cp arm64/libmodloader-stripped.so release/libmodloader.so
+          cp arm32/libmodloader-stripped.so release/libmodloader-armeabi-v7a.so
+          # Linux installer under a stable distinct asset name
+          cp release/linux/ue-modloader-installer release/ue-modloader-installer-linux
+          chmod +x release/ue-modloader-installer-linux release/linux/ue-modloader-installer || true
+
       - name: Package mods & tools
         run: |
-          # ── Game mods ──
+          # ── Per-game mod zips (every game folder under mods/ ships) ──
           for game_dir in mods/*/; do
             game=$(basename "$game_dir")
-            for mod in "$game_dir"*/; do
-              [ -d "$mod" ] || continue
-              mod_name=$(basename "$mod")
-              mkdir -p "release/mods/$game/$mod_name"
-              cp "$mod"*.lua "release/mods/$game/$mod_name/" 2>/dev/null || true
-              cp "$mod"*.pak "release/mods/$game/$mod_name/" 2>/dev/null || true
-            done
+            mkdir -p "release/mods/$game"
+            cp -r "$game_dir". "release/mods/$game/" 2>/dev/null || true
+            (cd mods && zip -r "../release/${game}-mods.zip" "$game")
           done
 
           # ── PAK files ──
@@ -207,9 +286,6 @@ jobs:
           cp CHANGELOG.md release/ 2>/dev/null || true
           cp docs/LUA_API.md release/ 2>/dev/null || true
 
-          # ── Linux installer is separate ──
-          chmod +x release/linux/ue-modloader-installer 2>/dev/null || true
-
       - name: Create Windows release archive
         run: |
           cd release
@@ -220,6 +296,7 @@ jobs:
         run: |
           # Copy shared files into linux release
           cp release/libmodloader.so release/linux/
+          cp release/libmodloader-armeabi-v7a.so release/linux/
           cp -r release/mods release/linux/mods 2>/dev/null || true
           cp -r release/tools release/linux/tools 2>/dev/null || true
           cp -r release/examples release/linux/examples 2>/dev/null || true
@@ -245,6 +322,12 @@ jobs:
           files: |
             quest-ue-modloader-${{ steps.tag.outputs.tag }}-windows.zip
             quest-ue-modloader-${{ steps.tag.outputs.tag }}-linux.tar.gz
+            release/libmodloader.so
+            release/libmodloader-armeabi-v7a.so
+            release/ue-modloader-installer.exe
+            release/ue-modloader-installer-linux
+            release/pcbridge.exe
+            release/*-mods.zip
           generate_release_notes: true
           draft: false
           prerelease: ${{ steps.tag.outputs.prerelease }}
