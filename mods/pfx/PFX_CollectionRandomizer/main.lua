@@ -1752,6 +1752,10 @@ local autoWarmup = 3         -- ~21s after init so the one-shot scrambles finish
 -- actual hub time spread across the whole session — enough to cover every table's
 -- cabinet as you pass it, incl. BSG / Tomb Raider Manor. /randomize re-arms it.
 local autoRun, AUTO_MAX = 0, 220
+-- Adaptive back-off state: while nothing new is streaming, skip whole ticks so the
+-- loop is nearly free (this is what removed the recurring hub spike). autoSkip is the
+-- count of upcoming ticks to skip; it grows with the idle streak up to AUTO_MAX_SKIP.
+local autoSkip, idleStreak, AUTO_MAX_SKIP = 0, 0, 5
 local function live_cabinet_count()
     local nc = 0
     for _, c in ipairs(FindAllOf("BP_CabinetBase_C") or {}) do
@@ -1763,28 +1767,50 @@ end
 LoopAsync(8000, function()
     if _G._RAND_GEN ~= MY_GEN then return true end   -- superseded by a reload
     if not initDone then return false end
-    if not hub_active() then return false end        -- in a table: pause, resume at hub
+    if not hub_active() then                          -- in a table: pause, and force a
+        autoSkip = 0; lastCab, lastSlots = -1, -1      -- fresh scan on return (hub reloads)
+        return false
+    end
     if autoWarmup > 0 then autoWarmup = autoWarmup - 1; return false end
+
+    -- Adaptive back-off. The change-detection below costs ~8 full GUObjectArray walks;
+    -- running it every 8s regardless was the recurring hub spike. While nothing new is
+    -- streaming (standing still / in a menu) we skip whole ticks so the loop is nearly
+    -- free, and snap back to per-tick scanning the instant content changes.
+    if autoSkip > 0 then autoSkip = autoSkip - 1; return false end
+
     autoRun = autoRun + 1
     if autoRun > AUTO_MAX then
         Log(TAG .. ": auto-apply window ended — inert (use /randomize to re-run)")
         return true
     end
-    -- change detection + streaming guard. build_entry_pool reflects on collectible
-    -- entries (GetEntryID/GetClassName/Get) and takes an UNCATCHABLE SIGSEGV on
-    -- half-streamed ones. So we ONLY rebuild the pool when the raw entry count has
-    -- held steady across two ticks (i.e. streaming has settled). Raw counts are
-    -- FindAllOf-#-only — no reflection — so they're safe to read every tick.
+
+    -- CHEAP-FIRST change gate: cabinet + slot counts only (the slot scan is 1.5s-cached).
+    -- The 6 entry-count probes are deferred until AFTER a change is seen, so an idle scan
+    -- tick does ~8 walks instead of 14 — and back-off makes most ticks do zero.
+    local nc = live_cabinet_count()
+    local ns = count_registered_slots()
+    if nc == lastCab and ns == lastSlots then
+        idleStreak = idleStreak + 1
+        autoSkip = math.min(idleStreak, AUTO_MAX_SKIP)   -- widen the quiet gap the longer it's idle
+        return false
+    end
+
+    -- Something streamed in — only NOW pay for the entry-streaming stability check.
+    -- build_entry_pool reflects on entries (GetEntryID/GetClassName/Get) and takes an
+    -- UNCATCHABLE SIGSEGV on half-streamed ones, so rebuild only once the raw entry
+    -- count holds steady across two ticks. Raw counts are FindAllOf-#-only (no reflection).
     local function raw_n(cls) local a = FindAllOf(cls); return a and #a or 0 end
     local er = raw_n("PFXCollectibleEntry_BallSkin") + raw_n("PFXCollectibleEntry_BallTrail")
              + raw_n("PFXCollectibleEntry_FlipperArm") + raw_n("PFXCollectibleEntry_Gadget")
              + raw_n("PFXCollectibleEntry_Statue") + raw_n("PFXCollectibleEntry_Poster")
-    local entriesStable = (er == lastEntryRaw)
+    if er ~= lastEntryRaw then                 -- entries mid-stream: wait a tick, retry
+        lastEntryRaw = er; idleStreak = 0; autoSkip = 0
+        return false
+    end
     lastEntryRaw = er
-    local nc = live_cabinet_count()
-    local ns = count_registered_slots()
-    if nc == lastCab and ns == lastSlots then return false end   -- nothing new streamed in
-    if not entriesStable then return false end                   -- entries mid-stream: wait a tick
+
+    idleStreak = 0; autoSkip = 0
     lastCab, lastSlots = nc, ns
     pcall(build_entry_pool)
     -- Randomize slots at stations that just streamed in (incremental: skips ones already

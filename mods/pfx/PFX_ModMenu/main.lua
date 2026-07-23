@@ -264,16 +264,23 @@ local ACTIONS = {
 
     -- == WILLIAMS OPERATOR ====================================================
     -- The emulated Williams ROM's OWN operator/service menu (tests, adjustments,
-    -- audits) — cracked via sw21 "COIN DOOR CLOSED" from the TAF ROM. Toggle the
-    -- coin door OPEN, then ENTER opens the menu; Up/Down cycle items, ESCAPE backs
-    -- out. Opening it halts play (authentic WPC) — do it from attract/game-over.
+    -- audits). "Operator Menu" auto-opens the coin door (switch auto-detected from
+    -- the ROM per table) AND binds the Touch controllers so you drive it in-headset:
+    --   right stick ↑/↓ = +/−   |   stick CLICK = ENTER   |   A = ESCAPE
+    -- Hold stick-click ~1s to enter. Opening it halts play (authentic WPC) — do it
+    -- from attract/game-over. The bridge buttons below still work as a fallback.
     { id="hdr_op", header=true, label="== WILLIAMS OPERATOR ==" },
 
-    { id="op_door", toggle=true, label=function()
-        local api = rawget(_G, "PFX_Operator")
-        local on = api and api.door_on and api.door_on()
-        return "Coin Door: " .. (on and "OPEN (held)" or "closed") .. "  [" .. tostring(api and api.mode and api.mode() or "?") .. "]"
-    end, fn=function()
+    { id="op_mode", toggle=true, label="Operator Menu  (R-stick nav/ENTER, A=ESC, X=HELP)",
+      fn=function()
+        local api = rawget(_G, "PFX_Operator"); if not api then return "Operator: mod not loaded" end
+        local on = api.operator_toggle and api.operator_toggle()
+        return on and "Operator Menu ON — hold stick-click to enter; stick +/-, A=back"
+                  or  "Operator Menu OFF"
+    end },
+
+    { id="op_door", toggle=true, label="Coin Door  (hold OPEN for service)",
+      fn=function()
         local api = rawget(_G, "PFX_Operator"); if not api then return "Operator: mod not loaded" end
         local on = api.door(not (api.door_on and api.door_on()))
         return "Coin door " .. (on and "OPEN (held) — now press ENTER" or "closed")
@@ -425,6 +432,14 @@ local function action_toggle_state(idx)
         return false
     elseif id == "cheat_logstates" then
         return (api and api.cheats and not not api.cheats.log_game_states) or log_states_on
+    elseif id == "op_mode" then
+        local oapi = rawget(_G, "PFX_Operator")
+        if oapi and oapi.operator_on then local ok,v = pcall(oapi.operator_on); if ok then return not not v end end
+        return false
+    elseif id == "op_door" then
+        local oapi = rawget(_G, "PFX_Operator")
+        if oapi and oapi.door_on then local ok,v = pcall(oapi.door_on); if ok then return not not v end end
+        return false
     end
     return false
 end
@@ -605,7 +620,7 @@ local function build_mod_panel_on(w)
     pcall(function() title = CreateWidget("WBP_Button_Default_C", pc) end)
     if is_live(title) then
         pcall(function() llc:Call("AddChild", title) end)
-        set_button_text(title, "PFX MOD MENU  v10")
+        set_button_text(title, "PFX MOD MENU  v11")
         clear_button_icon(title)
         pcall(function() title:Set("IsEnabled", false) end)
     end
@@ -632,7 +647,7 @@ local function build_mod_panel_on(w)
             if is_live(entry) then
                 pcall(function() llc:Call("AddChild", entry) end)
                 pcall(function() entry:Set("Type", 1) end)
-                pcall(function() entry:Set("Title", a.label) end)
+                pcall(function() entry:Set("Title", get_action_label(idx)) end)
                 local opts = (type(a.options) == "function") and a.options() or a.options
                 local init = ((a.get_index and a.get_index()) or 1) - 1
                 pcall(function()
@@ -659,7 +674,7 @@ local function build_mod_panel_on(w)
             if is_live(entry) then
                 pcall(function() llc:Call("AddChild", entry) end)
                 pcall(function() entry:Set("Type", 1) end)
-                pcall(function() entry:Set("Title", a.label) end)
+                pcall(function() entry:Set("Title", get_action_label(idx)) end)
                 local init_idx = action_toggle_state(idx) and 1 or 0
                 pcall(function()
                     local os = entry:Get("OptionSwitcher")
@@ -685,7 +700,7 @@ local function build_mod_panel_on(w)
             if is_live(entry) then
                 pcall(function() llc:Call("AddChild", entry) end)
                 pcall(function() entry:Set("Type", 2) end)
-                pcall(function() entry:Set("Title", a.label) end)
+                pcall(function() entry:Set("Title", get_action_label(idx)) end)
                 pcall(function() entry:Set("SliderMinValue", a.min) end)
                 pcall(function() entry:Set("SliderMaxValue", a.max) end)
                 pcall(function() entry:Set("SliderStepSize", a.step) end)

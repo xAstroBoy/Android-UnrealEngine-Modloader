@@ -225,8 +225,221 @@ end
 local function release_all()
   if not wpc_live() then return false, "no WPC machine" end
   set_door(false)
+  ST.bind_on = false
   pcall(function() MemWriteU8(ST.wpc + COIN_BYTE, 0) end)
   return true, "coin door released + buttons cleared"
+end
+
+-- ── Quest controller binding ─────────────────────────────────────────────────
+-- Drive the WPC service buttons with the PHYSICAL Touch controllers so the
+-- operator menu is navigable in-headset (no bridge). The service buttons are the
+-- cabinet byte's high nibble (ENTER=b7, UP=b6, DOWN=b5, ESCAPE=b4) and are the
+-- SAME on every WPC game, so this is table-agnostic. Mapping (right hand):
+--   A = ENTER / Begin Test   B = ESCAPE / back   R-stick ↑ = + (up)   ↓ = − (down)
+-- We MIRROR the held state each frame: holding a button holds the switch, so the
+-- ROM sees the ~24-frame hold Begin Test needs, and +/- auto-repeat while held.
+-- Raw OVRPlugin poll from the game thread (same technique as PFX_FingerMode's grip
+-- reader — CALLED not hooked). ONE gen-guarded loop; never stacks (no lag).
+local OVR = { base = 0, buf = 0, rbuf = 0, ok = false }
+local PTR_MASK = 0x00FFFFFFFFFFFFFF
+local OVR_GS6  = 0x176C40          -- ovrp_GetControllerState6 in libOVRPlugin.so
+-- ovrControllerState6: Buttons@+4(u32), IndexTrigger[0/1]@+16/+20, HandTrigger[1]@+28,
+-- Thumbstick[1]@+40(x)/+44(y).
+local OVR_BTN      = 4
+local OVR_RSTICK_Y = 44        -- Thumbstick[1].y (right stick vertical)
+local BTN_A      = 0x00000001  -- right A            → ESCAPE (B is the game's PAUSE button, avoid it)
+local BTN_RTHUMB = 0x00000004  -- right stick CLICK  → ENTER
+local BTN_X      = 0x00000100  -- left X button      → START button (WPC "help page" in service menus)
+local function ovr_base()
+  if OVR.base ~= 0 then return OVR.base end
+  local f = io.open("/proc/self/maps", "r"); if not f then return 0 end
+  local b = nil
+  for line in f:lines() do
+    if line:find("libOVRPlugin.so", 1, true) then
+      local a = line:match("^(%x+)-")
+      if a then local v = tonumber(a, 16); if v and (not b or v < b) then b = v end end
+    end
+  end
+  f:close(); OVR.base = b or 0; return OVR.base
+end
+local function ovr_setup()
+  if OVR.ok then return true end
+  if ovr_base() == 0 then return false end
+  if OVR.buf == 0 then
+    local p; pcall(function() p = CallNativeBySymbol("malloc", "pp", 512) end)
+    if p then OVR.buf = (type(p) == "number") and p or PtrToInt(p) end
+  end
+  if not OVR.buf or OVR.buf == 0 then return false end
+  OVR.rbuf = OVR.buf & PTR_MASK
+  OVR.ok = true
+  return true
+end
+local function ovr_poll()
+  if not ovr_setup() then return nil end
+  pcall(function() CallNative(IntToPtr(OVR.base + OVR_GS6), "iup", 0x03, IntToPtr(OVR.buf)) end)
+  local btn = MemReadU64(OVR.rbuf + OVR_BTN) & 0xFFFFFFFF   -- Buttons u32 (low 32 of the qword @+4)
+  local sy  = MemReadFloat(OVR.rbuf + OVR_RSTICK_Y)         -- right thumbstick Y
+  return btn, sy
+end
+
+-- ── Auto-detect the coin-door switch from the ROM (works on ANY WPC game) ────
+-- Finds "COIN DOOR CLOSED" in the emulated ROM, locates its slot in the switch-
+-- name pointer table, and derives the emulator switch byte+bit. Polarity is
+-- auto-sensed: the game drives the door "closed" every frame, so OPEN = the
+-- opposite value. One-time, cached in ST.cd = {byte,bit,openval} (or false).
+-- (TAF=sw21=m+25186 b0 set-open; this '92 game=sw22=m+25186 b1 clear-open — both
+--  fall straight out of this, no per-table constants.)
+-- Core: resolve a NAMED switch's matrix {byte,bit,sw} from the emulated ROM's own
+-- switch-name pointer table (idx: [0]hdr [1]INVALID [2..9]=D1-D8 [10]=sw11 …).
+-- Table-agnostic — the same routine drives the coin door AND the start button.
+-- (Validated offline on the CFTBL dump: START BUTTON→sw13, SLAM TILT→sw21,
+--  COIN DOOR CLOSED→sw22, ALWAYS CLOSED→sw24 — all matched the live matrix.)
+local function find_named_switch(tgt)
+  if not wpc_live() then return nil end
+  local ok, res = pcall(function()
+    local rb = MemReadU64(ST.wpc + 248 + 24880) & 0x00FFFFFFFFFFFFFF
+    if rb < 0x6000000000 then return nil end
+    local hp = {}; for i=1,#tgt do hp[#hp+1]=string.format("%02x",tgt:byte(i)) end; hp=table.concat(hp)
+    local soff; local prev=""; local pos=0; local SIZE=0x80000; local keep=(#tgt-1)*2
+    while pos<SIZE do
+      local n=math.min(0x1000,SIZE-pos); local h=MemReadBytes(rb+pos,n); if not h then break end
+      local hy=prev..h; local base=pos-(#prev//2); local a=hy:find(hp,1)
+      if a and (a-1)%2==0 then soff=base+(a-1)//2; break end
+      prev=(#hy>=keep) and hy:sub(#hy-keep+1) or hy; pos=pos+n
+    end
+    if not soff then return nil end
+    local guest = 0x4000 + (soff & 0x3FFF); local bank = soff >> 14
+    local bh={}; for c=0,0x3000,0x1000 do local h=MemReadBytes(rb+(bank<<14)+c,0x1000); bh[#bh+1]=h or "" end
+    bh=table.concat(bh)
+    local function w16(bytepos) return (tonumber(bh:sub(bytepos*2+1,bytepos*2+2),16)<<8)|tonumber(bh:sub(bytepos*2+3,bytepos*2+4),16) end
+    local pstr=string.format("%04x",guest); local cand; local s=1
+    while true do
+      local a=bh:find(pstr,s); if not a then break end
+      if (a-1)%2==0 then
+        local bp=(a-1)//2; local good=0
+        for _,d in ipairs({-4,-2,2,4}) do local q=bp+d; if q>=0 and q*2+4<=#bh then local w=w16(q); if w>=0x4000 and w<=0x7FFF then good=good+1 end end end
+        if good>=3 then cand=bp; break end
+      end
+      s=a+1
+    end
+    if not cand then return nil end
+    local start=cand
+    while start-2>=0 and w16(start-2)>=0x4000 and w16(start-2)<=0x7FFF do start=start-2 end
+    local idx=(cand-start)//2
+    local linear=idx-9
+    if linear<1 then return nil end
+    local col=(linear-1)//8+1; local row=(linear-1)%8+1
+    return { byte=25184+col, bit=(1<<(row-1)), sw=col*10+row }
+  end)
+  return (ok and res) or nil
+end
+
+-- Coin door: name-table lookup + polarity auto-sense (the game drives it "closed"
+-- every frame, so OPEN = the opposite value). Cached in ST.cd={byte,bit,openval,sw}.
+local function detect_coindoor()
+  if ST.cd ~= nil then return ST.cd or nil end
+  local res = find_named_switch("COIN DOOR CLOSED")
+  if res then
+    local cur = MemReadU8(ST.wpc + res.byte) & res.bit    -- game-driven (closed) value
+    res.openval = (cur ~= 0) and 0 or res.bit             -- OPEN = the opposite
+    ST.cd = res
+    Log(TAG..string.format(": coin door = sw%d (m+%d bit0x%02X, open=%s)", res.sw, res.byte, res.bit, res.openval==0 and "clear" or "set"))
+    return res
+  end
+  ST.cd = false
+  Log(TAG..": coin-door auto-detect failed")
+  return nil
+end
+
+-- START BUTTON (matrix switch, momentary N.O. — closed = pressed). In the WPC
+-- service menus, pressing START shows the HELP page for the current item.
+-- Cached in ST.start = {byte,bit,sw} (or false if not found).
+local function detect_start()
+  if ST.start ~= nil then return ST.start or nil end
+  local res = find_named_switch("START BUTTON")
+  if res then
+    ST.start = res
+    Log(TAG..string.format(": start button = sw%d (m+%d bit0x%02X)", res.sw, res.byte, res.bit))
+    return res
+  end
+  ST.start = false
+  Log(TAG..": start-button auto-detect failed")
+  return nil
+end
+-- pin the auto-detected coin door OPEN (one write; used by the bind loop each frame)
+local function door_hold_open()
+  local cd = detect_coindoor(); if not cd then return end
+  pcall(function()
+    local v = MemReadU8(ST.wpc + cd.byte)
+    v = (cd.openval ~= 0) and (v | cd.bit) or (v & (~cd.bit & 0xFF))
+    MemWriteU8(ST.wpc + cd.byte, v)
+  end)
+end
+
+-- Tap the START button (matrix switch) once → brings up the WPC HELP page for the
+-- current service item. Bridge/API helper; the left-stick binding does this live.
+-- Preserves the rest of the column (START shares its byte with other switches).
+local function tap_start()
+  if not wpc_live() then return false, "no WPC machine (play a Williams table)" end
+  local st = detect_start(); if not st then return false, "start button not found in ROM" end
+  unharden()
+  local held = 0
+  LoopAsync(1, function()
+    held = held + 1
+    if not wpc_live() then return true end
+    pcall(function()
+      local v = MemReadU8(ST.wpc + st.byte)
+      if held <= 9 then v = v | st.bit else v = v & (~st.bit & 0xFF) end
+      MemWriteU8(ST.wpc + st.byte, v)
+    end)
+    return held > 16
+  end)
+  return true, string.format("START (sw%d) tapped — help page", st.sw)
+end
+
+-- Persistent controller-binding mode. While on, each frame maps the Touch buttons
+-- to the service-button bits of the cabinet byte (preserving the coin bits).
+local function bind_controls(on)
+  ST.bind_on = on and true or false
+  if ST.bind_on then unharden(); ovr_setup(); detect_coindoor(); detect_start() end
+  if ST.bind_on and not ST.bind_loop then
+    ST.bind_loop = true
+    LoopAsync(1, function()
+      if _G._OPM_GEN ~= MY_GEN or not ST.bind_on then
+        if wpc_live() then pcall(function()
+          MemWriteU8(ST.wpc + COIN_BYTE, MemReadU8(ST.wpc + COIN_BYTE) & 0x0F)  -- drop service bits
+          local st = ST.start                                                    -- release START button
+          if type(st)=="table" then MemWriteU8(ST.wpc + st.byte, MemReadU8(ST.wpc + st.byte) & (~st.bit & 0xFF)) end
+        end) end
+        ST.bind_loop = false
+        return true
+      end
+      if not wpc_live() then return false end
+      door_hold_open()          -- hold the auto-detected coin door OPEN every frame
+      local btn, sy = ovr_poll()
+      if btn then
+        local bits = 0
+        if (btn & BTN_RTHUMB) ~= 0 then bits = bits | BTN.enter  end   -- R-stick CLICK → ENTER / Begin Test
+        if (btn & BTN_A)      ~= 0 then bits = bits | BTN.escape end   -- A → ESCAPE / back
+        if sy and sy >  0.55 then bits = bits | BTN.up   end           -- R-stick ↑ → + (up)
+        if sy and sy < -0.55 then bits = bits | BTN.down end           -- R-stick ↓ → − (down)
+        pcall(function()
+          local v = MemReadU8(ST.wpc + COIN_BYTE) & 0x0F          -- keep coin bits, set service bits
+          MemWriteU8(ST.wpc + COIN_BYTE, v | bits)
+        end)
+        -- X button (left hand) → START button (matrix switch) → WPC help page. Mirror
+        -- the held state onto the START bit, preserving the rest of its column.
+        local st = detect_start()
+        if st then pcall(function()
+          local mv = MemReadU8(ST.wpc + st.byte)
+          if (btn & BTN_X) ~= 0 then mv = mv | st.bit else mv = mv & (~st.bit & 0xFF) end
+          MemWriteU8(ST.wpc + st.byte, mv)
+        end) end
+      end
+      return false
+    end)
+  end
+  return ST.bind_on
 end
 
 -- ── debug displays ───────────────────────────────────────────────────────────
@@ -306,7 +519,19 @@ _G.PFX_Operator = {
   down   = function() return tap("down")   end,   -- - / navigate down
   escape = function() return tap("escape") end,   -- ESCAPE / back / exit
   coin   = function() return tap("coin")   end,   -- insert a coin
+  start       = tap_start,                        -- press START → WPC help page
+  press_start = tap_start,
   tap          = tap,
+  -- OPERATOR MODE: auto-opens the coin door + binds the Touch controllers so the
+  -- ROM's operator menu is accessible & navigable in-headset. Controls:
+  --   right stick ↑/↓ = +/−   |   stick CLICK = ENTER   |   A = ESCAPE
+  operator_mode        = bind_controls,                       -- operator_mode(true/false)
+  operator_toggle      = function() return bind_controls(not ST.bind_on) end,
+  operator_on          = function() return ST.bind_on == true end,
+  bind                 = bind_controls,                       -- (aliases, back-compat)
+  bind_toggle          = function() return bind_controls(not ST.bind_on) end,
+  bind_on              = function() return ST.bind_on == true end,
+  coindoor             = detect_coindoor,                     -- returns {byte,bit,openval,sw}
   release_all  = release_all,
   toggle_debug = toggle_debug,               -- per-machine emulator debug display
   toggle_romdbg= toggle_romdbg,              -- global YUP ROM-debug flag
@@ -331,11 +556,14 @@ pcall(function() RegisterCommand("op_up",     function() return r(API.up)     en
 pcall(function() RegisterCommand("op_down",   function() return r(API.down)   end) end)
 pcall(function() RegisterCommand("op_esc",    function() return r(API.escape) end) end)
 pcall(function() RegisterCommand("op_coin",   function() return r(API.coin)   end) end)
+pcall(function() RegisterCommand("op_start",  function() return r(API.start)  end) end)
 -- probe helper: flip the door-open polarity if a build proves inverted
 pcall(function() RegisterCommand("op_release",function() return r(API.release_all) end) end)
+pcall(function() RegisterCommand("op_bind",   function() return TAG..": Operator Mode "..(bind_controls(not ST.bind_on) and "ON (door auto-open; R-stick=+/-, click=ENTER, A=ESC, X=START/help)" or "off") end) end)
+pcall(function() RegisterCommand("op_operator",function() return TAG..": Operator Mode "..(bind_controls(not ST.bind_on) and "ON (door auto-open; R-stick=+/-, click=ENTER, A=ESC, X=START/help)" or "off") end) end)
 pcall(function() RegisterCommand("op_dbg",    function() return r(API.toggle_debug) end) end)
 pcall(function() RegisterCommand("op_romdbg", function() return r(API.toggle_romdbg) end) end)
 pcall(function() RegisterCommand("op_text",   function(a) return TAG..": "..tostring(select(2, debug_text(a or ""))) end) end)
 pcall(function() RegisterCommand("op_sound",  function(a) return TAG..": "..tostring(select(2, play_sound(tonumber(a) or 1))) end) end)
 
-Log(TAG .. ": v2 ready — WPC operator menu via sw21 (COIN DOOR CLOSED). op_door (toggle hold-open), op_enter/up/down/esc/coin, op_release, op_dbg. Open from attract/game-over (opening it halts play, authentic WPC).")
+Log(TAG .. ": v3 ready — WPC operator menu (auto-detect coin door + START button). op_door, op_enter/up/down/esc/coin, op_start (help page), op_release, op_dbg. Operator mode: R-stick nav / click=ENTER / A=ESC / X=START(help). Open from attract/game-over (opening it halts play, authentic WPC).")
