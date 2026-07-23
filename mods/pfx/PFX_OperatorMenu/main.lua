@@ -506,6 +506,79 @@ LoopAsync(1500, function()
   return false
 end)
 
+-- ── Runtime 6809 ROM AOB-patcher (merged from the old PFX_WPCRomPatch) ───────
+-- Patches the emulated WPC ROM IMAGE directly rather than racing the per-frame
+-- switch re-sync. romBase = *(machine+248+24880) (512KB); a patch at rom-file
+-- offset X writes romBase+X. Signatures are AOB (survive ROM revisions); the scan
+-- runs in the HEX domain because MemReadBytes returns hex (see find_named_switch).
+local ROM_SIZE = 0x80000
+ST.rom_applied = ST.rom_applied or {}
+local function rombase()
+  if not wpc_live() then return 0 end
+  local rb = 0; pcall(function() rb = MemReadU64(ST.wpc + 248 + 24880) end)
+  if not heap(rb) then return 0 end
+  return rb & 0x00FFFFFFFFFFFFFF
+end
+local function parse_aob(str)
+  local pat, plen = {}, 0
+  for tok in str:gmatch("%S+") do
+    plen = plen + 1
+    if tok == "??" or tok == "?" then pat[#pat+1] = "%x%x"
+    else pat[#pat+1] = string.format("%02x", tonumber(tok, 16)) end
+  end
+  return { plen = plen, lpat = table.concat(pat) }
+end
+local function rom_scan(p)
+  local rb = rombase(); if rb == 0 then return {} end
+  local lpat, plen = p.lpat, p.plen
+  local hits, CH = {}, 0x1000
+  local keep = (plen - 1) * 2                 -- even hex chars = whole-byte overlap
+  local prevhex, pos = "", 0
+  while pos < ROM_SIZE do
+    local n = math.min(CH, ROM_SIZE - pos)
+    local h = nil; pcall(function() h = MemReadBytes(rb + pos, n) end)
+    if not h then break end
+    local hy = prevhex .. h
+    local basebyte = pos - (#prevhex // 2)
+    local s = 1
+    while true do
+      local a = hy:find(lpat, s); if not a then break end
+      if (a - 1) % 2 == 0 then hits[#hits+1] = basebyte + (a - 1) // 2 end
+      s = a + 1
+    end
+    prevhex = (#hy >= keep) and hy:sub(#hy - keep + 1) or hy
+    pos = pos + n
+  end
+  return hits
+end
+local function rom_apply(patch)
+  if ST.rom_applied[patch.name] then return true, patch.name .. ": already applied" end
+  local rb = rombase(); if rb == 0 then return false, "no WPC ROM detected yet" end
+  unharden()
+  local hits = rom_scan(parse_aob(patch.aob))
+  if #hits == 0 then return false, patch.name .. ": signature NOT FOUND" end
+  if patch.verify_unique ~= false and #hits ~= 1 then
+    return false, string.format("%s: signature matched %d times (want 1) — refusing", patch.name, #hits)
+  end
+  local off = hits[1]
+  local already = true                        -- idempotent: re-detect/reload won't double-apply
+  for _, e in ipairs(patch.edits) do
+    local cur = 0; pcall(function() cur = MemReadU8(rb + off + e.rel) end)
+    if cur == e.to then
+    elseif (not e.from) or cur == e.from then already = false
+    else return false, string.format("%s: byte@+%d is 0x%02X, expected 0x%02X — NOT patching", patch.name, e.rel, cur, e.from) end
+  end
+  for _, e in ipairs(patch.edits) do pcall(function() MemWriteU8(rb + off + e.rel, e.to) end) end
+  ST.rom_applied[patch.name] = { off = off, at = rb + off }
+  return true, string.format("%s: %s at rom 0x%05X", patch.name, already and "already patched" or "patched", off)
+end
+-- Patch catalog. slam_tilt: force BCS->BRA (bank 0x13 $69D6: BD 6E AE / 25 23 /
+-- BD 87 33) so "SLAM TILT SWITCH IS STUCK CLOSED" (msg 0x6E) never blocks boot.
+-- OFF by default — apply explicitly (API.apply_slam / bridge wpc_patch_slam).
+local ROM_PATCHES = {
+  slam_tilt = { name = "slam_tilt_skip", aob = "BD 6E AE ?? 23 BD 87 33", edits = { { rel = 3, from = 0x25, to = 0x20 } } },
+}
+
 -- ── Public API (menu / other mods) ──────────────────────────────────────────
 _G.PFX_Operator = {
   -- Operator mode: hold the coin door OPEN so the ROM's service buttons work.
@@ -521,6 +594,12 @@ _G.PFX_Operator = {
   coin   = function() return tap("coin")   end,   -- insert a coin
   start       = tap_start,                        -- press START → WPC help page
   press_start = tap_start,
+  -- 6809 ROM image AOB-patcher (merged from PFX_WPCRomPatch)
+  rombase     = rombase,
+  rom_scan    = function(aob) return rom_scan(parse_aob(aob)) end,
+  rom_apply   = rom_apply,
+  rom_patches = ROM_PATCHES,
+  apply_slam  = function() return rom_apply(ROM_PATCHES.slam_tilt) end,
   tap          = tap,
   -- OPERATOR MODE: auto-opens the coin door + binds the Touch controllers so the
   -- ROM's operator menu is accessible & navigable in-headset. Controls:
@@ -557,6 +636,28 @@ pcall(function() RegisterCommand("op_down",   function() return r(API.down)   en
 pcall(function() RegisterCommand("op_esc",    function() return r(API.escape) end) end)
 pcall(function() RegisterCommand("op_coin",   function() return r(API.coin)   end) end)
 pcall(function() RegisterCommand("op_start",  function() return r(API.start)  end) end)
+-- 6809 ROM AOB-patcher (merged PFX_WPCRomPatch)
+pcall(function() RegisterCommand("wpc_rom", function()
+  local rb = rombase()
+  if rb == 0 then return TAG..": no WPC machine yet (play a Williams table)" end
+  local hdr = ""; pcall(function() local b = MemReadBytes(rb + 2, 40); if b then hdr = b end end)
+  return string.format("%s: romBase=0x%X hdr='%s'", TAG, rb, (hdr:gsub("[^%g ]", ".")))
+end) end)
+pcall(function() RegisterCommand("wpc_scan", function(a)
+  if not a or a == "" then return TAG..": usage wpc_scan <hex aob, ?? wildcard>" end
+  local hits = rom_scan(parse_aob(a)); local t = {}
+  for i = 1, math.min(#hits, 12) do
+    local o = hits[i]; local bank = (o < 0x78000) and (o >> 14) or -1
+    local guest = (o >= 0x78000) and (0x8000 + (o - 0x78000)) or (0x4000 + (o & 0x3FFF))
+    t[#t+1] = string.format("0x%05X(%s $%04X)", o, bank<0 and "FIX" or string.format("b%02X", bank), guest)
+  end
+  return string.format("%s: %d hit(s): %s", TAG, #hits, table.concat(t, " "))
+end) end)
+pcall(function() RegisterCommand("wpc_patch_slam", function() return TAG..": "..tostring(select(2, rom_apply(ROM_PATCHES.slam_tilt))) end) end)
+pcall(function() RegisterCommand("wpc_applied", function()
+  local t = {}; for k, v in pairs(ST.rom_applied) do t[#t+1] = string.format("%s@0x%X", k, v.at or 0) end
+  return TAG..": applied = " .. (#t > 0 and table.concat(t, ", ") or "(none)")
+end) end)
 -- probe helper: flip the door-open polarity if a build proves inverted
 pcall(function() RegisterCommand("op_release",function() return r(API.release_all) end) end)
 pcall(function() RegisterCommand("op_bind",   function() return TAG..": Operator Mode "..(bind_controls(not ST.bind_on) and "ON (door auto-open; R-stick=+/-, click=ENTER, A=ESC, X=START/help)" or "off") end) end)
@@ -566,4 +667,4 @@ pcall(function() RegisterCommand("op_romdbg", function() return r(API.toggle_rom
 pcall(function() RegisterCommand("op_text",   function(a) return TAG..": "..tostring(select(2, debug_text(a or ""))) end) end)
 pcall(function() RegisterCommand("op_sound",  function(a) return TAG..": "..tostring(select(2, play_sound(tonumber(a) or 1))) end) end)
 
-Log(TAG .. ": v3 ready — WPC operator menu (auto-detect coin door + START button). op_door, op_enter/up/down/esc/coin, op_start (help page), op_release, op_dbg. Operator mode: R-stick nav / click=ENTER / A=ESC / X=START(help). Open from attract/game-over (opening it halts play, authentic WPC).")
+Log(TAG .. ": v4 ready — WPC operator menu (auto-detect coin door + START button) + merged 6809 ROM AOB-patcher. op_door, op_enter/up/down/esc/coin, op_start (help page), op_release, op_dbg; wpc_rom/wpc_scan/wpc_patch_slam/wpc_applied. Operator mode: R-stick nav / click=ENTER / A=ESC / X=START(help). Open from attract/game-over (opening it halts play, authentic WPC).")
