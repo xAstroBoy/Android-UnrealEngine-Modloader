@@ -119,6 +119,28 @@ namespace sdk_gen
         return pkgs;
     }
 
+    // Per-entity write guard. A single corrupt reflection entity — e.g. a garbage
+    // string length that makes a copy request an absurd size (std::bad_alloc even
+    // though overcommit is on and rlimits are unlimited, because the allocator
+    // rejects the size outright) — must NOT abort the whole pass and lose the
+    // thousands of good entities after it. Log the culprit by name and skip it.
+    // If EVERY entity throws, the flood of skip lines makes clear it's real memory
+    // pressure rather than one poisoned entity.
+    template <typename T, typename WriteFn>
+    static bool guard_write(const char *kind, const T &e, WriteFn &&fn)
+    {
+        try { fn(); return true; }
+        catch (const std::exception &ex)
+        {
+            logger::log_warn("SDK_GEN", "skipped %s '%s': %s", kind, e.name.c_str(), ex.what());
+        }
+        catch (...)
+        {
+            logger::log_warn("SDK_GEN", "skipped %s '%s' (unknown exception)", kind, e.name.c_str());
+        }
+        return false;
+    }
+
     // Pad a string to N characters with spaces (right-pad)
     static std::string pad_right(const std::string &s, size_t width)
     {
@@ -147,8 +169,22 @@ namespace sdk_gen
     // CXX type name conversion (PropType → C++ type string)
     // ═══════════════════════════════════════════════════════════════════════
 
+    // A few engine classes (AnimNotifyStateMachineInspectionLibrary,
+    // AsyncActionChangePrimaryAssetBundles, ImportanceSamplingLibrary, …) carry a
+    // property whose resolved inner type name has a corrupt/absurd length. Copying
+    // or concatenating it (as every branch below does) would request a nonsensical
+    // allocation → std::bad_alloc even under always-overcommit. Reading .size() is
+    // safe (no allocation), so reject an insane length up front and substitute a
+    // placeholder — the class then dumps cleanly instead of being skipped whole.
+    static bool sane_type(const reflection::PropertyInfo &pi)
+    {
+        return pi.inner_type_name.size() <= 4096 && pi.inner_type_name2.size() <= 4096;
+    }
+
     static std::string cxx_type_name(const reflection::PropertyInfo &pi)
     {
+        if (!sane_type(pi))
+            return "uint8 /* unresolved type */";
         using PT = reflection::PropType;
         switch (pi.type)
         {
@@ -262,6 +298,8 @@ namespace sdk_gen
 
     static std::string lua_type_name(const reflection::PropertyInfo &pi)
     {
+        if (!sane_type(pi))
+            return "any";
         using PT = reflection::PropType;
         switch (pi.type)
         {
@@ -557,11 +595,11 @@ namespace sdk_gen
 
                 for (size_t idx : sorted_structs)
                 {
-                    cxx_write_struct(f, structs[idx]);
+                    guard_write("struct", structs[idx], [&] { cxx_write_struct(f, structs[idx]); });
                 }
                 for (size_t idx : sorted_classes)
                 {
-                    cxx_write_class(f, classes[idx]);
+                    guard_write("class", classes[idx], [&] { cxx_write_class(f, classes[idx]); });
                 }
 
                 fprintf(f, "#endif\n");
@@ -590,7 +628,7 @@ namespace sdk_gen
 
                 for (size_t idx : sorted_enums)
                 {
-                    cxx_write_enum(f, enums[idx]);
+                    guard_write("enum", enums[idx], [&] { cxx_write_enum(f, enums[idx]); });
                 }
 
                 fclose(f);
@@ -797,11 +835,11 @@ namespace sdk_gen
 
                 for (size_t idx : sorted_structs)
                 {
-                    lua_write_struct(f, structs[idx]);
+                    guard_write("struct", structs[idx], [&] { lua_write_struct(f, structs[idx]); });
                 }
                 for (size_t idx : sorted_classes)
                 {
-                    lua_write_class(f, classes[idx]);
+                    guard_write("class", classes[idx], [&] { lua_write_class(f, classes[idx]); });
                 }
 
                 fclose(f);
@@ -830,7 +868,7 @@ namespace sdk_gen
 
                 for (size_t idx : sorted_enums)
                 {
-                    lua_write_enum(f, enums[idx]);
+                    guard_write("enum", enums[idx], [&] { lua_write_enum(f, enums[idx]); });
                 }
 
                 fclose(f);
@@ -1094,18 +1132,15 @@ namespace sdk_gen
         int files = 0;
         for (const auto &ci : classes)
         {
-            legacy_write_class(ci);
-            files++;
+            if (guard_write("class", ci, [&] { legacy_write_class(ci); })) files++;
         }
         for (const auto &si : structs)
         {
-            legacy_write_struct(si);
-            files++;
+            if (guard_write("struct", si, [&] { legacy_write_struct(si); })) files++;
         }
         for (const auto &ei : enums)
         {
-            legacy_write_enum(ei);
-            files++;
+            if (guard_write("enum", ei, [&] { legacy_write_enum(ei); })) files++;
         }
 
         // Write _index.lua
